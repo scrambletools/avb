@@ -39,7 +39,7 @@ fn model(entity_id: EntityId, name: &str, talker: bool) -> EndpointModel {
         entity_name: name.into(),
         group_name: String::new(),
         vendor_name: "Scramble Tools".into(),
-        model_name: "triib endpoint".into(),
+        model_name: "Host endpoint".into(),
         firmware_version: "0.1.0".into(),
         serial_number: String::new(),
         mac: HOST_MAC,

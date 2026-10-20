@@ -1,4 +1,4 @@
-//! AVTP audio streams for triib's talker and listener entities: AAF and
+//! AVTP audio streams for talker and listener entities: AAF and
 //! AM824 frames built and read (IEEE 1722-2016, 7 and 6.4), sent paced on
 //! gPTP time and received into a buffer the audio device plays, with
 //! audio from and to the computer's devices through cpal, a test tone or

@@ -1,5 +1,5 @@
-//! The loudest samples of a stream's first two channels, which triib's
-//! meters show.
+//! The loudest samples of a stream's first two channels, for an app's
+//! meters.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 

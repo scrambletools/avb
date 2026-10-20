@@ -1,0 +1,22 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/scrambletools/avb"
+
+[workspace.dependencies]
+# The protocol crates depend on nothing beyond each other, and build
+# without std when their default feature is off.
+atdecc = { path = "crates/atdecc", version = "0.1.0", default-features = false }
+avb-mrp = { path = "crates/avb-mrp", version = "0.1.0", default-features = false }
+avb-net = { path = "crates/avb-net", version = "0.1.0", default-features = false }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

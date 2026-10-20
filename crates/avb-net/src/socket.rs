@@ -123,14 +123,14 @@ impl std::fmt::Display for Blocked {
                 )
             }
             Self::CaptureDevices => formatter.write_str(
-                "raw Ethernet needs access to /dev/bpf*: install triib's capture helper, or \
+                "raw Ethernet needs access to /dev/bpf*: install a capture helper, such as \
                  Wireshark's ChmodBPF, and log in again",
             ),
             Self::Npcap => formatter.write_str(
-                "raw Ethernet needs Npcap: install it from https://npcap.com, then open triib again",
+                "raw Ethernet needs Npcap: install it from https://npcap.com, then start the program again",
             ),
             Self::NpcapAdministrators => formatter.write_str(
-                "Npcap lets only administrators capture: run triib as administrator, or \
+                "Npcap lets only administrators capture: run the program as administrator, or \
                  reinstall Npcap without \"Restrict Npcap driver's access to Administrators \
                  only\"",
             ),

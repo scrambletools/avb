@@ -547,7 +547,7 @@ impl Advertiser {
 
     /// The longest random delay before advertising: a fifth of the valid
     /// time (6.2.4.2.2), and no more than a second, so other controllers
-    /// see triib promptly.
+    /// see this one promptly.
     fn delay_limit(&self) -> Duration {
         (self.valid() / 5).min(Duration::from_secs(1))
     }

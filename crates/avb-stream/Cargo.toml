@@ -1,7 +1,9 @@
 [package]
-name = "triib-stream"
-description = "AVTP audio streams for triib's endpoints: AAF talkers and listeners on gPTP time, with audio through cpal"
-version.workspace = true
+name = "avb-stream"
+description = "AVTP audio streams: AAF and AM824 talkers and listeners paced on gPTP time, CRF media clocks, with audio through cpal"
+version = "0.1.0"
+categories = ["network-programming", "multimedia::audio"]
+keywords = ["avb", "avtp", "aaf", "milan", "1722"]
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
