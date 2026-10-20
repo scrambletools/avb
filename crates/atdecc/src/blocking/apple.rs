@@ -56,8 +56,9 @@ pub(super) fn avb_enabled(name: &str) -> Option<bool> {
 }
 
 /// The framework's view of one interface, sending commands to this Mac's
-/// own entities and turning their answers into frames.
-pub(super) struct Local {
+/// own entities and turning their answers into frames. [`super::Driver`]
+/// uses it; a program running a controller in a loop of its own can too.
+pub struct Local {
     _interface: Retained<AnyObject>,
     aecp: Retained<AnyObject>,
     acmp: Retained<AnyObject>,
@@ -86,7 +87,7 @@ pub(super) struct Local {
 impl Local {
     /// The framework on interface `name`, for controller `controller`, or
     /// `None` where it is missing or AVB is off on the interface.
-    pub(super) fn open(name: &str, controller: EntityId) -> Option<Self> {
+    pub fn open(name: &str, controller: EntityId) -> Option<Self> {
         let base = AnyClass::get(c"AVBInterface")?;
         let ethernet = AnyClass::get(c"AVBEthernetInterface")?;
         let ns_name = NSString::from_str(name);
@@ -138,7 +139,7 @@ impl Local {
 
     /// Sends `bytes` through the framework when they are a command to an
     /// entity `is_local` says is on this Mac, returning whether it did.
-    pub(super) fn send(&self, bytes: &[u8], is_local: impl Fn(EntityId) -> bool) -> bool {
+    pub fn send(&self, bytes: &[u8], is_local: impl Fn(EntityId) -> bool) -> bool {
         let (target, sent) = match pdu::decode(bytes) {
             Ok(Pdu::Aem(aem))
                 if aem.header.message_type == AecpMessageType::AEM_COMMAND
@@ -170,12 +171,12 @@ impl Local {
     }
 
     /// Whether commands wait for their answers.
-    pub(super) fn waiting(&self) -> bool {
+    pub fn waiting(&self) -> bool {
         self.waiting.load(Ordering::Relaxed) > 0
     }
 
     /// The next answer, as the frame's octets after the Ethernet header.
-    pub(super) fn poll(&self) -> Option<Vec<u8>> {
+    pub fn poll(&self) -> Option<Vec<u8>> {
         self.answers.try_recv().ok()
     }
 
@@ -408,7 +409,7 @@ impl Local {
     /// of an ACMP command it sent on the wire for this controller, under a
     /// controller ID of its own: one known from its answers, or a command
     /// just sent through it, whose ID is learned then.
-    pub(super) fn echoes(&self, bytes: &[u8]) -> bool {
+    pub fn echoes(&self, bytes: &[u8]) -> bool {
         let Ok(Pdu::Acmp(copy)) = pdu::decode(bytes) else {
             return false;
         };

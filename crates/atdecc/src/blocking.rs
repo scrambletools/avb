@@ -14,6 +14,14 @@ use crate::time::Instant;
 #[cfg(target_os = "macos")]
 mod apple;
 
+/// This Mac's own AVB entities, reached through Apple's AudioVideoBridging
+/// framework, as macOS never shows its AVB stack the frames written to
+/// BPF: hand it each command the controller queues ([`Local::send`]), and
+/// the controller each answer ([`Local::poll`]), as frames from the Mac's
+/// own address.
+#[cfg(target_os = "macos")]
+pub use apple::Local;
+
 /// Room for any Ethernet payload.
 const FRAME: usize = 1536;
 
