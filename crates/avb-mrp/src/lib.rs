@@ -34,6 +34,8 @@ pub mod mrpdu;
 pub mod msrp;
 pub mod mvrp;
 pub mod participant;
+#[cfg(feature = "std")]
+pub mod sharing;
 
 pub use mrpdu::Event;
 pub use participant::{Participant, Registration};
