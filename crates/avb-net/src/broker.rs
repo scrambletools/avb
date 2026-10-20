@@ -94,8 +94,8 @@ pub(crate) fn open(kind: Kind) -> io::Result<OwnedFd> {
 
 /// The program that must hold CAP_NET_RAW for raw sockets to open: the
 /// installed helper, or the one found that could not start, else this
-/// one.
-pub(crate) fn needs_capability() -> Option<PathBuf> {
+/// one. An app names it in the command it offers to grant the capability.
+pub fn needs_capability() -> Option<PathBuf> {
     INSTALLED
         .get()
         .map(|installed| installed.program.clone())
