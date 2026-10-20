@@ -39,3 +39,7 @@ required-features = ["std"]
 [[example]]
 name = "phc_watch"
 required-features = ["std"]
+
+[[example]]
+name = "netraw"
+required-features = ["std"]

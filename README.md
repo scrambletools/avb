@@ -65,10 +65,17 @@ avb-stream = { path = "../avb/crates/avb-stream" }
 
 ## Platform needs
 
-- **Linux:** raw Ethernet needs `CAP_NET_RAW`
-  (`sudo setcap cap_net_raw+ep <program>`). gPTP comes from ptp4l; the
-  stream crates read its time from the interface's PTP hardware clock,
-  which must be readable.
+- **Linux:** raw Ethernet needs `CAP_NET_RAW`, but only to open a
+  socket. Rather than granting it to the app, which then runs as a
+  process others may not look into (the desktop portals refuse it file
+  dialogs and screen sharing; debuggers and crash reports pass it by),
+  ship a tiny helper whose `main` calls `avb_net::broker::serve()`, grant
+  the capability to that alone (`sudo setcap cap_net_raw+ep <helper>`),
+  and at start `install` a `Broker::start(<helper>)`: every raw socket
+  `avb-net` and `avb-stream` open then comes from the helper, passed over
+  a Unix socket. The `netraw` example is such a helper. gPTP comes from
+  ptp4l; the stream crates read its time from the interface's PTP
+  hardware clock, which must be readable.
 - **macOS:** raw Ethernet needs read and write access to `/dev/bpf*`.
 - **Windows:** raw Ethernet needs [Npcap](https://npcap.com).
 

@@ -99,7 +99,7 @@ pub fn avtp_payload(frame: &[u8]) -> Option<&[u8]> {
 mod platform {
     use std::io;
     use std::mem::{size_of, zeroed};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::time::Duration;
 
     use super::{ETHERTYPE_AVTP, ETHERTYPE_VLAN};
@@ -116,17 +116,7 @@ mod platform {
                 format!("no interface named {interface}"),
             )
         })?;
-        // SAFETY: plain system call with integer arguments.
-        let raw = unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_RAW | libc::SOCK_CLOEXEC, 0) };
-        if raw < 0 {
-            let error = io::Error::last_os_error();
-            return Err(match error.raw_os_error() {
-                Some(libc::EPERM | libc::EACCES) => crate::socket::raw_capability(),
-                _ => error,
-            });
-        }
-        // SAFETY: `raw` is a socket this function just opened and owns.
-        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let fd = crate::broker::open(crate::broker::Kind::Raw)?;
         Ok((fd, index))
     }
 

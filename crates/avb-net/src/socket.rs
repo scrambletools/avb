@@ -113,9 +113,14 @@ impl std::fmt::Display for Blocked {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::RawCapability => {
-                let program = std::env::current_exe()
+                // The app's helper, where it has one, else the app.
+                #[cfg(target_os = "linux")]
+                let program = crate::broker::needs_capability();
+                #[cfg(not(target_os = "linux"))]
+                let program = std::env::current_exe().ok();
+                let program = program
                     .map(|path| path.display().to_string())
-                    .unwrap_or_else(|_| "the program".to_owned());
+                    .unwrap_or_else(|| "the program".to_owned());
                 write!(
                     formatter,
                     "raw Ethernet needs CAP_NET_RAW; grant it with: sudo setcap cap_net_raw+ep \
@@ -157,7 +162,7 @@ pub fn check_access() -> io::Result<()> {
 mod platform {
     use std::io;
     use std::mem::{size_of, zeroed};
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::time::Duration;
 
     use super::{Received, Sent};
@@ -173,19 +178,7 @@ mod platform {
     /// Opens a packet socket that hears nothing, which takes the same
     /// permission as one that does.
     pub fn check_access() -> io::Result<()> {
-        // SAFETY: plain system call with integer arguments.
-        let raw =
-            unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-        if raw < 0 {
-            let error = io::Error::last_os_error();
-            return Err(match error.raw_os_error() {
-                Some(libc::EPERM | libc::EACCES) => super::Blocked::RawCapability.error(),
-                _ => error,
-            });
-        }
-        // SAFETY: `raw` is a socket this function just opened and owns.
-        drop(unsafe { OwnedFd::from_raw_fd(raw) });
-        Ok(())
+        crate::broker::open(crate::broker::Kind::Datagram).map(drop)
     }
 
     impl Socket {
@@ -200,18 +193,7 @@ mod platform {
             // is on: bound to one ethertype the socket would never hear what
             // other programs here send, which Linux hands only to sockets
             // bound to every protocol.
-            // SAFETY: plain system call with integer arguments.
-            let raw =
-                unsafe { libc::socket(libc::AF_PACKET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
-            if raw < 0 {
-                let error = io::Error::last_os_error();
-                return Err(match error.raw_os_error() {
-                    Some(libc::EPERM | libc::EACCES) => super::Blocked::RawCapability.error(),
-                    _ => error,
-                });
-            }
-            // SAFETY: `raw` is a socket this function just opened and owns.
-            let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+            let fd = crate::broker::open(crate::broker::Kind::Datagram)?;
             let socket = Self {
                 fd,
                 index,
