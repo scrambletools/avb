@@ -113,6 +113,43 @@ pub fn installed() -> bool {
     INSTALLED.get().is_some()
 }
 
+/// Starts and installs the app's helper, `name`, once: found beside the
+/// running program, or beside the folder it is in, as for an example, or
+/// in one of `folders`, where packages put it. Later calls do nothing
+/// once one is installed, and try again after one failed, as after the
+/// helper is granted the capability.
+pub fn use_helper(name: &str, folders: &[&Path]) -> io::Result<()> {
+    static STARTING: Mutex<()> = Mutex::new(());
+    let _one_at_a_time = STARTING.lock().unwrap_or_else(PoisonError::into_inner);
+    if installed() {
+        return Ok(());
+    }
+    let program = find(name, folders).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("the raw Ethernet helper, {name}, is not installed beside this program"),
+        )
+    })?;
+    install(Broker::start(&program)?);
+    Ok(())
+}
+
+/// Where the helper `name` is, as [`use_helper`] looks for it.
+fn find(name: &str, folders: &[&Path]) -> Option<PathBuf> {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|program| program.parent().map(Path::to_path_buf));
+    let mut places = Vec::new();
+    if let Some(folder) = beside {
+        places.push(folder.join(name));
+        if let Some(parent) = folder.parent() {
+            places.push(parent.join(name));
+        }
+    }
+    places.extend(folders.iter().map(|folder| folder.join(name)));
+    places.into_iter().find(|place| place.is_file())
+}
+
 /// A running helper, and the socket to it. Dropping it stops the helper.
 pub struct Broker {
     stream: UnixStream,
