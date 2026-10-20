@@ -70,6 +70,10 @@ struct Installed {
 
 static INSTALLED: OnceLock<Installed> = OnceLock::new();
 
+/// The helper [`use_helper`] found last, started or not, for the error to
+/// name.
+static FOUND: Mutex<Option<PathBuf>> = Mutex::new(None);
+
 /// A packet socket of `kind`: from the helper when one is installed, else
 /// made here. The error for one the capability is missing for carries
 /// [`crate::Blocked::RawCapability`].
@@ -89,11 +93,13 @@ pub(crate) fn open(kind: Kind) -> io::Result<OwnedFd> {
 }
 
 /// The program that must hold CAP_NET_RAW for raw sockets to open: the
-/// installed helper, else this one.
+/// installed helper, or the one found that could not start, else this
+/// one.
 pub(crate) fn needs_capability() -> Option<PathBuf> {
     INSTALLED
         .get()
         .map(|installed| installed.program.clone())
+        .or_else(|| FOUND.lock().unwrap_or_else(PoisonError::into_inner).clone())
         .or_else(|| std::env::current_exe().ok())
 }
 
@@ -130,6 +136,7 @@ pub fn use_helper(name: &str, folders: &[&Path]) -> io::Result<()> {
             format!("the raw Ethernet helper, {name}, is not installed beside this program"),
         )
     })?;
+    *FOUND.lock().unwrap_or_else(PoisonError::into_inner) = Some(program.clone());
     install(Broker::start(&program)?);
     Ok(())
 }
