@@ -2920,3 +2920,109 @@ fn reads_the_counters_of_clocks_and_streams() {
     assert_eq!(output.timestamp_uncertain, None);
     assert_eq!(model.clock_domain_counters(0).unwrap().locked, Some(1));
 }
+
+const OTHER_CONTROLLER: EntityId = EntityId(0x9c6b_00ff_fd30_9a2b);
+
+/// A response the entity sent another controller on this computer, which
+/// this one hears as they share the address.
+fn overheard_response(command_type: AemCommandType, status: AemStatus, payload: &[u8]) -> Vec<u8> {
+    let pdu = AemPdu {
+        header: AecpHeader {
+            message_type: AecpMessageType::AEM_RESPONSE,
+            status: status.0,
+            target_entity_id: TALKER,
+            controller_entity_id: OTHER_CONTROLLER,
+            sequence_id: 9,
+        },
+        unsolicited: false,
+        controller_request: false,
+        command_type,
+        payload,
+    };
+    let mut out = [0; 160];
+    let length = pdu.encode(&mut out).unwrap();
+    out[..length].to_vec()
+}
+
+#[test]
+fn another_controllers_responses_here_update_the_model() {
+    let (mut controller, mut entity) = enumerated();
+    events(&mut controller);
+    // The stream info it read.
+    let mut info = vec![0u8; 48];
+    put(&mut info, 0, DescriptorType::STREAM_INPUT.0);
+    put(&mut info, 2, 1);
+    info[4..8].copy_from_slice(&StreamInfoFlags::CONNECTED.0.to_be_bytes());
+    let frame = overheard_response(AemCommandType::GET_STREAM_INFO, AemStatus::SUCCESS, &info);
+    controller.handle_frame(at(1), TALKER_MAC, &frame).unwrap();
+    assert_eq!(events(&mut controller), [Event::EntityModelChanged(TALKER)]);
+    let model = controller.model(TALKER).unwrap();
+    let info = model.stream_info(DescriptorType::STREAM_INPUT, 1).unwrap();
+    assert!(info.bound());
+    // A rename it made: the descriptor is read again.
+    entity.rename(DescriptorType::STREAM_INPUT, 1, "Vocal");
+    let mut name = vec![0u8; 72];
+    put(&mut name, 0, DescriptorType::STREAM_INPUT.0);
+    put(&mut name, 2, 1);
+    let frame = overheard_response(AemCommandType::SET_NAME, AemStatus::SUCCESS, &name);
+    controller.handle_frame(at(2), TALKER_MAC, &frame).unwrap();
+    assert_eq!(exchange(&mut controller, &mut entity, at(2)), 1);
+    let model = controller.model(TALKER).unwrap();
+    assert_eq!(
+        model.name_of(DescriptorType::STREAM_INPUT, 1),
+        Some("Vocal")
+    );
+    // What it was refused, and its own registration, change nothing here.
+    let mut format = vec![0u8; 12];
+    put(&mut format, 0, DescriptorType::STREAM_INPUT.0);
+    let refused = overheard_response(
+        AemCommandType::SET_STREAM_FORMAT,
+        AemStatus::BAD_ARGUMENTS,
+        &format,
+    );
+    controller
+        .handle_frame(at(3), TALKER_MAC, &refused)
+        .unwrap();
+    let deregistered = overheard_response(
+        AemCommandType::DEREGISTER_UNSOLICITED_NOTIFICATION,
+        AemStatus::SUCCESS,
+        &[],
+    );
+    controller
+        .handle_frame(at(3), TALKER_MAC, &deregistered)
+        .unwrap();
+    assert!(transmits(&mut controller).is_empty());
+}
+
+#[test]
+fn refreshing_asks_an_entity_again() {
+    let (mut controller, mut entity) = enumerated();
+    events(&mut controller);
+    // The entity changes without telling: a binding and a name.
+    entity.bindings.insert(1, (OTHER_TALKER, 0));
+    entity.rename(DescriptorType::STREAM_INPUT, 1, "Vocal");
+    let seen = entity.commands.len();
+    controller.refresh_stream(at(1), TALKER, DescriptorType::STREAM_INPUT, 1);
+    controller.refresh_descriptor(at(1), TALKER, DescriptorType::STREAM_INPUT, 1);
+    exchange(&mut controller, &mut entity, at(1));
+    assert_eq!(
+        commands_since(&entity, seen),
+        [
+            AemCommandType::GET_STREAM_INFO,
+            AemCommandType::GET_COUNTERS,
+            AemCommandType::READ_DESCRIPTOR
+        ]
+    );
+    assert!(events(&mut controller).contains(&Event::EntityModelChanged(TALKER)));
+    let model = controller.model(TALKER).unwrap();
+    let info = model.stream_info(DescriptorType::STREAM_INPUT, 1).unwrap();
+    assert!(info.bound());
+    assert_eq!(
+        model.name_of(DescriptorType::STREAM_INPUT, 1),
+        Some("Vocal")
+    );
+    // Nothing is asked of a descriptor it lacks, or of an entity not read.
+    controller.refresh_stream(at(2), TALKER, DescriptorType::STREAM_INPUT, 9);
+    controller.refresh_descriptor(at(2), OTHER_TALKER, DescriptorType::ENTITY, 0);
+    assert!(transmits(&mut controller).is_empty());
+}

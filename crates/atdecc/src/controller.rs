@@ -899,6 +899,19 @@ impl Controller {
                 }
                 self.handle_response(inflight, aem);
             }
+            // Controllers on one computer share its address, so another's
+            // responses come here too. One that changed an entity, or read
+            // how a stream stands, tells this controller what a
+            // notification would, which some entities never send.
+            AecpMessageType::AEM_RESPONSE
+                if !aem.unsolicited && aem.status().is_success() && overheard(aem.command_type) =>
+            {
+                if aem.command_type == AemCommandType::SET_CONFIGURATION {
+                    self.reconfigured(now, header.target_entity_id, aem.payload);
+                    return;
+                }
+                self.handle_notification(header.target_entity_id, aem);
+            }
             _ => {}
         }
     }
@@ -2951,6 +2964,61 @@ impl Controller {
         command
     }
 
+    /// Reads one of an entity's descriptors again, as after a
+    /// notification, the model taking what it holds now: to follow what
+    /// other controllers change on entities that send no notifications.
+    pub fn refresh_descriptor(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        descriptor_type: DescriptorType,
+        index: u16,
+    ) {
+        if self.read(entity_id, descriptor_type, index) {
+            self.queue_read(entity_id, descriptor_type, index, true);
+            self.pump(now);
+        }
+    }
+
+    /// Asks an entity again how one of its streams stands: its stream
+    /// info, and its counters where the controller reads them, which
+    /// entities that send no notifications never tell as they change.
+    pub fn refresh_stream(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        descriptor_type: DescriptorType,
+        index: u16,
+    ) {
+        if !self.read(entity_id, descriptor_type, index) {
+            return;
+        }
+        self.queue_query(
+            entity_id,
+            Request::GetStreamInfo {
+                descriptor_type,
+                index,
+            },
+        );
+        if self.config.read_counters {
+            self.queue_query(
+                entity_id,
+                Request::GetCounters {
+                    descriptor_type,
+                    index,
+                },
+            );
+        }
+        self.pump(now);
+    }
+
+    /// Whether an entity is read, with the descriptor named.
+    fn read(&self, entity_id: EntityId, descriptor_type: DescriptorType, index: u16) -> bool {
+        self.models.get(&entity_id).is_some_and(|model| {
+            model.state == EnumerationState::Complete && model.has(descriptor_type, index)
+        })
+    }
+
     /// Asks a talker what it has of a stream output (GET_TX_STATE): its
     /// stream ID, destination, VLAN and how many listen, which the model
     /// then holds.
@@ -3578,6 +3646,29 @@ fn control_values(payload: &[u8], index: u16) -> Option<&[u8]> {
         .then(|| payload.get(4..))
         .flatten()
         .filter(|values| !values.is_empty())
+}
+
+/// The responses to another controller this one learns from, as from a
+/// notification: those that changed what the model holds, or read how a
+/// stream or an interface stands.
+fn overheard(command_type: AemCommandType) -> bool {
+    matches!(
+        command_type,
+        AemCommandType::SET_CONFIGURATION
+            | AemCommandType::SET_STREAM_FORMAT
+            | AemCommandType::SET_STREAM_INFO
+            | AemCommandType::GET_STREAM_INFO
+            | AemCommandType::SET_NAME
+            | AemCommandType::SET_SAMPLING_RATE
+            | AemCommandType::SET_CLOCK_SOURCE
+            | AemCommandType::SET_CONTROL
+            | AemCommandType::GET_AVB_INFO
+            | AemCommandType::GET_AS_PATH
+            | AemCommandType::GET_COUNTERS
+            | AemCommandType::ADD_AUDIO_MAPPINGS
+            | AemCommandType::REMOVE_AUDIO_MAPPINGS
+            | AemCommandType::SET_MAX_TRANSIT_TIME
+    )
 }
 
 fn command_type_of(request: Request) -> AemCommandType {
