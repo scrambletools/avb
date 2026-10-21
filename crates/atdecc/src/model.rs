@@ -19,8 +19,9 @@ use crate::control::ControlDescriptor;
 use crate::descriptor::{
     AudioClusterDescriptor, AudioMapDescriptor, AudioUnitDescriptor, AvbInterfaceDescriptor,
     ClockDomainDescriptor, ClockSourceDescriptor, ConfigurationDescriptor, DescriptorType,
-    EntityDescriptor, LocaleDescriptor, LocalizedStringRef, SamplingRate, StreamDescriptor,
-    StreamPortDescriptor, StringsDescriptor, names,
+    EntityDescriptor, LocaleDescriptor, LocalizedStringRef, MemoryObjectDescriptor,
+    MemoryObjectType, SamplingRate, StreamDescriptor, StreamPortDescriptor, StringsDescriptor,
+    names,
 };
 use crate::id::{ClockIdentity, EntityId, StreamId};
 use crate::lite::LiteStatus;
@@ -164,6 +165,9 @@ pub struct EntityModel {
     /// The streams it declares over CVU SRP, by stream ID, with when each
     /// was last heard.
     cvu_talkers: BTreeMap<u64, (TalkerDeclaration, Instant)>,
+    /// The octets of its memory objects read through Address Access, by
+    /// MEMORY_OBJECT index: its logos.
+    memory: BTreeMap<u16, Vec<u8>>,
 }
 
 impl EntityModel {
@@ -172,6 +176,31 @@ impl EntityModel {
             state: EnumerationState::Reading,
             ..Self::default()
         }
+    }
+
+    /// Its MEMORY_OBJECT descriptors, by index.
+    pub fn memory_objects(&self) -> impl Iterator<Item = MemoryObjectDescriptor<'_>> {
+        self.descriptors(DescriptorType::MEMORY_OBJECT)
+            .filter_map(|(_, bytes)| MemoryObjectDescriptor::decode(bytes).ok())
+    }
+
+    /// The image a memory object of `memory_object_type` holds, once read:
+    /// PNG_ENTITY for the entity's logo, PNG_MANUFACTURER for its vendor's.
+    pub fn image(&self, memory_object_type: MemoryObjectType) -> Option<&[u8]> {
+        let object = self
+            .memory_objects()
+            .find(|object| object.memory_object_type == memory_object_type)?;
+        self.memory.get(&object.index).map(Vec::as_slice)
+    }
+
+    /// Stores the octets read of memory object `index`, returning whether
+    /// they differ from those stored before.
+    pub(crate) fn store_memory(&mut self, index: u16, octets: Vec<u8>) -> bool {
+        if self.memory.get(&index) == Some(&octets) {
+            return false;
+        }
+        self.memory.insert(index, octets);
+        true
     }
 
     /// Stores a descriptor, returning whether it differs from the one

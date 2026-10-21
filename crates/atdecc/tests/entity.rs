@@ -9,9 +9,10 @@ use std::time::Duration;
 use atdecc::adp::{Adpdu, EntityCapabilities};
 use atdecc::aecp::{AaMode, AaStatus, AaTlv, AddressAccessPdu, AecpHeader, AecpMessageType};
 use atdecc::controller::{Config, Controller, Event, Outcome};
-use atdecc::descriptor::DescriptorType;
+use atdecc::descriptor::{DescriptorType, MemoryObjectDescriptor, MemoryObjectType};
 use atdecc::entity::{
     EndpointModel, Entity, EntityEvent, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel,
+    VENDOR_LOGO_ADDRESS,
 };
 use atdecc::model::EnumerationState;
 use atdecc::stream_format::StreamFormat;
@@ -64,6 +65,7 @@ fn model(entity_id: EntityId, name: &str, talker: bool) -> EndpointModel {
         clock_source: 0,
         clock_source_inputs: if talker { vec![] } else { vec![0] },
         logo: None,
+        vendor_logo: None,
     }
 }
 
@@ -1019,11 +1021,13 @@ fn address_access(entity: &mut Entity, tlv: AaTlv<'_>) -> (AaStatus, Vec<u8>) {
 }
 
 #[test]
-fn an_entity_gives_its_logo_through_address_access() {
+fn an_entity_gives_its_logos_through_address_access() {
     let logo: Vec<u8> = (0..1000).map(|at| at as u8).collect();
+    let vendor_logo: Vec<u8> = (0..300).map(|at| (at * 7) as u8).collect();
     let mut entity = Entity::new(
         EndpointModel {
             logo: Some(logo.clone()),
+            vendor_logo: Some(vendor_logo.clone()),
             ..model(TALKER, "Talker", true)
         },
         &[(STREAM, DESTINATION)],
@@ -1062,6 +1066,15 @@ fn an_entity_gives_its_logo_through_address_access() {
         address_access(&mut entity, read(LOGO_ADDRESS + 900, 200)).0,
         AaStatus::ADDRESS_TOO_HIGH
     );
+    // The vendor logo, at its own address, and nothing between the two.
+    assert_eq!(
+        address_access(&mut entity, read(VENDOR_LOGO_ADDRESS + 100, 200)),
+        (AaStatus::SUCCESS, vendor_logo[100..].to_vec())
+    );
+    assert_eq!(
+        address_access(&mut entity, read(LOGO_ADDRESS + 1000, 1)).0,
+        AaStatus::ADDRESS_TOO_HIGH
+    );
     assert_eq!(
         address_access(&mut entity, read(LOGO_ADDRESS - 1, 10)).0,
         AaStatus::ADDRESS_TOO_LOW
@@ -1094,12 +1107,15 @@ fn an_entity_gives_its_logo_through_address_access() {
 }
 
 #[test]
-fn a_controller_reads_the_logos_descriptor() {
+fn a_controller_reads_the_logos() {
     let mut network = Network::new();
-    let logo = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    // More than one read holds, and less.
+    let logo: Vec<u8> = (0..1200).map(|at| (at % 251) as u8).collect();
+    let vendor_logo = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
     network.talker = Entity::new(
         EndpointModel {
             logo: Some(logo.clone()),
+            vendor_logo: Some(vendor_logo.clone()),
             ..model(TALKER, "Talker", true)
         },
         &[(STREAM, DESTINATION)],
@@ -1120,6 +1136,21 @@ fn a_controller_reads_the_logos_descriptor() {
     assert_eq!(field(84), logo.len() as u64);
     assert_eq!(field(92), logo.len() as u64);
     assert_eq!(field(100), u64::from(MEMORY_SEGMENT));
+    let vendor = model
+        .descriptor(DescriptorType::MEMORY_OBJECT, 1)
+        .and_then(|bytes| MemoryObjectDescriptor::decode(bytes).ok())
+        .expect("the vendor logo's");
+    assert_eq!(
+        vendor.memory_object_type,
+        MemoryObjectType::PNG_MANUFACTURER
+    );
+    assert_eq!(vendor.start_address, VENDOR_LOGO_ADDRESS);
+    // Both read through Address Access.
+    assert_eq!(model.image(MemoryObjectType::PNG_ENTITY), Some(&logo[..]));
+    assert_eq!(
+        model.image(MemoryObjectType::PNG_MANUFACTURER),
+        Some(&vendor_logo[..])
+    );
     // The listener, without one, has none.
     let listener = network.controller.model(LISTENER).unwrap();
     assert!(
@@ -1127,4 +1158,35 @@ fn a_controller_reads_the_logos_descriptor() {
             .descriptor(DescriptorType::MEMORY_OBJECT, 0)
             .is_none()
     );
+    assert_eq!(listener.image(MemoryObjectType::PNG_ENTITY), None);
+}
+
+#[test]
+fn a_vendor_logo_alone_is_the_first_memory_object() {
+    let mut network = Network::new();
+    let vendor_logo = vec![1, 2, 3];
+    network.talker = Entity::new(
+        EndpointModel {
+            vendor_logo: Some(vendor_logo.clone()),
+            ..model(TALKER, "Talker", true)
+        },
+        &[(STREAM, DESTINATION)],
+    );
+    network.talker.start(Instant::ZERO);
+    network.controller.discover(None);
+    network.run(3000);
+    let model = network.controller.model(TALKER).expect("read");
+    let objects: Vec<MemoryObjectDescriptor<'_>> = model.memory_objects().collect();
+    assert_eq!(objects.len(), 1);
+    assert_eq!(objects[0].index, 0);
+    assert_eq!(
+        objects[0].memory_object_type,
+        MemoryObjectType::PNG_MANUFACTURER
+    );
+    assert_eq!(objects[0].maximum_segment_length, Some(502));
+    assert_eq!(
+        model.image(MemoryObjectType::PNG_MANUFACTURER),
+        Some(&vendor_logo[..])
+    );
+    assert_eq!(model.image(MemoryObjectType::PNG_ENTITY), None);
 }

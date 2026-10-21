@@ -278,6 +278,7 @@ fn replaying_the_entities_reproduces_the_commands_and_models() {
     config.read_talker_state = false;
     config.lite_status = false;
     config.wireless_status = false;
+    config.read_logos = false;
     config.first_sequence_id = first_sequence_id;
     let mut controller = Controller::new(config);
     let mut replayed: Vec<Vec<u8>> = Vec::new();

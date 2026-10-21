@@ -83,10 +83,24 @@ pub struct EndpointModel {
     /// The PNG image controllers show the entity with: a MEMORY_OBJECT
     /// of PNG_ENTITY, its octets read through Address Access.
     pub logo: Option<Vec<u8>>,
+    /// The PNG image of its vendor, as `logo`: a MEMORY_OBJECT of
+    /// PNG_MANUFACTURER, after the logo's.
+    pub vendor_logo: Option<Vec<u8>>,
 }
 
 /// Where the logo's octets start, as Address Access reads them.
 pub const LOGO_ADDRESS: u64 = 0x1000_0000;
+/// Where the vendor logo's octets start.
+pub const VENDOR_LOGO_ADDRESS: u64 = 0x2000_0000;
+
+/// A memory object the entity has: what it holds, its name, where its
+/// octets start and the octets.
+struct MemoryObject<'a> {
+    memory_object_type: MemoryObjectType,
+    name: &'static str,
+    address: u64,
+    data: &'a [u8],
+}
 
 /// The most octets of a memory object one Address Access response
 /// carries, in a TLV of its own.
@@ -230,25 +244,67 @@ impl EndpointModel {
             (DescriptorType::CONTROL, 1),
             (DescriptorType::CLOCK_DOMAIN, 1),
         ]);
-        if self.logo.is_some() {
-            counts.push((DescriptorType::MEMORY_OBJECT, 1));
+        let memory_objects = self.memory_objects().count() as u16;
+        if memory_objects > 0 {
+            counts.push((DescriptorType::MEMORY_OBJECT, memory_objects));
         }
         counts
     }
 
+    /// Its memory objects, by MEMORY_OBJECT index: the logo, then the
+    /// vendor logo, of those it has.
+    fn memory_objects(&self) -> impl Iterator<Item = MemoryObject<'_>> {
+        [
+            (
+                MemoryObjectType::PNG_ENTITY,
+                "Logo",
+                LOGO_ADDRESS,
+                &self.logo,
+            ),
+            (
+                MemoryObjectType::PNG_MANUFACTURER,
+                "Vendor logo",
+                VENDOR_LOGO_ADDRESS,
+                &self.vendor_logo,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(memory_object_type, name, address, data)| {
+            Some(MemoryObject {
+                memory_object_type,
+                name,
+                address,
+                data: data.as_deref()?,
+            })
+        })
+    }
+
+    /// Whether it has memory for Address Access to read.
+    pub(crate) fn has_memory(&self) -> bool {
+        self.memory_objects().next().is_some()
+    }
+
+    /// The length of the memory object at MEMORY_OBJECT `index`.
+    pub(crate) fn memory_length(&self, index: u16) -> Option<u64> {
+        let object = self.memory_objects().nth(usize::from(index))?;
+        Some(object.data.len() as u64)
+    }
+
     /// `length` octets of its memory objects from `address`, as Address
-    /// Access reads them: of the logo, its one object.
+    /// Access reads them: of the object starting last at or before it.
     pub(crate) fn memory(&self, address: u64, length: u16) -> Result<&[u8], AaStatus> {
-        let logo = self.logo.as_deref().ok_or(AaStatus::ADDRESS_INVALID)?;
-        let offset = address
-            .checked_sub(LOGO_ADDRESS)
+        let object = self
+            .memory_objects()
+            .filter(|object| object.address <= address)
+            .max_by_key(|object| object.address)
             .ok_or(AaStatus::ADDRESS_TOO_LOW)?;
-        let start = usize::try_from(offset).map_err(|_| AaStatus::ADDRESS_TOO_HIGH)?;
+        let start =
+            usize::try_from(address - object.address).map_err(|_| AaStatus::ADDRESS_TOO_HIGH)?;
         let end = start
             .checked_add(usize::from(length))
-            .filter(|end| *end <= logo.len())
+            .filter(|end| *end <= object.data.len())
             .ok_or(AaStatus::ADDRESS_TOO_HIGH)?;
-        Ok(&logo[start..end])
+        Ok(&object.data[start..end])
     }
 
     /// The localized strings: the vendor and model names.
@@ -487,15 +543,16 @@ impl EndpointModel {
                 .u16(NO_STRING)
                 .pad_to(212)
                 .done(),
-            DescriptorType::MEMORY_OBJECT if index == 0 => {
-                let length = self.logo.as_ref()?.len() as u64;
+            DescriptorType::MEMORY_OBJECT => {
+                let object = self.memory_objects().nth(usize::from(index))?;
+                let length = object.data.len() as u64;
                 writer
-                    .name("Logo")
+                    .name(object.name)
                     .u16(NO_STRING)
-                    .u16(MemoryObjectType::PNG_ENTITY.0)
+                    .u16(object.memory_object_type.0)
                     .u16(DescriptorType::ENTITY.0) // target_descriptor_type
                     .u16(0) // target_descriptor_index
-                    .u64(LOGO_ADDRESS) // start_address
+                    .u64(object.address) // start_address
                     .u64(length) // maximum_length
                     .u64(length)
                     .u64(u64::from(MEMORY_SEGMENT)) // maximum_segment_length

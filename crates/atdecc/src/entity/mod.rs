@@ -35,7 +35,7 @@ use crate::pdu::{self, Pdu};
 use crate::stream_format::StreamFormat;
 use crate::time::Instant;
 
-pub use model::{EndpointModel, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel};
+pub use model::{EndpointModel, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel, VENDOR_LOGO_ADDRESS};
 use model::{EntityState, name_field};
 
 /// How long the advertisement stays valid, in units of 2 s.
@@ -704,8 +704,8 @@ impl Entity {
             | EntityCapabilities::GPTP_SUPPORTED
             | EntityCapabilities::AEM_IDENTIFY_CONTROL_INDEX_VALID
             | EntityCapabilities::AEM_INTERFACE_INDEX_VALID;
-        // Its logo is read through Address Access.
-        if self.model.logo.is_some() {
+        // Its logos are read through Address Access.
+        if self.model.has_memory() {
             capabilities |= EntityCapabilities::ADDRESS_ACCESS_SUPPORTED;
         }
         let model = &self.model;
@@ -826,7 +826,7 @@ impl Entity {
         }
     }
 
-    /// Address Access: reads of its memory objects' octets, the logo's,
+    /// Address Access: reads of its memory objects' octets, its logos',
     /// as many as one response carries. It writes and executes nothing,
     /// and without a logo has no memory to read.
     fn handle_address_access(&mut self, source: MacAddress, command: &AddressAccessPdu<'_>) {
@@ -855,7 +855,7 @@ impl Entity {
     /// The response TLVs of an Address Access command whose every TLV
     /// reads its memory, each with the octets read.
     fn read_memory(&self, command: &AddressAccessPdu<'_>) -> Result<Vec<u8>, AaStatus> {
-        if self.model.logo.is_none() {
+        if !self.model.has_memory() {
             return Err(AaStatus::NOT_IMPLEMENTED);
         }
         let mut answer = Vec::new();
@@ -1547,10 +1547,10 @@ impl Entity {
                     return (AemStatus::BAD_ARGUMENTS, echo(), false);
                 }
                 let (configuration, index) = (read_u16(payload, 0), read_u16(payload, 2));
-                match &self.model.logo {
-                    Some(logo) if configuration == 0 && index == 0 => {
+                match self.model.memory_length(index) {
+                    Some(length) if configuration == 0 => {
                         let mut answer = Vec::from(&payload[..4]);
-                        answer.extend_from_slice(&(logo.len() as u64).to_be_bytes());
+                        answer.extend_from_slice(&length.to_be_bytes());
                         (AemStatus::SUCCESS, answer, false)
                     }
                     _ => (AemStatus::NO_SUCH_DESCRIPTOR, echo(), false),

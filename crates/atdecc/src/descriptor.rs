@@ -532,6 +532,44 @@ impl<'a> ClockDomainDescriptor<'a> {
     }
 }
 
+/// The MEMORY_OBJECT descriptor: memory a controller reads or writes
+/// through Address Access, such as a logo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryObjectDescriptor<'a> {
+    pub index: u16,
+    pub object_name: &'a str,
+    pub localized_description: LocalizedStringRef,
+    pub memory_object_type: MemoryObjectType,
+    /// The descriptor it is for, such as the ENTITY.
+    pub target_descriptor_type: DescriptorType,
+    pub target_descriptor_index: u16,
+    /// Where its octets start, and how many it holds now and at most.
+    pub start_address: u64,
+    pub maximum_length: u64,
+    pub length: u64,
+    /// The most octets one Address Access TLV carries of it, which
+    /// IEEE 1722.1-2021 added; `None` where the descriptor ends before it.
+    pub maximum_segment_length: Option<u64>,
+}
+
+impl<'a> MemoryObjectDescriptor<'a> {
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+        need(bytes, 100)?;
+        Ok(Self {
+            index: read_u16(bytes, 2),
+            object_name: aem_string(&bytes[4..68]),
+            localized_description: LocalizedStringRef(read_u16(bytes, 68)),
+            memory_object_type: MemoryObjectType(read_u16(bytes, 70)),
+            target_descriptor_type: DescriptorType(read_u16(bytes, 72)),
+            target_descriptor_index: read_u16(bytes, 74),
+            start_address: read_u64(bytes, 76),
+            maximum_length: read_u64(bytes, 84),
+            length: read_u64(bytes, 92),
+            maximum_segment_length: (bytes.len() >= 108).then(|| read_u64(bytes, 100)),
+        })
+    }
+}
+
 /// The LOCALE descriptor (Table 7-21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LocaleDescriptor<'a> {

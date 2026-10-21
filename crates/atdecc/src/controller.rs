@@ -18,7 +18,10 @@ use avb_net::MacAddress;
 
 use crate::acmp::{AcmpFlags, AcmpMessageType, AcmpStatus, Acmpdu};
 use crate::adp::{AdpMessageType, Adpdu, ControllerCapabilities, EntityCapabilities};
-use crate::aecp::{AecpMessageType, AemCommandType, AemPdu, AemStatus, VendorUniquePdu};
+use crate::aecp::{
+    AaMode, AaStatus, AaTlv, AddressAccessPdu, AecpHeader, AecpMessageType, AemCommandType, AemPdu,
+    AemStatus, VendorUniquePdu,
+};
 use crate::aem::{
     self, Addressing, AsPath, AudioMap, AudioMapping, AudioMappings, AvbInfo, Counters,
     DynamicQuery, MappingChange, MaxTransitTime, ReadDescriptorResponse, SetClockSource, SetName,
@@ -27,7 +30,7 @@ use crate::aem::{
 use crate::cache::{CachedModel, ModelKey};
 use crate::descriptor::{
     AudioUnitDescriptor, ConfigurationDescriptor, DescriptorType, EntityDescriptor,
-    LocaleDescriptor, SamplingRate, StreamPortDescriptor,
+    LocaleDescriptor, MemoryObjectDescriptor, MemoryObjectType, SamplingRate, StreamPortDescriptor,
 };
 use crate::error::{DecodeError, EncodeError};
 use crate::id::{EntityId, EntityModelId};
@@ -95,6 +98,13 @@ const WIRELESS_MISSES: u8 = 3;
 /// The most values one GET_DYNAMIC_INFO asks for.
 const MAX_DYNAMIC_QUERIES: usize = 16;
 
+/// The largest logo read, against lengths no image needs.
+const MAX_LOGO: u64 = 1 << 20;
+
+/// The most octets of a memory object one Address Access response
+/// carries, in a TLV of its own.
+const MEMORY_SEGMENT: u64 = (AddressAccessPdu::MAX_TLVS_LEN - AaTlv::HEADER_LEN) as u64;
+
 /// The most parts a stream port's dynamic mappings are read in, against
 /// counts no entity could mean; Milan's parts hold up to 176 mappings.
 const MAX_MAP_PARTS: u16 = 256;
@@ -140,6 +150,9 @@ pub struct Config {
     /// `wireless_poll`, zero for never, to follow their link and time.
     pub wireless_status: bool,
     pub wireless_poll: Duration,
+    /// Read each entity's logos, its own and its vendor's, through Address
+    /// Access once it is read, where it advertises Address Access.
+    pub read_logos: bool,
     /// The controller's own MAC address, where entities advertised from
     /// it are out of its reach: it does not read them.
     pub own_mac: Option<MacAddress>,
@@ -168,6 +181,7 @@ impl Config {
             lite_poll: Duration::from_secs(5),
             wireless_status: true,
             wireless_poll: Duration::from_secs(5),
+            read_logos: true,
             own_mac: None,
             advertise: None,
             first_sequence_id: 0,
@@ -422,6 +436,12 @@ enum Request {
         queries: [DynamicQuery; MAX_DYNAMIC_QUERIES],
         count: u8,
     },
+    /// One part of a memory object's octets, from `offset`, read through
+    /// Address Access: a logo.
+    ReadMemory {
+        index: u16,
+        offset: u32,
+    },
 }
 
 /// The protocols whose commands are numbered apart.
@@ -430,6 +450,7 @@ enum Channel {
     Aem,
     Mvu,
     Acmp,
+    AddressAccess,
 }
 
 impl Request {
@@ -448,6 +469,7 @@ impl Request {
             | Request::GetTxState { .. }
             | Request::GetTxConnection { .. }
             | Request::DisconnectTx { .. } => Channel::Acmp,
+            Request::ReadMemory { .. } => Channel::AddressAccess,
             _ => Channel::Aem,
         }
     }
@@ -562,6 +584,7 @@ pub struct Controller {
     next_aem_sequence: u16,
     next_mvu_sequence: u16,
     next_acmp_sequence: u16,
+    next_address_access_sequence: u16,
     next_command: u32,
     /// When to turn each identifying entity's identify control off.
     identify_off: BTreeMap<EntityId, (Instant, u16)>,
@@ -577,6 +600,9 @@ pub struct Controller {
     mapping_changes: BTreeMap<CommandId, Vec<AudioMapping>>,
     /// The values of each SET_CONTROL waiting to go.
     control_values: BTreeMap<CommandId, Vec<u8>>,
+    /// The octets read so far of each memory object being read, by entity
+    /// and MEMORY_OBJECT index.
+    memory_reads: BTreeMap<(EntityId, u16), Vec<u8>>,
     advertiser: Option<Advertiser>,
     random: Random,
     outgoing: VecDeque<(MacAddress, Vec<u8>)>,
@@ -595,6 +621,7 @@ impl Controller {
             next_aem_sequence: config.first_sequence_id,
             next_mvu_sequence: config.first_sequence_id,
             next_acmp_sequence: config.first_sequence_id,
+            next_address_access_sequence: config.first_sequence_id,
             next_command: 0,
             identify_off: BTreeMap::new(),
             next_lite_poll: None,
@@ -602,6 +629,7 @@ impl Controller {
             cache: BTreeMap::new(),
             mapping_changes: BTreeMap::new(),
             control_values: BTreeMap::new(),
+            memory_reads: BTreeMap::new(),
             advertiser: config.advertise.map(|advertise| Advertiser {
                 config: advertise,
                 available_index: 0,
@@ -669,6 +697,14 @@ impl Controller {
             }
             Ok(Pdu::VendorUnique(vendor_unique)) => {
                 self.handle_vendor_unique(now, &vendor_unique);
+                Ok(())
+            }
+            Ok(Pdu::Aecp(header, _))
+                if header.message_type == AecpMessageType::ADDRESS_ACCESS_RESPONSE =>
+            {
+                if let Ok(response) = AddressAccessPdu::decode(bytes) {
+                    self.handle_address_access(&response);
+                }
                 Ok(())
             }
             Ok(_) => Ok(()),
@@ -795,6 +831,7 @@ impl Controller {
     fn forget(&mut self, entity_id: EntityId) {
         self.models.remove(&entity_id);
         self.identify_off.remove(&entity_id);
+        self.memory_reads.retain(|&(read, _), _| read != entity_id);
         let mut abandoned: Vec<CommandId> = Vec::new();
         if let Some(session) = self.sessions.remove(&entity_id) {
             abandoned.extend(session.queue.iter().filter_map(|request| request.command()));
@@ -1211,6 +1248,80 @@ impl Controller {
         }
     }
 
+    /// An Address Access response: the next part of a memory object read.
+    fn handle_address_access(&mut self, response: &AddressAccessPdu<'_>) {
+        let header = &response.header;
+        if header.controller_entity_id != self.config.entity_id {
+            return;
+        }
+        let key = (Channel::AddressAccess, header.sequence_id);
+        let Some(&inflight) = self.inflight.get(&key) else {
+            return;
+        };
+        let Request::ReadMemory { index, offset } = inflight.request else {
+            return;
+        };
+        if inflight.entity_id != header.target_entity_id {
+            return;
+        }
+        self.complete(key, inflight);
+        let read = (response.status() == AaStatus::SUCCESS)
+            .then(|| response.tlvs().next())
+            .flatten()
+            .and_then(Result::ok)
+            .filter(|tlv| tlv.mode == AaMode::READ && !tlv.data.is_empty());
+        self.memory_read(inflight.entity_id, index, offset, read.map(|tlv| tlv.data));
+    }
+
+    /// Takes the octets read of memory object `index` from `offset`, none
+    /// when the read failed: asks for the next part, or keeps the object
+    /// once it is all read.
+    fn memory_read(&mut self, entity_id: EntityId, index: u16, offset: u32, data: Option<&[u8]>) {
+        let key = (entity_id, index);
+        let Some(data) = data else {
+            self.memory_reads.remove(&key);
+            return;
+        };
+        let read = self.memory_reads.entry(key).or_default();
+        if offset == 0 {
+            read.clear();
+        }
+        if read.len() != offset as usize {
+            self.memory_reads.remove(&key);
+            return;
+        }
+        read.extend_from_slice(data);
+        let have = read.len() as u64;
+        let Some(model) = self.models.get_mut(&entity_id) else {
+            self.memory_reads.remove(&key);
+            return;
+        };
+        let length = model
+            .memory_objects()
+            .find(|object| object.index == index)
+            .map(|object| object.length);
+        match length {
+            Some(length) if have < length => {
+                if let Some(session) = self.sessions.get_mut(&entity_id) {
+                    session.queue.push_front(Request::ReadMemory {
+                        index,
+                        offset: have as u32,
+                    });
+                }
+            }
+            Some(length) if have == length => {
+                let octets = self.memory_reads.remove(&key).unwrap_or_default();
+                if model.store_memory(index, octets) {
+                    self.events.push_back(Event::EntityModelChanged(entity_id));
+                }
+            }
+            // More than the object holds, or an object gone.
+            _ => {
+                self.memory_reads.remove(&key);
+            }
+        }
+    }
+
     fn handle_response(&mut self, inflight: Inflight, aem: &AemPdu<'_>) {
         let entity_id = inflight.entity_id;
         match inflight.request {
@@ -1416,7 +1527,8 @@ impl Controller {
             | Request::Unbind { .. }
             | Request::GetTxState { .. }
             | Request::GetTxConnection { .. }
-            | Request::DisconnectTx { .. } => {}
+            | Request::DisconnectTx { .. }
+            | Request::ReadMemory { .. } => {}
         }
         self.check_complete(entity_id);
     }
@@ -2332,6 +2444,21 @@ impl Controller {
         if self.config.register_unsolicited && !model.registered {
             session.queue.push_back(Request::RegisterUnsolicited);
         }
+        // Its logos, from an entity that advertises Address Access.
+        let address_access = self.entities.get(&entity_id).is_some_and(|entity| {
+            entity
+                .adp
+                .entity_capabilities
+                .contains(EntityCapabilities::ADDRESS_ACCESS_SUPPORTED)
+        });
+        if self.config.read_logos && address_access {
+            for object in model.memory_objects().filter(is_logo) {
+                session.queue.push_back(Request::ReadMemory {
+                    index: object.index,
+                    offset: 0,
+                });
+            }
+        }
         self.events.push_back(Event::EntityEnumerated(entity_id));
     }
 
@@ -2432,6 +2559,7 @@ impl Controller {
                 Channel::Aem => &mut self.next_aem_sequence,
                 Channel::Mvu => &mut self.next_mvu_sequence,
                 Channel::Acmp => &mut self.next_acmp_sequence,
+                Channel::AddressAccess => &mut self.next_address_access_sequence,
             };
             let sequence = *counter;
             *counter = sequence.wrapping_add(1);
@@ -2476,7 +2604,7 @@ impl Controller {
         };
         let destination = match inflight.request.channel() {
             Channel::Acmp => crate::ADP_ACMP_MULTICAST,
-            Channel::Aem | Channel::Mvu => entity.mac,
+            Channel::Aem | Channel::Mvu | Channel::AddressAccess => entity.mac,
         };
         let length = match inflight.request {
             Request::ReadDescriptor {
@@ -2681,6 +2809,36 @@ impl Controller {
                     &queries[..usize::from(count)],
                     &mut out,
                 )
+            }
+            Request::ReadMemory { index, offset } => {
+                let Some((address, length)) = self
+                    .models
+                    .get(&inflight.entity_id)
+                    .and_then(|model| memory_part(model, index, offset))
+                else {
+                    return false;
+                };
+                let mut tlv = [0; AaTlv::HEADER_LEN];
+                let read = AaTlv {
+                    mode: AaMode::READ,
+                    length,
+                    address,
+                    data: &[],
+                };
+                read.encode(&mut tlv).and_then(|_| {
+                    AddressAccessPdu {
+                        header: AecpHeader {
+                            message_type: AecpMessageType::ADDRESS_ACCESS_COMMAND,
+                            status: 0,
+                            target_entity_id: addressing.target,
+                            controller_entity_id: addressing.controller,
+                            sequence_id,
+                        },
+                        tlv_count: 1,
+                        tlvs: &tlv,
+                    }
+                    .encode(&mut out)
+                })
             }
             Request::GetRxState { input } => acmp(
                 AcmpMessageType::GET_RX_STATE_COMMAND,
@@ -3388,6 +3546,9 @@ impl Controller {
                         .get_or_insert(now + self.config.wireless_poll);
                 }
             }
+            if let Request::ReadMemory { index, .. } = inflight.request {
+                self.memory_reads.remove(&(inflight.entity_id, index));
+            }
             if let Request::GetDynamicInfo { queries, count } = inflight.request {
                 self.dynamic_info_answered(
                     inflight.entity_id,
@@ -3671,6 +3832,34 @@ fn overheard(command_type: AemCommandType) -> bool {
     )
 }
 
+/// Whether a memory object is a logo the controller reads: a PNG of the
+/// entity or of its vendor, of a length an image needs.
+fn is_logo(object: &MemoryObjectDescriptor<'_>) -> bool {
+    matches!(
+        object.memory_object_type,
+        MemoryObjectType::PNG_ENTITY | MemoryObjectType::PNG_MANUFACTURER
+    ) && (1..=MAX_LOGO).contains(&object.length)
+}
+
+/// Where the part of memory object `index` from `offset` starts, and how
+/// many octets of it one read asks for: as many as the entity's segments
+/// and one response hold, to the object's end.
+fn memory_part(model: &EntityModel, index: u16, offset: u32) -> Option<(u64, u16)> {
+    let object = model
+        .memory_objects()
+        .find(|object| object.index == index)
+        .filter(is_logo)?;
+    let left = object.length.checked_sub(u64::from(offset))?;
+    let segment = object
+        .maximum_segment_length
+        .filter(|&segment| segment > 0)
+        .map_or(MEMORY_SEGMENT, |segment| segment.min(MEMORY_SEGMENT));
+    let length = u16::try_from(left.min(segment))
+        .ok()
+        .filter(|&length| length > 0)?;
+    Some((object.start_address.checked_add(u64::from(offset))?, length))
+}
+
 fn command_type_of(request: Request) -> AemCommandType {
     match request {
         Request::ReadDescriptor { .. } => AemCommandType::READ_DESCRIPTOR,
@@ -3706,7 +3895,8 @@ fn command_type_of(request: Request) -> AemCommandType {
         | Request::Unbind { .. }
         | Request::GetTxState { .. }
         | Request::GetTxConnection { .. }
-        | Request::DisconnectTx { .. } => AemCommandType(0xffff),
+        | Request::DisconnectTx { .. }
+        | Request::ReadMemory { .. } => AemCommandType(0xffff),
     }
 }
 
