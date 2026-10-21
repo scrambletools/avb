@@ -8,13 +8,17 @@
 //! From version 2, they ask it to listen to streams too: it declares a
 //! listener for each on the port, as the stream's talker is registered,
 //! and tells them that talker's declaration as it comes, changes and
-//! goes.
+//! goes. Where both ends take AVB Lite, it declares them there too, by
+//! CVU SRP in the name of the program's entity (the AVB Lite profile, 6),
+//! and tells the program the port's mode and where to send each copy of
+//! its streams, as AVB Lite sends one to each listener.
 //!
 //! It serves on a Unix socket in the user's runtime folder, named for the
 //! interface, which only the same user reaches. Each message is an octet
 //! of kind, two octets of length, and the payload: a Talker Advertise as
 //! MSRP encodes it, a stream ID, a stream ID and a listener's state or a
-//! refusal, a hello, or a stream ID and its talker's declaration.
+//! refusal, a hello, a stream ID and its talker's declaration, an entity
+//! ID, a stream ID with a VLAN tag and addresses, or the port's mode.
 //!
 //! Each end skips the kinds it does not know, so a kind once given keeps
 //! its payload, and what comes later takes a new kind. Each end says
@@ -27,6 +31,7 @@ use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::MacAddress;
 use crate::msrp::{self, ListenerState, TalkerDeclaration};
 
 mod kind {
@@ -41,11 +46,15 @@ mod kind {
     pub const LISTEN: u8 = 9;
     pub const UNLISTEN: u8 = 10;
     pub const TALKER: u8 = 11;
+    pub const ENTITY: u8 = 12;
+    pub const COPIES: u8 = 13;
+    pub const MODE: u8 = 14;
+    pub const ESCALATION: u8 = 15;
 }
 
 /// The version this module speaks: 1 since each end says hello and the
 /// participant answers each Declare, which version 0 did not; 2 since
-/// programs can listen through it.
+/// programs can listen through it, and declare in AVB Lite.
 pub const VERSION: u16 = 2;
 
 /// How long a program waits for the participant's hello before taking it
@@ -61,6 +70,12 @@ pub mod feature {
     /// The participant takes Listen and Unlisten: it declares listeners
     /// for a program's streams and tells it their talkers.
     pub const LISTENERS: u32 = 1 << 1;
+    /// Said by both ends: the participant keeps a program's talkers and
+    /// listeners while the port runs AVB Lite, declaring them by CVU SRP
+    /// in the name of the Entity the program gives, and tells it the
+    /// port's Mode and each stream's Copies; the program follows them.
+    /// Where either end lacks it, Unavailable stops them in AVB Lite.
+    pub const AVB_LITE: u32 = 1 << 2;
 }
 
 /// The state octet of a listener that left.
@@ -97,32 +112,49 @@ pub enum Request {
     /// computer, and tell the program the talker's declaration as it
     /// changes. The first Talker notice answers it, at once, even when no
     /// talker declares the stream; Refused answers it while the
-    /// participant cannot declare listeners, as in AVB Lite. Asking twice
-    /// is asking once.
+    /// participant cannot declare listeners, as in AVB Lite without
+    /// AVB_LITE. Asking twice is asking once.
     Listen(u64),
     /// Stop listening to the stream with this ID; nothing, for one not
     /// listened to. A connection closing stops all of its listening.
     Unlisten(u64),
+    /// The entity ID of the entity whose streams the program declares and
+    /// listens to on this connection, which AVB Lite's declarations name
+    /// as the endpoint declaring (profile 6, Message format). A program
+    /// that says AVB_LITE gives it after its hello, before it declares or
+    /// listens, else it is taken for one without AVB_LITE; a program with
+    /// streams of several entities connects once for each.
+    Entity(u64),
+    /// Whether the port's streams may escalate to multicast beyond their
+    /// unicast fan-out, as a controller set it on the program's entity
+    /// (SET_LITE_CONFIG, profile 2.4): the participant decides for every
+    /// talker on the port, so it takes it for all of them, and tells
+    /// every program the Mode that follows.
+    Escalation(bool),
     /// A Declare whose talker could not be read, with the stream ID its
     /// first octets give, where it has them.
     Unreadable(Option<u64>),
 }
 
 /// What the participant tells a program sharing it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Notice {
     /// The participant's version and features, as the program connects.
     Hello(Hello),
     /// The listeners for one of its streams, as the port registers them:
-    /// their state, or none once they left.
+    /// their state, or none once they left. In AVB Lite, as the
+    /// participant serves them: Ready where it sends the stream to all
+    /// that ask, Ready Failed where it refuses some, Asking Failed where
+    /// it refuses them all.
     Listener {
         stream_id: u64,
         state: Option<ListenerState>,
     },
     /// Its talkers and listeners cannot be declared now, as while the
-    /// port runs AVB Lite; they are withdrawn until it says they can
-    /// again, when the program declares and listens again.
+    /// port runs AVB Lite where either end lacks AVB_LITE; they are
+    /// withdrawn until it says they can again, when the program declares
+    /// and listens again.
     Unavailable,
     Available,
     /// It declared the stream with this ID, as asked.
@@ -135,11 +167,55 @@ pub enum Notice {
     },
     /// The talker of a stream the program listens to, as it declares the
     /// stream, Talker Advertise or Talker Failed, on the port or on this
-    /// computer; none while no talker declares it.
+    /// computer; none while no talker declares it. In AVB Lite, its CVU
+    /// SRP declaration: its destination `00:00:00:00:00:00` while the
+    /// stream comes unicast, to this computer's own address, else the
+    /// multicast address it escalated to (profile 6, Stream transport
+    /// addressing); Talker Failed where the talker refuses this computer,
+    /// or where this computer's link has no room for the stream, code 1
+    /// with this computer's address as Bridge ID (profile 6, item 6).
     Talker {
         stream_id: u64,
         talker: Option<TalkerDeclaration>,
     },
+    /// Where to send one of its streams while the port runs AVB Lite, and
+    /// with which VLAN tag: a unicast copy to each address, this
+    /// computer's own among them for a listener here, or the stream's
+    /// multicast address alone once it escalated; none, nothing. The
+    /// participant admits listeners for all the talkers here within the
+    /// unicast fan-out and 75% of the link, refuses the others, and
+    /// orders escalating's steps (profile 6). It comes as they change,
+    /// after the Mode they follow; while the port runs AVB Lite, a stream
+    /// with no Copies yet goes nowhere. Mode back to AVB ends them, the
+    /// stream going as declared again.
+    Copies {
+        stream_id: u64,
+        /// The tag's TCI: priority 5, and the media VLAN, or 0 for a
+        /// priority tag only (profile 7).
+        tag: u16,
+        destinations: Vec<MacAddress>,
+    },
+    /// The port's mode, and the AVB Lite settings the program's entities
+    /// report in GET_LITE_STATUS (profile 2.4): once the program, its
+    /// hello saying AVB_LITE, names its Entity, and as it changes. While
+    /// the port runs AVB Lite a program's stream goes only where its
+    /// Copies say. A program connecting while it does hears Unavailable
+    /// first, before its hello; Available follows this Mode.
+    Mode(Mode),
+}
+
+/// The port's mode and AVB Lite settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mode {
+    /// Why the port runs AVB Lite, GET_LITE_STATUS's fallback_reason;
+    /// none while it runs AVB.
+    pub lite: Option<u8>,
+    /// The media VLAN, 0 for priority tags only.
+    pub media_vlan: u16,
+    /// How many listeners a stream goes to unicast.
+    pub unicast_fanout: u8,
+    /// Whether a stream escalates to multicast beyond them.
+    pub escalation: bool,
 }
 
 /// Why the participant did not declare a stream.
@@ -148,7 +224,8 @@ pub enum Notice {
 pub enum Refusal {
     /// The Declare's talker could not be read.
     Unreadable,
-    /// It cannot declare talkers now, as while the port runs AVB Lite.
+    /// It cannot declare talkers now, as while the port runs AVB Lite
+    /// where either end lacks AVB_LITE.
     Unavailable,
     /// Another talker here declares a stream of the same ID.
     Taken,
@@ -233,6 +310,8 @@ pub fn write_request(out: &mut impl Write, request: &Request) -> io::Result<()> 
         Request::Unlisten(stream_id) => {
             write_message(out, kind::UNLISTEN, &stream_id.to_be_bytes())
         }
+        Request::Entity(entity_id) => write_message(out, kind::ENTITY, &entity_id.to_be_bytes()),
+        Request::Escalation(allowed) => write_message(out, kind::ESCALATION, &[u8::from(*allowed)]),
         Request::Unreadable(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "an unreadable Declare is only read",
@@ -261,6 +340,10 @@ pub fn read_request(input: &mut impl Read) -> io::Result<Request> {
             kind::WITHDRAW => stream_id(&payload).map(Request::Withdraw),
             kind::LISTEN => stream_id(&payload).map(Request::Listen),
             kind::UNLISTEN => stream_id(&payload).map(Request::Unlisten),
+            kind::ENTITY => stream_id(&payload).map(Request::Entity),
+            kind::ESCALATION => payload
+                .first()
+                .map(|allowed| Request::Escalation(*allowed != 0)),
             _ => None,
         };
         if let Some(request) = request {
@@ -292,7 +375,66 @@ pub fn write_notice(out: &mut impl Write, notice: &Notice) -> io::Result<()> {
             Some(talker) => write_message(out, kind::TALKER, &msrp::talker_value(talker)),
             None => write_message(out, kind::TALKER, &stream_id.to_be_bytes()),
         },
+        Notice::Copies {
+            stream_id,
+            tag,
+            destinations,
+        } => {
+            let mut payload = stream_id.to_be_bytes().to_vec();
+            payload.extend_from_slice(&tag.to_be_bytes());
+            for destination in destinations {
+                payload.extend_from_slice(&destination.0);
+            }
+            write_message(out, kind::COPIES, &payload)
+        }
+        Notice::Mode(mode) => {
+            let flags = u8::from(mode.lite.is_some()) | (u8::from(mode.escalation) << 1);
+            let vlan = mode.media_vlan.to_be_bytes();
+            let payload = [
+                flags,
+                mode.lite.unwrap_or(0),
+                vlan[0],
+                vlan[1],
+                mode.unicast_fanout,
+            ];
+            write_message(out, kind::MODE, &payload)
+        }
     }
+}
+
+/// A Copies notice, from its stream ID, tag and whole addresses.
+fn copies(payload: &[u8]) -> Option<Notice> {
+    let stream_id = stream_id(payload)?;
+    let tag = u16::from_be_bytes(payload.get(8..10)?.try_into().ok()?);
+    let addresses = &payload[10..];
+    if !addresses.len().is_multiple_of(6) {
+        return None;
+    }
+    let destinations = addresses
+        .as_chunks::<6>()
+        .0
+        .iter()
+        .map(|octets| MacAddress(*octets))
+        .collect();
+    Some(Notice::Copies {
+        stream_id,
+        tag,
+        destinations,
+    })
+}
+
+/// A Mode notice, from its first five octets: a later version may add
+/// more.
+fn mode(payload: &[u8]) -> Option<Mode> {
+    let [flags, reason, high, low, fanout, ..] = *payload else {
+        return None;
+    };
+    Some(Mode {
+        lite: (flags & 1 != 0).then_some(reason),
+        media_vlan: u16::from_be_bytes([high, low]) & 0x0fff,
+        unicast_fanout: fanout,
+        escalation: flags & 2 != 0,
+    })
 }
 
 /// A Talker notice's declaration, from its value.
@@ -340,6 +482,8 @@ pub fn read_notice(input: &mut impl Read) -> io::Result<Notice> {
                     talker: talker(&payload)?,
                 })
             }),
+            kind::COPIES => copies(&payload),
+            kind::MODE => mode(&payload).map(Notice::Mode),
             _ => None,
         };
         if let Some(notice) = notice {
@@ -383,6 +527,9 @@ mod tests {
         write_request(&mut wire, &Request::Withdraw(7)).unwrap();
         write_request(&mut wire, &Request::Listen(8)).unwrap();
         write_request(&mut wire, &Request::Unlisten(8)).unwrap();
+        write_request(&mut wire, &Request::Entity(0xa010_a3ff_fea5_1726)).unwrap();
+        write_request(&mut wire, &Request::Escalation(true)).unwrap();
+        write_request(&mut wire, &Request::Escalation(false)).unwrap();
         let mut input = wire.as_slice();
         assert_eq!(read_request(&mut input).unwrap(), Request::Hello(HELLO));
         assert_eq!(
@@ -392,6 +539,15 @@ mod tests {
         assert_eq!(read_request(&mut input).unwrap(), Request::Withdraw(7));
         assert_eq!(read_request(&mut input).unwrap(), Request::Listen(8));
         assert_eq!(read_request(&mut input).unwrap(), Request::Unlisten(8));
+        assert_eq!(
+            read_request(&mut input).unwrap(),
+            Request::Entity(0xa010_a3ff_fea5_1726)
+        );
+        assert_eq!(read_request(&mut input).unwrap(), Request::Escalation(true));
+        assert_eq!(
+            read_request(&mut input).unwrap(),
+            Request::Escalation(false)
+        );
         assert!(read_request(&mut input).is_err(), "nothing more");
 
         let notices = [
@@ -433,6 +589,31 @@ mod tests {
                 stream_id: 7,
                 talker: None,
             },
+            Notice::Copies {
+                stream_id: 7,
+                tag: (5 << 13) | 2,
+                destinations: vec![
+                    MacAddress([0xe8, 0xf6, 0x0a, 0xe0, 0x92, 0x20]),
+                    MacAddress([0xa0, 0x10, 0xa3, 0xa5, 0x17, 0x26]),
+                ],
+            },
+            Notice::Copies {
+                stream_id: 7,
+                tag: 5 << 13,
+                destinations: Vec::new(),
+            },
+            Notice::Mode(Mode {
+                lite: Some(2),
+                media_vlan: 2,
+                unicast_fanout: 2,
+                escalation: true,
+            }),
+            Notice::Mode(Mode {
+                lite: None,
+                media_vlan: 0,
+                unicast_fanout: 1,
+                escalation: false,
+            }),
         ];
         let mut wire = Vec::new();
         for notice in &notices {
@@ -472,6 +653,7 @@ mod tests {
         assert_eq!(read_notice(&mut input).unwrap(), Notice::Available);
         assert!(HELLO.has(feature::LOCAL_LISTENERS));
         assert!(!HELLO.has(feature::LISTENERS));
+        assert!(!HELLO.has(feature::LOCAL_LISTENERS | feature::AVB_LITE));
         assert!(
             !Hello {
                 features: 0,
@@ -479,6 +661,29 @@ mod tests {
             }
             .has(feature::LOCAL_LISTENERS)
         );
+    }
+
+    /// A Mode a later version lengthens still reads, and Copies with part
+    /// of an address do not.
+    #[test]
+    fn a_later_mode_keeps_its_first_octets() {
+        let mut wire = Vec::new();
+        write_message(&mut wire, kind::MODE, &[1, 4, 0, 2, 2, 9, 9]).unwrap();
+        let mut ragged = 7u64.to_be_bytes().to_vec();
+        ragged.extend_from_slice(&[0xa0, 0x02, 1, 2, 3]);
+        write_message(&mut wire, kind::COPIES, &ragged).unwrap();
+        write_notice(&mut wire, &Notice::Available).unwrap();
+        let mut input = wire.as_slice();
+        assert_eq!(
+            read_notice(&mut input).unwrap(),
+            Notice::Mode(Mode {
+                lite: Some(4),
+                media_vlan: 2,
+                unicast_fanout: 2,
+                escalation: false,
+            })
+        );
+        assert_eq!(read_notice(&mut input).unwrap(), Notice::Available);
     }
 
     #[test]
