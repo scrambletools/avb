@@ -381,6 +381,28 @@ fn a_talker_without_an_address_is_probed_again_until_it_has_one() {
     );
 }
 
+/// An entity's AVB_INTERFACE counters, link up and down and grandmaster
+/// changes, as it is given them, read by a controller.
+#[test]
+fn a_controller_reads_an_entitys_interface_counters() {
+    let mut network = Network::new();
+    let mut counters = [0; 32];
+    counters[0] = 2;
+    counters[1] = 1;
+    counters[5] = 3;
+    network
+        .talker
+        .set_counters(DescriptorType::AVB_INTERFACE, 0, counters);
+    network.controller.discover(None);
+    network.run(3000);
+    let model = network.controller.model(TALKER).expect("read");
+    let read = model
+        .counters(DescriptorType::AVB_INTERFACE, 0)
+        .expect("GET_COUNTERS answered");
+    assert_eq!(read.valid, 0b10_0011);
+    assert_eq!(&read.block[..6], &[2, 1, 0, 0, 0, 3]);
+}
+
 #[test]
 fn a_controller_reads_an_entitys_avb_lite_status() {
     use atdecc::ClockIdentity as Clock;

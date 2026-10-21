@@ -246,6 +246,9 @@ pub struct Entity {
     inputs: Vec<Input>,
     /// The clock domain's counters: how often it locked and unlocked.
     clock_counters: [u32; 32],
+    /// The AVB_INTERFACE's counters: how often its link went up and down,
+    /// and its grandmaster changed.
+    interface_counters: [u32; 32],
     /// Each stream port input's dynamic mappings, by port.
     input_mappings: Vec<Vec<AudioMapping>>,
     known: BTreeMap<EntityId, Known>,
@@ -305,6 +308,7 @@ impl Entity {
             outputs,
             inputs,
             clock_counters: [0; 32],
+            interface_counters: [0; 32],
             known: BTreeMap::new(),
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
@@ -655,9 +659,10 @@ impl Entity {
         }
     }
 
-    /// Takes a stream's or the clock domain's counters, by their place in
-    /// GET_COUNTERS (Milan 1.3, 5.4.2.25): registered controllers hear
-    /// when they change. Call it no more than once a second.
+    /// Takes a stream's, the clock domain's or the AVB_INTERFACE's
+    /// counters, by their place in GET_COUNTERS (Milan 1.3, 5.4.2.25):
+    /// registered controllers hear when they change. Call it no more than
+    /// once a second.
     pub fn set_counters(
         &mut self,
         descriptor_type: DescriptorType,
@@ -666,6 +671,7 @@ impl Entity {
     ) {
         let slot = match descriptor_type {
             DescriptorType::CLOCK_DOMAIN if index == 0 => Some(&mut self.clock_counters),
+            DescriptorType::AVB_INTERFACE if index == 0 => Some(&mut self.interface_counters),
             DescriptorType::STREAM_INPUT => self
                 .inputs
                 .get_mut(usize::from(index))
@@ -1947,6 +1953,7 @@ impl Entity {
             DescriptorType::STREAM_INPUT => self.inputs[usize::from(index)].counters,
             DescriptorType::STREAM_OUTPUT => self.outputs[usize::from(index)].counters,
             DescriptorType::CLOCK_DOMAIN => self.clock_counters,
+            DescriptorType::AVB_INTERFACE => self.interface_counters,
             _ => [0; 32],
         };
         let mut answer = Vec::with_capacity(136);
