@@ -471,12 +471,19 @@ fn take_changes(shared: &Shared, running: &mut [Option<Running>]) {
             continue;
         };
         if let Some(stream) = running.get_mut(place) {
-            *stream = change.map(|opened| Running {
-                opened,
-                counters: counters.get(place).cloned().unwrap_or_default(),
-                expected: None,
-                last: Instant::now(),
-                mapped: Vec::new(),
+            *stream = change.map(|opened| {
+                // What the socket took while the sink opened and this
+                // thread slept is past its time: the stream starts with
+                // what comes next, rather than with frames counted late.
+                let mut frame = [0u8; 1522];
+                while let Ok(Some(_)) = opened.receiver.receive(&mut frame, Some(Duration::ZERO)) {}
+                Running {
+                    opened,
+                    counters: counters.get(place).cloned().unwrap_or_default(),
+                    expected: None,
+                    last: Instant::now(),
+                    mapped: Vec::new(),
+                }
             });
         }
     }
