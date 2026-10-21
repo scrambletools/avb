@@ -21,7 +21,8 @@ use crate::adp::{
     AdpMessageType, Adpdu, EntityCapabilities, ListenerCapabilities, TalkerCapabilities,
 };
 use crate::aecp::{
-    AecpHeader, AecpMessageType, AemCommandType, AemPdu, AemStatus, VendorUniquePdu,
+    AaMode, AaStatus, AaTlv, AddressAccessPdu, AecpHeader, AecpMessageType, AemCommandType, AemPdu,
+    AemStatus, VendorUniquePdu,
 };
 use crate::aem::NAME_LENGTH;
 use crate::aem::{AudioMapping, AvbInfoFlags, StreamInfoFlags};
@@ -34,7 +35,7 @@ use crate::pdu::{self, Pdu};
 use crate::stream_format::StreamFormat;
 use crate::time::Instant;
 
-pub use model::{EndpointModel, StreamModel};
+pub use model::{EndpointModel, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel};
 use model::{EntityState, name_field};
 
 /// How long the advertisement stays valid, in units of 2 s.
@@ -697,12 +698,16 @@ impl Entity {
     }
 
     fn capabilities(&self) -> EntityCapabilities {
-        let capabilities = EntityCapabilities::AEM_SUPPORTED
+        let mut capabilities = EntityCapabilities::AEM_SUPPORTED
             | EntityCapabilities::VENDOR_UNIQUE_SUPPORTED
             | EntityCapabilities::CLASS_A_SUPPORTED
             | EntityCapabilities::GPTP_SUPPORTED
             | EntityCapabilities::AEM_IDENTIFY_CONTROL_INDEX_VALID
             | EntityCapabilities::AEM_INTERFACE_INDEX_VALID;
+        // Its logo is read through Address Access.
+        if self.model.logo.is_some() {
+            capabilities |= EntityCapabilities::ADDRESS_ACCESS_SUPPORTED;
+        }
         let model = &self.model;
         if model
             .outputs
@@ -809,8 +814,68 @@ impl Entity {
             {
                 self.handle_vendor_unique(source, &vendor);
             }
+            Pdu::Aecp(header, _)
+                if header.target_entity_id == self.model.entity_id
+                    && header.message_type == AecpMessageType::ADDRESS_ACCESS_COMMAND =>
+            {
+                if let Ok(command) = AddressAccessPdu::decode(bytes) {
+                    self.handle_address_access(source, &command);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// Address Access: reads of its memory objects' octets, the logo's,
+    /// as many as one response carries. It writes and executes nothing,
+    /// and without a logo has no memory to read.
+    fn handle_address_access(&mut self, source: MacAddress, command: &AddressAccessPdu<'_>) {
+        let (status, tlv_count, tlvs) = match self.read_memory(command) {
+            Ok(answer) => (AaStatus::SUCCESS, command.tlv_count, answer),
+            Err(refusal) => {
+                let (count, tlvs) = refused(command);
+                (refusal, count, tlvs)
+            }
+        };
+        let response = AddressAccessPdu {
+            header: AecpHeader {
+                message_type: AecpMessageType::ADDRESS_ACCESS_RESPONSE,
+                status: status.0,
+                ..command.header
+            },
+            tlv_count,
+            tlvs: &tlvs,
+        };
+        let mut out = [0; 1500];
+        if let Ok(length) = response.encode(&mut out) {
+            self.outgoing.push_back((source, out[..length].to_vec()));
+        }
+    }
+
+    /// The response TLVs of an Address Access command whose every TLV
+    /// reads its memory, each with the octets read.
+    fn read_memory(&self, command: &AddressAccessPdu<'_>) -> Result<Vec<u8>, AaStatus> {
+        if self.model.logo.is_none() {
+            return Err(AaStatus::NOT_IMPLEMENTED);
+        }
+        let mut answer = Vec::new();
+        for tlv in command.tlvs() {
+            let tlv = tlv.map_err(|_| AaStatus::TLV_INVALID)?;
+            if tlv.mode != AaMode::READ {
+                return Err(AaStatus::UNSUPPORTED);
+            }
+            let data = self.model.memory(tlv.address, tlv.length)?;
+            let at = answer.len();
+            let end = at + AaTlv::HEADER_LEN + data.len();
+            if end > AddressAccessPdu::MAX_TLVS_LEN {
+                return Err(AaStatus::TLV_INVALID);
+            }
+            answer.resize(end, 0);
+            AaTlv { data, ..tlv }
+                .encode(&mut answer[at..])
+                .map_err(|_| AaStatus::TLV_INVALID)?;
+        }
+        Ok(answer)
     }
 
     fn handle_adp(&mut self, now: Instant, adpdu: &Adpdu) {
@@ -1477,6 +1542,20 @@ impl Entity {
                 answer.extend_from_slice(&u64::from(output.max_transit_time).to_be_bytes());
                 (AemStatus::SUCCESS, answer, true)
             }
+            AemCommandType::GET_MEMORY_OBJECT_LENGTH => {
+                if short(4) {
+                    return (AemStatus::BAD_ARGUMENTS, echo(), false);
+                }
+                let (configuration, index) = (read_u16(payload, 0), read_u16(payload, 2));
+                match &self.model.logo {
+                    Some(logo) if configuration == 0 && index == 0 => {
+                        let mut answer = Vec::from(&payload[..4]);
+                        answer.extend_from_slice(&(logo.len() as u64).to_be_bytes());
+                        (AemStatus::SUCCESS, answer, false)
+                    }
+                    _ => (AemStatus::NO_SUCH_DESCRIPTOR, echo(), false),
+                }
+            }
             AemCommandType::GET_AUDIO_MAP => self.audio_map(payload),
             AemCommandType::ADD_AUDIO_MAPPINGS | AemCommandType::REMOVE_AUDIO_MAPPINGS => {
                 self.change_mappings(command.command_type, payload)
@@ -1975,6 +2054,29 @@ fn is_talker_command(message: AcmpMessageType) -> bool {
             | AcmpMessageType::GET_TX_STATE_COMMAND
             | AcmpMessageType::GET_TX_CONNECTION_COMMAND
     )
+}
+
+/// The TLVs of a refused Address Access command given back with nothing
+/// read, as many as can be read, each READ's length zero, so they read
+/// as a response's; and how many.
+fn refused(command: &AddressAccessPdu<'_>) -> (u16, Vec<u8>) {
+    let mut echo = Vec::new();
+    let mut count = 0;
+    for tlv in command.tlvs().map_while(Result::ok) {
+        let tlv = if tlv.mode == AaMode::READ {
+            AaTlv { length: 0, ..tlv }
+        } else {
+            tlv
+        };
+        let at = echo.len();
+        echo.resize(at + AaTlv::HEADER_LEN + tlv.data.len(), 0);
+        if tlv.encode(&mut echo[at..]).is_err() {
+            echo.truncate(at);
+            break;
+        }
+        count += 1;
+    }
+    (count, echo)
 }
 
 /// Stream `stream`'s `channels` channels to its clusters one to one.

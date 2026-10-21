@@ -6,9 +6,13 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use atdecc::adp::{Adpdu, EntityCapabilities};
+use atdecc::aecp::{AaMode, AaStatus, AaTlv, AddressAccessPdu, AecpHeader, AecpMessageType};
 use atdecc::controller::{Config, Controller, Event, Outcome};
 use atdecc::descriptor::DescriptorType;
-use atdecc::entity::{EndpointModel, Entity, EntityEvent, StreamModel};
+use atdecc::entity::{
+    EndpointModel, Entity, EntityEvent, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel,
+};
 use atdecc::model::EnumerationState;
 use atdecc::stream_format::StreamFormat;
 use atdecc::{
@@ -59,6 +63,7 @@ fn model(entity_id: EntityId, name: &str, talker: bool) -> EndpointModel {
         },
         clock_source: 0,
         clock_source_inputs: if talker { vec![] } else { vec![0] },
+        logo: None,
     }
 }
 
@@ -973,4 +978,153 @@ fn an_outputs_class_follows_its_format() {
     network.run(1000);
     assert!(network.talker.model().outputs[0].class_b());
     assert_eq!(network.talker.max_transit_time(0), Some(5_000_000));
+}
+
+/// Asks `entity` for its memory with one Address Access TLV: the status,
+/// and the octets the response's TLV carries.
+fn address_access(entity: &mut Entity, tlv: AaTlv<'_>) -> (AaStatus, Vec<u8>) {
+    let mut tlvs = [0; 600];
+    let length = tlv.encode(&mut tlvs).unwrap();
+    let command = AddressAccessPdu {
+        header: AecpHeader {
+            message_type: AecpMessageType::ADDRESS_ACCESS_COMMAND,
+            status: 0,
+            target_entity_id: TALKER,
+            controller_entity_id: EntityId(0x0200_00ff_fe00_0001),
+            sequence_id: 3,
+        },
+        tlv_count: 1,
+        tlvs: &tlvs[..length],
+    };
+    let mut out = [0; 1500];
+    let length = command.encode(&mut out).unwrap();
+    entity.handle_frame(Instant::ZERO, CONTROLLER_MAC, &out[..length]);
+    let (destination, bytes) = entity.poll_transmit().expect("an answer");
+    assert_eq!(destination, CONTROLLER_MAC);
+    assert!(entity.poll_transmit().is_none());
+    let response = AddressAccessPdu::decode(&bytes).unwrap();
+    assert_eq!(
+        response.header.message_type,
+        AecpMessageType::ADDRESS_ACCESS_RESPONSE
+    );
+    assert_eq!(response.header.sequence_id, 3);
+    // Every response's TLVs read as a response's, a refusal's too.
+    let tlvs: Vec<AaTlv<'_>> = response.tlvs().map(Result::unwrap).collect();
+    (
+        response.status(),
+        tlvs.first()
+            .map(|tlv| tlv.data.to_vec())
+            .unwrap_or_default(),
+    )
+}
+
+#[test]
+fn an_entity_gives_its_logo_through_address_access() {
+    let logo: Vec<u8> = (0..1000).map(|at| at as u8).collect();
+    let mut entity = Entity::new(
+        EndpointModel {
+            logo: Some(logo.clone()),
+            ..model(TALKER, "Talker", true)
+        },
+        &[(STREAM, DESTINATION)],
+    );
+    entity.start(Instant::ZERO);
+    let adp = loop {
+        if let Some(adp) = std::iter::from_fn(|| entity.poll_transmit())
+            .find_map(|(_, bytes)| Adpdu::decode(&bytes).ok())
+        {
+            break adp;
+        }
+        let at = entity.poll_timeout().expect("it advertises");
+        entity.handle_timeout(at);
+    };
+    assert!(
+        adp.entity_capabilities
+            .contains(EntityCapabilities::ADDRESS_ACCESS_SUPPORTED)
+    );
+    while entity.poll_transmit().is_some() {}
+    let read = |address: u64, length: u16| AaTlv {
+        mode: AaMode::READ,
+        length,
+        address,
+        data: &[],
+    };
+    assert_eq!(
+        address_access(&mut entity, read(LOGO_ADDRESS + 500, 400)),
+        (AaStatus::SUCCESS, logo[500..900].to_vec())
+    );
+    // The most one response carries, to the logo's end.
+    assert_eq!(
+        address_access(&mut entity, read(LOGO_ADDRESS + 498, MEMORY_SEGMENT)),
+        (AaStatus::SUCCESS, logo[498..].to_vec())
+    );
+    assert_eq!(
+        address_access(&mut entity, read(LOGO_ADDRESS + 900, 200)).0,
+        AaStatus::ADDRESS_TOO_HIGH
+    );
+    assert_eq!(
+        address_access(&mut entity, read(LOGO_ADDRESS - 1, 10)).0,
+        AaStatus::ADDRESS_TOO_LOW
+    );
+    assert_eq!(
+        address_access(&mut entity, read(LOGO_ADDRESS, MEMORY_SEGMENT + 1)).0,
+        AaStatus::TLV_INVALID
+    );
+    let write = AaTlv {
+        mode: AaMode::WRITE,
+        length: 2,
+        address: LOGO_ADDRESS,
+        data: &[1, 2],
+    };
+    assert_eq!(address_access(&mut entity, write).0, AaStatus::UNSUPPORTED);
+    assert_eq!(
+        logo,
+        entity.model().logo.clone().unwrap(),
+        "nothing written"
+    );
+
+    // Without a logo there is no memory to read.
+    let mut plain = Entity::new(model(TALKER, "Talker", true), &[(STREAM, DESTINATION)]);
+    plain.start(Instant::ZERO);
+    while plain.poll_transmit().is_some() {}
+    assert_eq!(
+        address_access(&mut plain, read(LOGO_ADDRESS, 10)).0,
+        AaStatus::NOT_IMPLEMENTED
+    );
+}
+
+#[test]
+fn a_controller_reads_the_logos_descriptor() {
+    let mut network = Network::new();
+    let logo = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    network.talker = Entity::new(
+        EndpointModel {
+            logo: Some(logo.clone()),
+            ..model(TALKER, "Talker", true)
+        },
+        &[(STREAM, DESTINATION)],
+    );
+    network.talker.start(Instant::ZERO);
+    network.controller.discover(None);
+    network.run(3000);
+    let model = network.controller.model(TALKER).expect("read");
+    assert_eq!(model.state, EnumerationState::Complete);
+    let descriptor = model
+        .descriptor(DescriptorType::MEMORY_OBJECT, 0)
+        .expect("its MEMORY_OBJECT");
+    assert_eq!(descriptor.len(), 108);
+    let field = |at: usize| u64::from_be_bytes(descriptor[at..at + 8].try_into().unwrap());
+    // memory_object_type, then the descriptor it is for.
+    assert_eq!(descriptor[70..76], [0x00, 0x0a, 0x00, 0x00, 0x00, 0x00]);
+    assert_eq!(field(76), LOGO_ADDRESS);
+    assert_eq!(field(84), logo.len() as u64);
+    assert_eq!(field(92), logo.len() as u64);
+    assert_eq!(field(100), u64::from(MEMORY_SEGMENT));
+    // The listener, without one, has none.
+    let listener = network.controller.model(LISTENER).unwrap();
+    assert!(
+        listener
+            .descriptor(DescriptorType::MEMORY_OBJECT, 0)
+            .is_none()
+    );
 }

@@ -297,6 +297,165 @@ impl<'a> VendorUniquePdu<'a> {
     }
 }
 
+code! {
+    /// What an Address Access TLV does at its address.
+    pub struct AaMode(u8) {
+        const READ = 0;
+        const WRITE = 1;
+        const EXECUTE = 2;
+    }
+}
+
+code! {
+    /// Address Access status; SUCCESS in commands.
+    pub struct AaStatus(u8) {
+        const SUCCESS = 0;
+        const NOT_IMPLEMENTED = 1;
+        const ADDRESS_TOO_LOW = 2;
+        const ADDRESS_TOO_HIGH = 3;
+        const ADDRESS_INVALID = 4;
+        const TLV_INVALID = 5;
+        const DATA_INVALID = 6;
+        const UNSUPPORTED = 7;
+    }
+}
+
+/// One Address Access TLV: what to do at an address, over how many
+/// octets, with the octets written, or those read in a response.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AaTlv<'a> {
+    pub mode: AaMode,
+    /// The octets it reads, writes or executes, in 12 bits.
+    pub length: u16,
+    pub address: u64,
+    /// The octets written, or read in a response; none in a READ command.
+    pub data: &'a [u8],
+}
+
+impl AaTlv<'_> {
+    /// Octets of mode, length and address before its data.
+    pub const HEADER_LEN: usize = 10;
+
+    /// Writes it at the start of `out`, returning the octets written.
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, EncodeError> {
+        if self.length > 0x0fff {
+            return Err(EncodeError::OutOfRange("length"));
+        }
+        if self.mode.0 > 0x0f {
+            return Err(EncodeError::OutOfRange("mode"));
+        }
+        let length = Self::HEADER_LEN + self.data.len();
+        let out = avtp::buffer(out, length)?;
+        let word = (u16::from(self.mode.0) << 12) | self.length;
+        avtp::write(out, 0, &word.to_be_bytes());
+        avtp::write(out, 2, &self.address.to_be_bytes());
+        avtp::write(out, Self::HEADER_LEN, self.data);
+        Ok(length)
+    }
+}
+
+/// An Address Access command or response: the header and its TLVs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddressAccessPdu<'a> {
+    pub header: AecpHeader,
+    pub tlv_count: u16,
+    /// The TLVs as they go on the wire, which [`tlvs`](Self::tlvs)
+    /// reads.
+    pub tlvs: &'a [u8],
+}
+
+impl<'a> AddressAccessPdu<'a> {
+    /// The most octets of TLVs one carries: a control_data_length of at
+    /// most 524, less the controller ID, sequence ID and tlv_count.
+    pub const MAX_TLVS_LEN: usize = 512;
+
+    pub fn status(&self) -> AaStatus {
+        AaStatus(self.header.status)
+    }
+
+    /// Decodes an ADDRESS_ACCESS_COMMAND or ADDRESS_ACCESS_RESPONSE.
+    pub fn decode(bytes: &'a [u8]) -> Result<Self, DecodeError> {
+        let (header, body) = AecpHeader::decode(bytes)?;
+        if !matches!(
+            header.message_type,
+            AecpMessageType::ADDRESS_ACCESS_COMMAND | AecpMessageType::ADDRESS_ACCESS_RESPONSE
+        ) {
+            return Err(DecodeError::WrongMessageType(header.message_type.0));
+        }
+        if body.len() < 2 {
+            return Err(DecodeError::ShortControlData(
+                (body.len() + AecpHeader::LEN - ControlHeader::COMMON_LEN) as u16,
+            ));
+        }
+        Ok(Self {
+            header,
+            tlv_count: read_u16(body, 0),
+            tlvs: &body[2..],
+        })
+    }
+
+    pub fn encode(&self, out: &mut [u8]) -> Result<usize, EncodeError> {
+        self.header
+            .encode(&[&self.tlv_count.to_be_bytes(), self.tlvs], out)
+    }
+
+    /// Its TLVs in order, an error for one the octets left cannot hold,
+    /// after which there are none. A READ command's carry no octets; a
+    /// response's carry those read.
+    pub fn tlvs(&self) -> AaTlvs<'a> {
+        AaTlvs {
+            rest: self.tlvs,
+            left: self.tlv_count,
+            command: !self.header.message_type.is_response(),
+        }
+    }
+}
+
+/// The TLVs of an [`AddressAccessPdu`].
+#[derive(Debug, Clone)]
+pub struct AaTlvs<'a> {
+    rest: &'a [u8],
+    left: u16,
+    command: bool,
+}
+
+impl<'a> Iterator for AaTlvs<'a> {
+    type Item = Result<AaTlv<'a>, DecodeError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.left == 0 {
+            return None;
+        }
+        self.left -= 1;
+        let truncated = |needed, available| Some(Err(DecodeError::Truncated { needed, available }));
+        if self.rest.len() < AaTlv::HEADER_LEN {
+            self.left = 0;
+            return truncated(AaTlv::HEADER_LEN, self.rest.len());
+        }
+        let word = read_u16(self.rest, 0);
+        let mode = AaMode((word >> 12) as u8);
+        let length = word & 0x0fff;
+        let carried = if self.command && mode == AaMode::READ {
+            0
+        } else {
+            usize::from(length)
+        };
+        let end = AaTlv::HEADER_LEN + carried;
+        if self.rest.len() < end {
+            self.left = 0;
+            return truncated(end, self.rest.len());
+        }
+        let tlv = AaTlv {
+            mode,
+            length,
+            address: read_u64(self.rest, 2),
+            data: &self.rest[AaTlv::HEADER_LEN..end],
+        };
+        self.rest = &self.rest[end..];
+        Some(Ok(tlv))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,5 +533,98 @@ mod tests {
         assert_eq!(out[3], 20);
         assert_eq!(VendorUniquePdu::decode(&out[..length]), Ok(pdu));
         assert!(AemPdu::decode(&out[..length]).is_err());
+    }
+
+    /// An Address Access command reading 400 octets at 0x1000_0000, laid
+    /// out by hand.
+    const READ_400: [u8; 34] = [
+        0xfb, 0x02, 0x00, 0x16, // ADDRESS_ACCESS_COMMAND, status 0, length 22
+        0xa0, 0x10, 0xa3, 0xff, 0x00, 0xa5, 0x17, 0x26, // target_entity_id
+        0x9c, 0x6b, 0x00, 0xff, 0xfe, 0x30, 0x9a, 0x2b, // controller_entity_id
+        0x00, 0x09, // sequence_id
+        0x00, 0x01, // tlv_count
+        0x01, 0x90, // mode READ, length 400
+        0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x00, // address
+    ];
+
+    #[test]
+    fn an_address_access_read_carries_no_octets() {
+        let pdu = AddressAccessPdu::decode(&READ_400).unwrap();
+        assert_eq!(
+            pdu.header.message_type,
+            AecpMessageType::ADDRESS_ACCESS_COMMAND
+        );
+        assert_eq!(pdu.header.sequence_id, 9);
+        let tlvs: Vec<_> = pdu.tlvs().collect();
+        assert_eq!(
+            tlvs,
+            [Ok(AaTlv {
+                mode: AaMode::READ,
+                length: 400,
+                address: 0x1000_0000,
+                data: &[],
+            })]
+        );
+        let mut out = [0; 64];
+        assert_eq!(pdu.encode(&mut out), Ok(READ_400.len()));
+        assert_eq!(out[..READ_400.len()], READ_400);
+        assert!(AemPdu::decode(&READ_400).is_err());
+    }
+
+    #[test]
+    fn an_address_access_response_carries_what_it_read() {
+        let read = [0x89, b'P', b'N', b'G'];
+        let mut tlv = [0; 14];
+        let tlv_length = AaTlv {
+            mode: AaMode::READ,
+            length: 4,
+            address: 0x1000_0000,
+            data: &read,
+        }
+        .encode(&mut tlv)
+        .unwrap();
+        assert_eq!(tlv_length, 14);
+        let pdu = AddressAccessPdu {
+            header: AecpHeader {
+                message_type: AecpMessageType::ADDRESS_ACCESS_RESPONSE,
+                status: AaStatus::SUCCESS.0,
+                sequence_id: 9,
+                ..AecpHeader::default()
+            },
+            tlv_count: 1,
+            tlvs: &tlv,
+        };
+        let mut out = [0; 64];
+        let length = pdu.encode(&mut out).unwrap();
+        let decoded = AddressAccessPdu::decode(&out[..length]).unwrap();
+        assert_eq!(decoded, pdu);
+        assert_eq!(decoded.tlvs().next().unwrap().unwrap().data, read);
+    }
+
+    #[test]
+    fn a_tlv_past_the_octets_is_refused() {
+        let mut short = READ_400;
+        // Two TLVs claimed, one there.
+        short[23] = 2;
+        let pdu = AddressAccessPdu::decode(&short).unwrap();
+        let tlvs: Vec<_> = pdu.tlvs().collect();
+        assert_eq!(tlvs.len(), 2);
+        assert!(tlvs[0].is_ok());
+        assert!(matches!(tlvs[1], Err(DecodeError::Truncated { .. })));
+        // A WRITE carries the octets it writes, which are not there.
+        let mut write = READ_400;
+        write[24] = 0x11;
+        let pdu = AddressAccessPdu::decode(&write).unwrap();
+        assert!(matches!(
+            pdu.tlvs().next(),
+            Some(Err(DecodeError::Truncated { .. }))
+        ));
+        let too_long = AaTlv {
+            mode: AaMode::READ,
+            length: 0x1000,
+            address: 0,
+            data: &[],
+        };
+        assert!(too_long.encode(&mut [0; 16]).is_err());
     }
 }

@@ -16,8 +16,11 @@ use alloc::vec::Vec;
 
 use avb_net::MacAddress;
 
+use crate::aecp::{AaStatus, AaTlv, AddressAccessPdu};
 use crate::aem::NAME_LENGTH;
-use crate::descriptor::{ClockSourceType, DescriptorType, InterfaceFlags, StreamFlags};
+use crate::descriptor::{
+    ClockSourceType, DescriptorType, InterfaceFlags, MemoryObjectType, StreamFlags,
+};
 use crate::id::{ClockIdentity, EntityId, EntityModelId};
 use crate::stream_format::StreamFormat;
 
@@ -77,7 +80,17 @@ pub struct EndpointModel {
     /// The stream inputs that are clock sources too, beside the internal
     /// clock: those whose media clock the entity can follow.
     pub clock_source_inputs: Vec<u16>,
+    /// The PNG image controllers show the entity with: a MEMORY_OBJECT
+    /// of PNG_ENTITY, its octets read through Address Access.
+    pub logo: Option<Vec<u8>>,
 }
+
+/// Where the logo's octets start, as Address Access reads them.
+pub const LOGO_ADDRESS: u64 = 0x1000_0000;
+
+/// The most octets of a memory object one Address Access response
+/// carries, in a TLV of its own.
+pub const MEMORY_SEGMENT: u16 = (AddressAccessPdu::MAX_TLVS_LEN - AaTlv::HEADER_LEN) as u16;
 
 /// Fixed-size AEM text: UTF-8, zero padded, cut at a character boundary.
 pub(crate) fn name_field(text: &str) -> [u8; NAME_LENGTH] {
@@ -217,7 +230,25 @@ impl EndpointModel {
             (DescriptorType::CONTROL, 1),
             (DescriptorType::CLOCK_DOMAIN, 1),
         ]);
+        if self.logo.is_some() {
+            counts.push((DescriptorType::MEMORY_OBJECT, 1));
+        }
         counts
+    }
+
+    /// `length` octets of its memory objects from `address`, as Address
+    /// Access reads them: of the logo, its one object.
+    pub(crate) fn memory(&self, address: u64, length: u16) -> Result<&[u8], AaStatus> {
+        let logo = self.logo.as_deref().ok_or(AaStatus::ADDRESS_INVALID)?;
+        let offset = address
+            .checked_sub(LOGO_ADDRESS)
+            .ok_or(AaStatus::ADDRESS_TOO_LOW)?;
+        let start = usize::try_from(offset).map_err(|_| AaStatus::ADDRESS_TOO_HIGH)?;
+        let end = start
+            .checked_add(usize::from(length))
+            .filter(|end| *end <= logo.len())
+            .ok_or(AaStatus::ADDRESS_TOO_HIGH)?;
+        Ok(&logo[start..end])
     }
 
     /// The localized strings: the vendor and model names.
@@ -456,6 +487,20 @@ impl EndpointModel {
                 .u16(NO_STRING)
                 .pad_to(212)
                 .done(),
+            DescriptorType::MEMORY_OBJECT if index == 0 => {
+                let length = self.logo.as_ref()?.len() as u64;
+                writer
+                    .name("Logo")
+                    .u16(NO_STRING)
+                    .u16(MemoryObjectType::PNG_ENTITY.0)
+                    .u16(DescriptorType::ENTITY.0) // target_descriptor_type
+                    .u16(0) // target_descriptor_index
+                    .u64(LOGO_ADDRESS) // start_address
+                    .u64(length) // maximum_length
+                    .u64(length)
+                    .u64(u64::from(MEMORY_SEGMENT)) // maximum_segment_length
+                    .done()
+            }
             _ => return None,
         };
         Some(bytes)

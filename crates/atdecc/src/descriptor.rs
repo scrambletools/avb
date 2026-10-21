@@ -189,6 +189,28 @@ code! {
     }
 }
 
+code! {
+    /// A MEMORY_OBJECT descriptor's memory_object_type: what its octets
+    /// hold, which controllers read through Address Access.
+    pub struct MemoryObjectType(u16) {
+        const FIRMWARE_IMAGE = 0x0000;
+        const VENDOR_SPECIFIC = 0x0001;
+        const CRASH_DUMP = 0x0002;
+        const LOG_OBJECT = 0x0003;
+        const AUTOSTART_SETTINGS = 0x0004;
+        const SNAPSHOT_SETTINGS = 0x0005;
+        const SVG_MANUFACTURER = 0x0006;
+        const SVG_ENTITY = 0x0007;
+        const SVG_GENERIC = 0x0008;
+        const PNG_MANUFACTURER = 0x0009;
+        const PNG_ENTITY = 0x000a;
+        const PNG_GENERIC = 0x000b;
+        const DAE_MANUFACTURER = 0x000c;
+        const DAE_ENTITY = 0x000d;
+        const DAE_GENERIC = 0x000e;
+    }
+}
+
 fn need(bytes: &[u8], length: usize) -> Result<(), DecodeError> {
     if bytes.len() < length {
         return Err(DecodeError::Truncated {
