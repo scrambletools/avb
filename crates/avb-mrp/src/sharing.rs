@@ -5,12 +5,16 @@
 //! others: they ask it to declare and withdraw their talkers, and it tells
 //! them as listeners for their streams come and go, and whether it can
 //! declare for them at all, as it cannot while the port runs AVB Lite.
+//! From version 2, they ask it to listen to streams too: it declares a
+//! listener for each on the port, as the stream's talker is registered,
+//! and tells them that talker's declaration as it comes, changes and
+//! goes.
 //!
 //! It serves on a Unix socket in the user's runtime folder, named for the
 //! interface, which only the same user reaches. Each message is an octet
 //! of kind, two octets of length, and the payload: a Talker Advertise as
 //! MSRP encodes it, a stream ID, a stream ID and a listener's state or a
-//! refusal, or a hello.
+//! refusal, a hello, or a stream ID and its talker's declaration.
 //!
 //! Each end skips the kinds it does not know, so a kind once given keeps
 //! its payload, and what comes later takes a new kind. Each end says
@@ -34,11 +38,15 @@ mod kind {
     pub const HELLO: u8 = 6;
     pub const DECLARED: u8 = 7;
     pub const REFUSED: u8 = 8;
+    pub const LISTEN: u8 = 9;
+    pub const UNLISTEN: u8 = 10;
+    pub const TALKER: u8 = 11;
 }
 
 /// The version this module speaks: 1 since each end says hello and the
-/// participant answers each Declare. Version 0 did neither.
-pub const VERSION: u16 = 1;
+/// participant answers each Declare, which version 0 did not; 2 since
+/// programs can listen through it.
+pub const VERSION: u16 = 2;
 
 /// How long a program waits for the participant's hello before taking it
 /// for one of version 0, which says none.
@@ -50,6 +58,9 @@ pub mod feature {
     /// computer too, which take a program's stream as it leaves with no
     /// reservation, merged with the network's.
     pub const LOCAL_LISTENERS: u32 = 1 << 0;
+    /// The participant takes Listen and Unlisten: it declares listeners
+    /// for a program's streams and tells it their talkers.
+    pub const LISTENERS: u32 = 1 << 1;
 }
 
 /// The state octet of a listener that left.
@@ -79,6 +90,19 @@ pub enum Request {
     Declare(TalkerDeclaration),
     /// Withdraw the stream with this ID.
     Withdraw(u64),
+    /// Listen to the stream with this ID: declare a listener for it on
+    /// the port while its talker is registered there, Ready or Asking
+    /// Failed as the talker's declaration is, merged with the port's
+    /// other listeners here for it, none where the talker is on this
+    /// computer, and tell the program the talker's declaration as it
+    /// changes. The first Talker notice answers it, at once, even when no
+    /// talker declares the stream; Refused answers it while the
+    /// participant cannot declare listeners, as in AVB Lite. Asking twice
+    /// is asking once.
+    Listen(u64),
+    /// Stop listening to the stream with this ID; nothing, for one not
+    /// listened to. A connection closing stops all of its listening.
+    Unlisten(u64),
     /// A Declare whose talker could not be read, with the stream ID its
     /// first octets give, where it has them.
     Unreadable(Option<u64>),
@@ -96,17 +120,25 @@ pub enum Notice {
         stream_id: u64,
         state: Option<ListenerState>,
     },
-    /// Its talkers cannot be declared now, as while the port runs AVB
-    /// Lite; they are withdrawn until it says they can again.
+    /// Its talkers and listeners cannot be declared now, as while the
+    /// port runs AVB Lite; they are withdrawn until it says they can
+    /// again, when the program declares and listens again.
     Unavailable,
     Available,
     /// It declared the stream with this ID, as asked.
     Declared(u64),
     /// It did not declare the stream with this ID, zero where the Declare
-    /// gave none, and why.
+    /// gave none, and why; or did not listen to it.
     Refused {
         stream_id: u64,
         refusal: Refusal,
+    },
+    /// The talker of a stream the program listens to, as it declares the
+    /// stream, Talker Advertise or Talker Failed, on the port or on this
+    /// computer; none while no talker declares it.
+    Talker {
+        stream_id: u64,
+        talker: Option<TalkerDeclaration>,
     },
 }
 
@@ -197,6 +229,10 @@ pub fn write_request(out: &mut impl Write, request: &Request) -> io::Result<()> 
         Request::Withdraw(stream_id) => {
             write_message(out, kind::WITHDRAW, &stream_id.to_be_bytes())
         }
+        Request::Listen(stream_id) => write_message(out, kind::LISTEN, &stream_id.to_be_bytes()),
+        Request::Unlisten(stream_id) => {
+            write_message(out, kind::UNLISTEN, &stream_id.to_be_bytes())
+        }
         Request::Unreadable(_) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "an unreadable Declare is only read",
@@ -223,6 +259,8 @@ pub fn read_request(input: &mut impl Read) -> io::Result<Request> {
                 ),
             ),
             kind::WITHDRAW => stream_id(&payload).map(Request::Withdraw),
+            kind::LISTEN => stream_id(&payload).map(Request::Listen),
+            kind::UNLISTEN => stream_id(&payload).map(Request::Unlisten),
             _ => None,
         };
         if let Some(request) = request {
@@ -247,8 +285,31 @@ pub fn write_notice(out: &mut impl Write, notice: &Notice) -> io::Result<()> {
             payload.push(refusal.number());
             write_message(out, kind::REFUSED, &payload)
         }
+        // The declaration's value, which starts with the stream ID, its
+        // length telling Talker Failed's from Talker Advertise's; the
+        // stream ID alone once it is gone.
+        Notice::Talker { stream_id, talker } => match talker {
+            Some(talker) => write_message(out, kind::TALKER, &msrp::talker_value(talker)),
+            None => write_message(out, kind::TALKER, &stream_id.to_be_bytes()),
+        },
     }
 }
+
+/// A Talker notice's declaration, from its value.
+fn talker(payload: &[u8]) -> Option<Option<TalkerDeclaration>> {
+    if payload.len() == 8 {
+        return Some(None);
+    }
+    let attribute = if payload.len() >= TALKER_FAILED_LENGTH {
+        msrp::attribute::TALKER_FAILED
+    } else {
+        msrp::attribute::TALKER_ADVERTISE
+    };
+    msrp::decode_talker(attribute, payload, crate::Event::New).map(Some)
+}
+
+/// Octets of a Talker Failed's value: Talker Advertise's and the failure.
+const TALKER_FAILED_LENGTH: usize = 25 + 9;
 
 /// The next notice, skipping any it does not know; an error when the
 /// other end closed.
@@ -271,6 +332,12 @@ pub fn read_notice(input: &mut impl Read) -> io::Result<Notice> {
                 Some(Notice::Refused {
                     stream_id,
                     refusal: Refusal::from_number(*payload.get(8)?),
+                })
+            }),
+            kind::TALKER => stream_id(&payload).and_then(|stream_id| {
+                Some(Notice::Talker {
+                    stream_id,
+                    talker: talker(&payload)?,
                 })
             }),
             _ => None,
@@ -314,6 +381,8 @@ mod tests {
         // One the other end does not know, which it skips.
         write_message(&mut wire, 99, &[1, 2, 3]).unwrap();
         write_request(&mut wire, &Request::Withdraw(7)).unwrap();
+        write_request(&mut wire, &Request::Listen(8)).unwrap();
+        write_request(&mut wire, &Request::Unlisten(8)).unwrap();
         let mut input = wire.as_slice();
         assert_eq!(read_request(&mut input).unwrap(), Request::Hello(HELLO));
         assert_eq!(
@@ -321,6 +390,8 @@ mod tests {
             Request::Declare(talker())
         );
         assert_eq!(read_request(&mut input).unwrap(), Request::Withdraw(7));
+        assert_eq!(read_request(&mut input).unwrap(), Request::Listen(8));
+        assert_eq!(read_request(&mut input).unwrap(), Request::Unlisten(8));
         assert!(read_request(&mut input).is_err(), "nothing more");
 
         let notices = [
@@ -343,6 +414,24 @@ mod tests {
             Notice::Refused {
                 stream_id: 0,
                 refusal: Refusal::Other(42),
+            },
+            Notice::Talker {
+                stream_id: talker().stream_id,
+                talker: Some(talker()),
+            },
+            Notice::Talker {
+                stream_id: talker().stream_id,
+                talker: Some(TalkerDeclaration {
+                    failure: Some(msrp::TalkerFailure {
+                        bridge_id: 0x8000_0001_f2ff_ee42,
+                        code: 2,
+                    }),
+                    ..talker()
+                }),
+            },
+            Notice::Talker {
+                stream_id: 7,
+                talker: None,
             },
         ];
         let mut wire = Vec::new();
@@ -382,6 +471,7 @@ mod tests {
         // Too short to read, so skipped.
         assert_eq!(read_notice(&mut input).unwrap(), Notice::Available);
         assert!(HELLO.has(feature::LOCAL_LISTENERS));
+        assert!(!HELLO.has(feature::LISTENERS));
         assert!(
             !Hello {
                 features: 0,
