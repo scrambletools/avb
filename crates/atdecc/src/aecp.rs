@@ -328,7 +328,8 @@ pub struct AaTlv<'a> {
     /// The octets it reads, writes or executes, in 12 bits.
     pub length: u16,
     pub address: u64,
-    /// The octets written, or read in a response; none in a READ command.
+    /// The octets written, or read in a response; in a READ command none,
+    /// or zeros as many as it asks for.
     pub data: &'a [u8],
 }
 
@@ -400,8 +401,8 @@ impl<'a> AddressAccessPdu<'a> {
     }
 
     /// Its TLVs in order, an error for one the octets left cannot hold,
-    /// after which there are none. A READ command's carry no octets; a
-    /// response's carry those read.
+    /// after which there are none. A READ command's carry no octets, or
+    /// zeros as many as they ask for; a response's carry those read.
     pub fn tlvs(&self) -> AaTlvs<'a> {
         AaTlvs {
             rest: self.tlvs,
@@ -435,7 +436,13 @@ impl<'a> Iterator for AaTlvs<'a> {
         let word = read_u16(self.rest, 0);
         let mode = AaMode((word >> 12) as u8);
         let length = word & 0x0fff;
-        let carried = if self.command && mode == AaMode::READ {
+        // A READ command carries no octets, or as many zeros as it asks
+        // for, as controllers such as Hive send it and entities that
+        // answer it in place, as ESP32 endpoints do, need.
+        let carried = if self.command
+            && mode == AaMode::READ
+            && self.rest.len() < AaTlv::HEADER_LEN + usize::from(length)
+        {
             0
         } else {
             usize::from(length)
@@ -569,6 +576,31 @@ mod tests {
         assert_eq!(pdu.encode(&mut out), Ok(READ_400.len()));
         assert_eq!(out[..READ_400.len()], READ_400);
         assert!(AemPdu::decode(&READ_400).is_err());
+    }
+
+    /// A READ with as many zeros as it asks for, as Hive sends it, and
+    /// two bare READs after one another.
+    #[test]
+    fn a_read_may_carry_zeros() {
+        let mut padded = READ_400.to_vec();
+        padded.extend_from_slice(&[0; 400]);
+        // control_data_length, 22 and 400 more.
+        padded[2..4].copy_from_slice(&422u16.to_be_bytes());
+        let pdu = AddressAccessPdu::decode(&padded).unwrap();
+        let tlvs: Vec<_> = pdu.tlvs().collect();
+        assert_eq!(tlvs.len(), 1);
+        assert_eq!(tlvs[0].unwrap().data.len(), 400);
+        let mut two = READ_400.to_vec();
+        two[23] = 2;
+        two.extend_from_slice(&READ_400[24..]);
+        two[2..4].copy_from_slice(&32u16.to_be_bytes());
+        let pdu = AddressAccessPdu::decode(&two).unwrap();
+        let tlvs: Vec<_> = pdu.tlvs().map(Result::unwrap).collect();
+        assert_eq!(tlvs.len(), 2);
+        assert!(
+            tlvs.iter()
+                .all(|tlv| tlv.length == 400 && tlv.data.is_empty())
+        );
     }
 
     #[test]

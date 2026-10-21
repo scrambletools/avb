@@ -2590,7 +2590,8 @@ impl Controller {
             controller: self.config.entity_id,
             sequence_id,
         };
-        // Room for the longest command, GET_DYNAMIC_INFO.
+        // Room for the longest commands, GET_DYNAMIC_INFO and a padded
+        // Address Access READ.
         let mut out = [0; 600];
         let acmp = |message_type, talker: (EntityId, u16), input: u16, out: &mut [u8]| {
             Acmpdu::command(
@@ -2818,12 +2819,15 @@ impl Controller {
                 else {
                     return false;
                 };
-                let mut tlv = [0; AaTlv::HEADER_LEN];
+                // As many zeros as it asks for: ESP32 endpoints answer a
+                // READ in place, in a response as long as the command.
+                let zeros = [0; MEMORY_SEGMENT as usize];
+                let mut tlv = [0; AaTlv::HEADER_LEN + MEMORY_SEGMENT as usize];
                 let read = AaTlv {
                     mode: AaMode::READ,
                     length,
                     address,
-                    data: &[],
+                    data: &zeros[..usize::from(length)],
                 };
                 read.encode(&mut tlv).and_then(|_| {
                     AddressAccessPdu {
@@ -2835,7 +2839,7 @@ impl Controller {
                             sequence_id,
                         },
                         tlv_count: 1,
-                        tlvs: &tlv,
+                        tlvs: &tlv[..AaTlv::HEADER_LEN + usize::from(length)],
                     }
                     .encode(&mut out)
                 })

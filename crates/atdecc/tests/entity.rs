@@ -78,6 +78,10 @@ struct Network {
     controller_events: Vec<Event>,
     /// Every frame the entities sent.
     sent: Vec<Vec<u8>>,
+    /// A logo the talker's Address Access commands are answered from in
+    /// place, as ESP32 endpoints answer them, in a response as long as the
+    /// command, instead of by the talker.
+    in_place: Option<Vec<u8>>,
 }
 
 impl Network {
@@ -94,6 +98,7 @@ impl Network {
             entity_events: Vec::new(),
             controller_events: Vec::new(),
             sent: Vec::new(),
+            in_place: None,
         }
     }
 
@@ -126,6 +131,12 @@ impl Network {
                 let Some((source, destination, bytes)) = frames.pop_front() else {
                     break;
                 };
+                if destination == HOST_MAC
+                    && let Some(answer) = self.answer_in_place(&bytes)
+                {
+                    frames.push_back((HOST_MAC, CONTROLLER_MAC, answer));
+                    continue;
+                }
                 let multicast = destination == ADP_ACMP_MULTICAST;
                 if multicast || destination == CONTROLLER_MAC {
                     let _ = self.controller.handle_frame(now, source, &bytes);
@@ -142,6 +153,31 @@ impl Network {
             self.controller_events
                 .extend(std::iter::from_fn(|| self.controller.poll_event()));
         }
+    }
+}
+
+impl Network {
+    /// The answer to an Address Access READ of the talker's logo, written
+    /// over the command, as long as it: with the octets read only where
+    /// the command had room for them.
+    fn answer_in_place(&self, command: &[u8]) -> Option<Vec<u8>> {
+        let logo = self.in_place.as_ref()?;
+        let pdu = AddressAccessPdu::decode(command).ok()?;
+        if pdu.header.message_type != AecpMessageType::ADDRESS_ACCESS_COMMAND
+            || pdu.header.target_entity_id != TALKER
+        {
+            return None;
+        }
+        let mut answer = command.to_vec();
+        answer[1] = (answer[1] & 0xf0) | AecpMessageType::ADDRESS_ACCESS_RESPONSE.0;
+        // tlv_count, then the one TLV's mode and length, address and room.
+        let word = u16::from_be_bytes([answer[24], answer[25]]);
+        let length = usize::from(word & 0x0fff);
+        let address = u64::from_be_bytes(answer[26..34].try_into().unwrap());
+        let start = usize::try_from(address - LOGO_ADDRESS).unwrap();
+        let room = answer.len().saturating_sub(34).min(length);
+        answer[34..34 + room].copy_from_slice(&logo[start..start + room]);
+        Some(answer)
     }
 }
 
@@ -1159,6 +1195,27 @@ fn a_controller_reads_the_logos() {
             .is_none()
     );
     assert_eq!(listener.image(MemoryObjectType::PNG_ENTITY), None);
+}
+
+/// An entity that answers a READ in place, as ESP32 endpoints do, gives
+/// its logo too, as the controller's READs have room for it.
+#[test]
+fn a_logo_answered_in_place_is_read() {
+    let mut network = Network::new();
+    let logo: Vec<u8> = (0..1000).map(|at| (at % 241) as u8).collect();
+    network.talker = Entity::new(
+        EndpointModel {
+            logo: Some(logo.clone()),
+            ..model(TALKER, "Talker", true)
+        },
+        &[(STREAM, DESTINATION)],
+    );
+    network.talker.start(Instant::ZERO);
+    network.in_place = Some(logo.clone());
+    network.controller.discover(None);
+    network.run(3000);
+    let model = network.controller.model(TALKER).expect("read");
+    assert_eq!(model.image(MemoryObjectType::PNG_ENTITY), Some(&logo[..]));
 }
 
 #[test]
