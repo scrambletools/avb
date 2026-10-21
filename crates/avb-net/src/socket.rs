@@ -48,6 +48,16 @@ impl Socket {
         self.inner.join_multicast(group)
     }
 
+    /// Hears frames of every VLAN and address the interface receives,
+    /// `on`, or no longer. An interface that drops tagged frames of VLANs
+    /// not registered with it, as Intel's igb and igc do (see
+    /// [`crate::interfaces::filters_vlans`]), hears them only so, since
+    /// registering a VLAN takes an administrator. On macOS it stays so
+    /// until the socket closes; Windows' capture always does.
+    pub fn set_promiscuous(&self, on: bool) -> io::Result<()> {
+        self.inner.set_promiscuous(on)
+    }
+
     pub fn send(&self, destination: MacAddress, payload: &[u8]) -> io::Result<()> {
         self.inner.send(destination, payload)
     }
@@ -163,6 +173,7 @@ mod platform {
     use std::io;
     use std::mem::{size_of, zeroed};
     use std::os::fd::{AsRawFd, OwnedFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use super::{Received, Sent};
@@ -173,6 +184,8 @@ mod platform {
         index: i32,
         ethertype: u16,
         sent: Sent,
+        /// Whether it holds the interface promiscuous.
+        promiscuous: AtomicBool,
     }
 
     /// Opens a packet socket that hears nothing, which takes the same
@@ -199,6 +212,7 @@ mod platform {
                 index,
                 ethertype,
                 sent: Sent::default(),
+                promiscuous: AtomicBool::new(false),
             };
             socket.attach(&socket.program(None))?;
             let mut address = socket.address(None);
@@ -234,24 +248,56 @@ mod platform {
         }
 
         pub fn join_multicast(&self, group: MacAddress) -> io::Result<()> {
+            self.membership(
+                libc::PACKET_ADD_MEMBERSHIP,
+                libc::PACKET_MR_MULTICAST,
+                Some(group),
+            )
+        }
+
+        pub fn set_promiscuous(&self, on: bool) -> io::Result<()> {
+            if self.promiscuous.load(Ordering::Relaxed) == on {
+                return Ok(());
+            }
+            let change = if on {
+                libc::PACKET_ADD_MEMBERSHIP
+            } else {
+                libc::PACKET_DROP_MEMBERSHIP
+            };
+            self.membership(change, libc::PACKET_MR_PROMISC, None)?;
+            self.promiscuous.store(on, Ordering::Relaxed);
+            Ok(())
+        }
+
+        /// Adds or drops, by `change`, a membership of the interface of
+        /// `kind`: a multicast `group`, or its promiscuity. The kernel
+        /// drops this socket's memberships as it closes.
+        fn membership(
+            &self,
+            change: libc::c_int,
+            kind: libc::c_int,
+            group: Option<MacAddress>,
+        ) -> io::Result<()> {
             // SAFETY: packet_mreq is plain data, valid when zeroed.
             let mut request: libc::packet_mreq = unsafe { zeroed() };
             request.mr_ifindex = self.index;
-            request.mr_type = libc::PACKET_MR_MULTICAST as u16;
-            request.mr_alen = 6;
-            request.mr_address[..6].copy_from_slice(&group.0);
+            request.mr_type = kind as u16;
+            if let Some(group) = group {
+                request.mr_alen = 6;
+                request.mr_address[..6].copy_from_slice(&group.0);
+            }
             // SAFETY: `request` is a valid packet_mreq that lives through
             // the call, and the length passed is its size.
-            let joined = unsafe {
+            let changed = unsafe {
                 libc::setsockopt(
                     self.fd.as_raw_fd(),
                     libc::SOL_PACKET,
-                    libc::PACKET_ADD_MEMBERSHIP,
+                    change,
                     (&raw const request).cast(),
                     size_of::<libc::packet_mreq>() as libc::socklen_t,
                 )
             };
-            if joined < 0 {
+            if changed < 0 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
@@ -766,14 +812,20 @@ mod platform {
                         .push(group);
                     Ok(())
                 }
-                Err(_) => {
-                    // SAFETY: BIOCPROMISC takes no argument.
-                    if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::BIOCPROMISC as _) } < 0 {
-                        return Err(io::Error::last_os_error());
-                    }
-                    Ok(())
-                }
+                Err(_) => self.set_promiscuous(true),
             }
+        }
+
+        pub fn set_promiscuous(&self, on: bool) -> io::Result<()> {
+            // A BPF device stays promiscuous until it closes.
+            if !on {
+                return Ok(());
+            }
+            // SAFETY: BIOCPROMISC takes no argument.
+            if unsafe { libc::ioctl(self.fd.as_raw_fd(), libc::BIOCPROMISC as _) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
 
         pub fn send(&self, destination: MacAddress, payload: &[u8]) -> io::Result<()> {
@@ -1179,6 +1231,10 @@ mod platform {
             Ok(())
         }
 
+        pub fn set_promiscuous(&self, _on: bool) -> io::Result<()> {
+            Ok(())
+        }
+
         pub fn keep_payloads_starting(&self, first: u8, last: u8) -> io::Result<()> {
             let npcap = npcap()?;
             let receiver = self.receiver.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1296,6 +1352,10 @@ mod platform {
         }
 
         pub fn join_multicast(&self, _group: MacAddress) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub fn set_promiscuous(&self, _on: bool) -> io::Result<()> {
             Err(unsupported())
         }
 
