@@ -9,10 +9,19 @@
 //! It serves on a Unix socket in the user's runtime folder, named for the
 //! interface, which only the same user reaches. Each message is an octet
 //! of kind, two octets of length, and the payload: a Talker Advertise as
-//! MSRP encodes it, a stream ID, or a stream ID and a listener's state.
+//! MSRP encodes it, a stream ID, a stream ID and a listener's state or a
+//! refusal, or a hello.
+//!
+//! Each end skips the kinds it does not know, so a kind once given keeps
+//! its payload, and what comes later takes a new kind. Each end says
+//! hello as the connection opens, with its version and features: a
+//! program that hears none from the participant soon after it connects
+//! shares one of version 0, which answers no Declare and tells only the
+//! network's listeners.
 
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use crate::msrp::{self, ListenerState, TalkerDeclaration};
 
@@ -22,23 +31,65 @@ mod kind {
     pub const LISTENER: u8 = 3;
     pub const UNAVAILABLE: u8 = 4;
     pub const AVAILABLE: u8 = 5;
+    pub const HELLO: u8 = 6;
+    pub const DECLARED: u8 = 7;
+    pub const REFUSED: u8 = 8;
+}
+
+/// The version this module speaks: 1 since each end says hello and the
+/// participant answers each Declare. Version 0 did neither.
+pub const VERSION: u16 = 1;
+
+/// How long a program waits for the participant's hello before taking it
+/// for one of version 0, which says none.
+pub const HELLO_WAIT: Duration = Duration::from_millis(500);
+
+/// What an end can do beyond its version, one bit each.
+pub mod feature {
+    /// The participant's Listener notices count the listeners on this
+    /// computer too, which take a program's stream as it leaves with no
+    /// reservation, merged with the network's.
+    pub const LOCAL_LISTENERS: u32 = 1 << 0;
 }
 
 /// The state octet of a listener that left.
 const LEFT: u8 = 0xff;
 
+/// An end's version and features, as it says hello.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hello {
+    pub version: u16,
+    pub features: u32,
+}
+
+impl Hello {
+    /// Whether it has every feature of `features`.
+    pub fn has(self, features: u32) -> bool {
+        self.features & features == features
+    }
+}
+
 /// What a program asks of the participant it shares.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Request {
+    /// The program's version and features, as it connects.
+    Hello(Hello),
     /// Declare this talker's stream, or declare it again as it changed.
     Declare(TalkerDeclaration),
     /// Withdraw the stream with this ID.
     Withdraw(u64),
+    /// A Declare whose talker could not be read, with the stream ID its
+    /// first octets give, where it has them.
+    Unreadable(Option<u64>),
 }
 
 /// What the participant tells a program sharing it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Notice {
+    /// The participant's version and features, as the program connects.
+    Hello(Hello),
     /// The listeners for one of its streams, as the port registers them:
     /// their state, or none once they left.
     Listener {
@@ -49,6 +100,48 @@ pub enum Notice {
     /// Lite; they are withdrawn until it says they can again.
     Unavailable,
     Available,
+    /// It declared the stream with this ID, as asked.
+    Declared(u64),
+    /// It did not declare the stream with this ID, zero where the Declare
+    /// gave none, and why.
+    Refused {
+        stream_id: u64,
+        refusal: Refusal,
+    },
+}
+
+/// Why the participant did not declare a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Refusal {
+    /// The Declare's talker could not be read.
+    Unreadable,
+    /// It cannot declare talkers now, as while the port runs AVB Lite.
+    Unavailable,
+    /// Another talker here declares a stream of the same ID.
+    Taken,
+    /// One a later version gives.
+    Other(u8),
+}
+
+impl Refusal {
+    fn number(self) -> u8 {
+        match self {
+            Self::Unreadable => 1,
+            Self::Unavailable => 2,
+            Self::Taken => 3,
+            Self::Other(number) => number,
+        }
+    }
+
+    fn from_number(number: u8) -> Self {
+        match number {
+            1 => Self::Unreadable,
+            2 => Self::Unavailable,
+            3 => Self::Taken,
+            _ => Self::Other(number),
+        }
+    }
 }
 
 /// The socket a participant on `interface` serves, in the user's runtime
@@ -81,14 +174,33 @@ fn stream_id(payload: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(payload.get(..8)?.try_into().ok()?))
 }
 
+fn hello_payload(hello: Hello) -> Vec<u8> {
+    let mut payload = hello.version.to_be_bytes().to_vec();
+    payload.extend_from_slice(&hello.features.to_be_bytes());
+    payload
+}
+
+/// A hello, from its first six octets: a later version may add more.
+fn hello(payload: &[u8]) -> Option<Hello> {
+    Some(Hello {
+        version: u16::from_be_bytes(payload.get(..2)?.try_into().ok()?),
+        features: u32::from_be_bytes(payload.get(2..6)?.try_into().ok()?),
+    })
+}
+
 pub fn write_request(out: &mut impl Write, request: &Request) -> io::Result<()> {
     match request {
+        Request::Hello(hello) => write_message(out, kind::HELLO, &hello_payload(*hello)),
         Request::Declare(declaration) => {
             write_message(out, kind::DECLARE, &msrp::talker_value(declaration))
         }
         Request::Withdraw(stream_id) => {
             write_message(out, kind::WITHDRAW, &stream_id.to_be_bytes())
         }
+        Request::Unreadable(_) => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "an unreadable Declare is only read",
+        )),
     }
 }
 
@@ -98,12 +210,18 @@ pub fn read_request(input: &mut impl Read) -> io::Result<Request> {
     loop {
         let (kind, payload) = read_message(input)?;
         let request = match kind {
-            kind::DECLARE => msrp::decode_talker(
-                msrp::attribute::TALKER_ADVERTISE,
-                &payload,
-                crate::Event::New,
-            )
-            .map(Request::Declare),
+            kind::HELLO => hello(&payload).map(Request::Hello),
+            kind::DECLARE => Some(
+                msrp::decode_talker(
+                    msrp::attribute::TALKER_ADVERTISE,
+                    &payload,
+                    crate::Event::New,
+                )
+                .map_or_else(
+                    || Request::Unreadable(stream_id(&payload)),
+                    Request::Declare,
+                ),
+            ),
             kind::WITHDRAW => stream_id(&payload).map(Request::Withdraw),
             _ => None,
         };
@@ -115,6 +233,7 @@ pub fn read_request(input: &mut impl Read) -> io::Result<Request> {
 
 pub fn write_notice(out: &mut impl Write, notice: &Notice) -> io::Result<()> {
     match notice {
+        Notice::Hello(hello) => write_message(out, kind::HELLO, &hello_payload(*hello)),
         Notice::Listener { stream_id, state } => {
             let mut payload = stream_id.to_be_bytes().to_vec();
             payload.push(state.map_or(LEFT, ListenerState::number));
@@ -122,6 +241,12 @@ pub fn write_notice(out: &mut impl Write, notice: &Notice) -> io::Result<()> {
         }
         Notice::Unavailable => write_message(out, kind::UNAVAILABLE, &[]),
         Notice::Available => write_message(out, kind::AVAILABLE, &[]),
+        Notice::Declared(stream_id) => write_message(out, kind::DECLARED, &stream_id.to_be_bytes()),
+        Notice::Refused { stream_id, refusal } => {
+            let mut payload = stream_id.to_be_bytes().to_vec();
+            payload.push(refusal.number());
+            write_message(out, kind::REFUSED, &payload)
+        }
     }
 }
 
@@ -131,6 +256,7 @@ pub fn read_notice(input: &mut impl Read) -> io::Result<Notice> {
     loop {
         let (kind, payload) = read_message(input)?;
         let notice = match kind {
+            kind::HELLO => hello(&payload).map(Notice::Hello),
             kind::LISTENER => stream_id(&payload).and_then(|stream_id| {
                 let state = *payload.get(8)?;
                 Some(Notice::Listener {
@@ -140,6 +266,13 @@ pub fn read_notice(input: &mut impl Read) -> io::Result<Notice> {
             }),
             kind::UNAVAILABLE => Some(Notice::Unavailable),
             kind::AVAILABLE => Some(Notice::Available),
+            kind::DECLARED => stream_id(&payload).map(Notice::Declared),
+            kind::REFUSED => stream_id(&payload).and_then(|stream_id| {
+                Some(Notice::Refused {
+                    stream_id,
+                    refusal: Refusal::from_number(*payload.get(8)?),
+                })
+            }),
             _ => None,
         };
         if let Some(notice) = notice {
@@ -168,14 +301,21 @@ mod tests {
         }
     }
 
+    const HELLO: Hello = Hello {
+        version: VERSION,
+        features: feature::LOCAL_LISTENERS,
+    };
+
     #[test]
     fn requests_and_notices_go_across() {
         let mut wire = Vec::new();
+        write_request(&mut wire, &Request::Hello(HELLO)).unwrap();
         write_request(&mut wire, &Request::Declare(talker())).unwrap();
         // One the other end does not know, which it skips.
         write_message(&mut wire, 99, &[1, 2, 3]).unwrap();
         write_request(&mut wire, &Request::Withdraw(7)).unwrap();
         let mut input = wire.as_slice();
+        assert_eq!(read_request(&mut input).unwrap(), Request::Hello(HELLO));
         assert_eq!(
             read_request(&mut input).unwrap(),
             Request::Declare(talker())
@@ -184,6 +324,7 @@ mod tests {
         assert!(read_request(&mut input).is_err(), "nothing more");
 
         let notices = [
+            Notice::Hello(HELLO),
             Notice::Listener {
                 stream_id: 7,
                 state: Some(ListenerState::Ready),
@@ -194,6 +335,15 @@ mod tests {
             },
             Notice::Unavailable,
             Notice::Available,
+            Notice::Declared(7),
+            Notice::Refused {
+                stream_id: 7,
+                refusal: Refusal::Taken,
+            },
+            Notice::Refused {
+                stream_id: 0,
+                refusal: Refusal::Other(42),
+            },
         ];
         let mut wire = Vec::new();
         for notice in &notices {
@@ -203,6 +353,42 @@ mod tests {
         for notice in notices {
             assert_eq!(read_notice(&mut input).unwrap(), notice);
         }
+    }
+
+    #[test]
+    fn a_declare_that_cannot_be_read_comes_through() {
+        let value = msrp::talker_value(&talker());
+        let mut wire = Vec::new();
+        write_message(&mut wire, kind::DECLARE, &value[..10]).unwrap();
+        write_message(&mut wire, kind::DECLARE, &[1, 2]).unwrap();
+        let mut input = wire.as_slice();
+        assert_eq!(
+            read_request(&mut input).unwrap(),
+            Request::Unreadable(Some(talker().stream_id))
+        );
+        assert_eq!(read_request(&mut input).unwrap(), Request::Unreadable(None));
+    }
+
+    #[test]
+    fn a_later_hello_keeps_its_first_octets() {
+        let mut payload = hello_payload(HELLO);
+        payload.extend_from_slice(&[9, 9, 9]);
+        let mut wire = Vec::new();
+        write_message(&mut wire, kind::HELLO, &payload).unwrap();
+        write_message(&mut wire, kind::HELLO, &[0, 2]).unwrap();
+        write_notice(&mut wire, &Notice::Available).unwrap();
+        let mut input = wire.as_slice();
+        assert_eq!(read_notice(&mut input).unwrap(), Notice::Hello(HELLO));
+        // Too short to read, so skipped.
+        assert_eq!(read_notice(&mut input).unwrap(), Notice::Available);
+        assert!(HELLO.has(feature::LOCAL_LISTENERS));
+        assert!(
+            !Hello {
+                features: 0,
+                ..HELLO
+            }
+            .has(feature::LOCAL_LISTENERS)
+        );
     }
 
     #[test]
