@@ -1763,7 +1763,9 @@ impl Entity {
     }
 
     /// Moves every stream but `except` to the format that packs samples as
-    /// its current one does at `rate`, telling registered controllers.
+    /// its current one does at `rate`, or, where its channels take more
+    /// than a frame there, to that packing of the most channels it offers
+    /// at `rate`, telling registered controllers.
     fn follow_rate(&mut self, rate: u32, except: Option<(DescriptorType, u16)>) {
         let mut moved = Vec::new();
         for (descriptor_type, streams) in [
@@ -1778,9 +1780,20 @@ impl Entity {
                     continue;
                 }
                 let current = stream.current_format;
-                if let Some(format) = stream.formats.iter().copied().find(|format| {
-                    format.sample_rate() == Some(rate) && format.same_but_rate(current)
-                }) {
+                let at_rate = || {
+                    stream
+                        .formats
+                        .iter()
+                        .copied()
+                        .filter(|format| format.sample_rate() == Some(rate))
+                };
+                let same = at_rate().find(|format| format.same_but_rate(current));
+                let fewer = || {
+                    at_rate()
+                        .filter(|format| format.same_but_rate_and_channels(current))
+                        .max_by_key(|format| format.channels())
+                };
+                if let Some(format) = same.or_else(fewer) {
                     stream.current_format = format;
                     moved.push((descriptor_type, index, format));
                 }

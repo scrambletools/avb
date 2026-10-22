@@ -15,6 +15,7 @@ pub mod am824;
 pub mod audio;
 pub mod clock;
 pub mod crf;
+pub mod formats;
 pub mod listener;
 pub mod media;
 mod meter;

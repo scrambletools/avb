@@ -261,6 +261,30 @@ impl StreamFormat {
         }
     }
 
+    /// Whether two audio formats pack samples alike but for their rate
+    /// and channels: as [`same_but_rate`](Self::same_but_rate) has it,
+    /// whatever their channels, or their quadlets and labels in IEC
+    /// 61883-6. An entity changing its sampling rate falls back on it for
+    /// a stream whose channels take more than a frame at the new rate.
+    pub fn same_but_rate_and_channels(self, other: StreamFormat) -> bool {
+        match (self.kind(), other.kind()) {
+            (FormatKind::Aaf(one), FormatKind::Aaf(two)) => {
+                let frames = |aaf: &Aaf, rate: Option<u32>| {
+                    rate.map(|rate| u64::from(aaf.samples_per_frame) * u64::from(rate))
+                };
+                (one.up_to, one.sample_format, one.bit_depth)
+                    == (two.up_to, two.sample_format, two.bit_depth)
+                    && frames(&one, nsr_hertz(two.nsr)) == frames(&two, nsr_hertz(one.nsr))
+            }
+            (FormatKind::Iec61883_6(one), FormatKind::Iec61883_6(two)) => {
+                one.packing == two.packing
+                    && (one.blocking, one.non_blocking, one.up_to, one.synchronous)
+                        == (two.blocking, two.non_blocking, two.up_to, two.synchronous)
+            }
+            _ => false,
+        }
+    }
+
     /// An AAF format without its up-to flag and channel count, which may
     /// differ between a talker and a listener that takes fewer channels.
     fn aaf_without_channels(self) -> u64 {
@@ -508,6 +532,15 @@ mod tests {
         let am824_96 = StreamFormat(0x00a0_0408_4000_0800);
         assert!(am824_48.same_but_rate(am824_96));
         assert!(!am824_48.same_but_rate(aaf_48));
+        // At other channels, too: 16 channels at 48 kHz, 8 at 96.
+        let aaf_48_16 = StreamFormat(0x0205_0220_0400_6000);
+        assert!(!aaf_48_16.same_but_rate(aaf_96));
+        assert!(aaf_48_16.same_but_rate_and_channels(aaf_96));
+        assert!(!aaf_48_16.same_but_rate_and_channels(class_b_96));
+        assert!(!aaf_48_16.same_but_rate_and_channels(aaf_24_in_32));
+        let am824_96_2 = StreamFormat(0x00a0_0402_4000_0200);
+        assert!(am824_48.same_but_rate_and_channels(am824_96_2));
+        assert!(!am824_48.same_but_rate_and_channels(aaf_96));
     }
 
     #[test]

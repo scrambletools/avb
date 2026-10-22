@@ -621,6 +621,44 @@ fn the_sampling_rate_and_stream_formats_move_together() {
     );
 }
 
+/// A stream whose channels take more than a frame at the new rate moves
+/// to its packing of the most channels that fit there.
+#[test]
+fn a_new_rate_too_fast_for_a_streams_channels_takes_fewer() {
+    use atdecc::descriptor::SamplingRate;
+
+    // AAF of 32-bit at 48 kHz, 16 channels; at 192 kHz, 24 samples a
+    // frame, 8 and 2 channels.
+    const AAF_48K_16CH: StreamFormat = StreamFormat(0x0205_0220_0400_6000);
+    const AAF_192K_8CH: StreamFormat = StreamFormat(0x0209_0220_0201_8000);
+    const AAF_192K_2CH: StreamFormat = StreamFormat(0x0209_0220_0081_8000);
+    let mut network = Network::new();
+    let mut model = model(TALKER, "Talker", true);
+    model.sampling_rates = vec![48_000, 192_000];
+    model.outputs[0].formats = vec![AAF_48K_16CH, AAF_192K_2CH, AAF_192K_8CH];
+    model.outputs[0].current_format = AAF_48K_16CH;
+    let mut talker = Entity::new(model, &[(STREAM, DESTINATION)]);
+    talker.start(network.now);
+    network.talker = talker;
+    network.controller.discover(None);
+    network.run(3000);
+
+    let now = network.now;
+    network.controller.set_sampling_rate(
+        now,
+        TALKER,
+        DescriptorType::AUDIO_UNIT,
+        0,
+        SamplingRate(192_000),
+    );
+    network.run(1000);
+    assert_eq!(network.talker.model().current_sampling_rate, 192_000);
+    assert_eq!(
+        network.talker.model().outputs[0].current_format,
+        AAF_192K_8CH
+    );
+}
+
 /// A media clock output, CRF, has no stream port, clusters or map: the
 /// audio output after it has the one port, mapped to its own stream, and
 /// a new rate moves the audio alone.
