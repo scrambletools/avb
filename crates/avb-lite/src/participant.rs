@@ -42,7 +42,7 @@ pub const BROADCAST: MacAddress = MacAddress([0xff; 6]);
 pub const PRIORITY: u8 = 5;
 
 /// The unicast fan-out the profile recommends.
-pub const FANOUT: u8 = 2;
+pub const FANOUT: u8 = 5;
 
 /// The media VLAN where none is configured.
 pub const MEDIA_VLAN: u16 = 2;
@@ -139,7 +139,7 @@ pub struct Participant {
 
 impl Participant {
     /// The port's participant on the interface with address `mac`, from
-    /// `now`: a fan-out of 2, escalation not allowed, the media VLAN 2,
+    /// `now`: a fan-out of 5, escalation not allowed, the media VLAN 2,
     /// and no link speed to go by until it is set.
     pub fn new(mac: MacAddress, now: Duration) -> Self {
         let [a, b, c, d, e, f] = mac.0;
