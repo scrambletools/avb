@@ -532,6 +532,17 @@ impl Entity {
         }
     }
 
+    /// The link came up again: advertises a random moment from now, as
+    /// what it sent while the link was down reached no one, rather than
+    /// at its next interval (IEEE 1722.1's advertising state machine on a
+    /// link state change). Nothing before it starts.
+    pub fn link_up(&mut self, now: Instant) {
+        if let Some(at) = self.advertise_at {
+            let soon = now + self.random.up_to(DISCOVER_DELAY);
+            self.advertise_at = Some(at.min(soon));
+        }
+    }
+
     /// Takes over from `earlier`, this entity before its model changed,
     /// in place of starting: its advertisements count on from that one's,
     /// so controllers read the new model rather than see it leave or

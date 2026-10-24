@@ -1307,3 +1307,28 @@ fn a_vendor_logo_alone_is_the_first_memory_object() {
     );
     assert_eq!(model.image(MemoryObjectType::PNG_ENTITY), None);
 }
+
+#[test]
+fn an_entity_advertises_again_as_its_link_comes_up() {
+    let mut entity = Entity::new(model(TALKER, "Talker", true), &[(STREAM, DESTINATION)]);
+    let advertisements = |entity: &mut Entity| {
+        std::iter::from_fn(|| entity.poll_transmit())
+            .filter(|(_, bytes)| Adpdu::decode(bytes).is_ok())
+            .count()
+    };
+    let mut now = Instant::ZERO;
+    entity.link_up(now);
+    assert_eq!(entity.poll_timeout(), None, "nothing before it starts");
+    entity.start(now);
+    // Its first advertisement goes out as the link goes down, to no one.
+    now += Duration::from_millis(500);
+    entity.handle_timeout(now);
+    assert_eq!(advertisements(&mut entity), 1);
+    // Up again a few seconds later: it advertises within the moment
+    // ENTITY_DISCOVER gives, not 10 s after the first.
+    now += Duration::from_secs(4);
+    entity.link_up(now);
+    now += Duration::from_millis(500);
+    entity.handle_timeout(now);
+    assert_eq!(advertisements(&mut entity), 1);
+}
