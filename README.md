@@ -12,6 +12,7 @@ daemon, a GUI, or firmware on a microcontroller.
 | Crate | What it does |
 |---|---|
 | `atdecc` | IEEE 1722.1-2021 with Milan 1.3, MAAP and AVB Lite's vendor unique messages: frame codecs, controller state machines (discovery, AECP commands, enumeration, ACMP, unsolicited notifications), entity state machines (AEM responder, Milan listener binding, ACMP talker) and the entity model as data |
+| `avb-lite` | The AVB Lite profile: falling back from AVB where no bridge reserves streams, and CVU SRP's declarations, admission and escalation |
 | `avb-mrp` | IEEE 802.1Q MRP (applicant, registrar, LeaveAll, periodic timers), MSRP and MVRP, and a port's participant shared between programs on one computer |
 | `avb-net` | Raw Ethernet per operating system: interfaces, frames, multicast membership, the PTP hardware clock, link settings |
 | `avb-stream` | AVTP audio: AAF and AM824 talkers and listeners paced on gPTP time, CRF media clock streams, and audio to and from the computer's devices through cpal |
@@ -44,20 +45,20 @@ daemon, a GUI, or firmware on a microcontroller.
 
 ## Using them
 
-They are not on crates.io yet. Depend on this repository, pinned by
-revision:
+They are on crates.io:
 
 ```toml
 [dependencies]
-atdecc = { git = "https://github.com/scrambletools/avb", rev = "<commit>" }
+atdecc = "0.1"
 ```
 
 To change them together with an app that uses them, point the app at a
 local checkout from its own git-ignored `.cargo/config.toml`:
 
 ```toml
-[patch."https://github.com/scrambletools/avb"]
+[patch.crates-io]
 atdecc = { path = "../avb/crates/atdecc" }
+avb-lite = { path = "../avb/crates/avb-lite" }
 avb-mrp = { path = "../avb/crates/avb-mrp" }
 avb-net = { path = "../avb/crates/avb-net" }
 avb-stream = { path = "../avb/crates/avb-stream" }
