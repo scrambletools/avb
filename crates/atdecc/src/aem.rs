@@ -127,6 +127,26 @@ pub fn encode_get_stream_info(
     command(addressing, AemCommandType::GET_STREAM_INFO, &payload).encode(out)
 }
 
+/// Encodes START_STREAMING, or STOP_STREAMING where `start` is false,
+/// for a STREAM_INPUT or STREAM_OUTPUT.
+pub fn encode_streaming(
+    addressing: Addressing,
+    start: bool,
+    descriptor_type: DescriptorType,
+    index: u16,
+    out: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let mut payload = [0; 4];
+    payload[0..2].copy_from_slice(&descriptor_type.0.to_be_bytes());
+    payload[2..4].copy_from_slice(&index.to_be_bytes());
+    let command_type = if start {
+        AemCommandType::START_STREAMING
+    } else {
+        AemCommandType::STOP_STREAMING
+    };
+    command(addressing, command_type, &payload).encode(out)
+}
+
 /// The most octets of values a control has (IEEE 1722.1-2021, Table
 /// 7-38: value_details' maximum).
 pub const MAX_CONTROL_VALUES: usize = 404;
@@ -1151,6 +1171,27 @@ mod tests {
         let length =
             encode_read_descriptor(ADDRESSING, 1, DescriptorType::ENTITY, 0, &mut out).unwrap();
         assert_eq!(AemPdu::decode(&out[..length]).unwrap().payload, &[0; 8]);
+    }
+
+    #[test]
+    fn streaming_commands_name_the_stream() {
+        let mut out = [0; 64];
+        for (start, command_type) in [
+            (false, AemCommandType::STOP_STREAMING),
+            (true, AemCommandType::START_STREAMING),
+        ] {
+            let length = encode_streaming(
+                ADDRESSING,
+                start,
+                DescriptorType::STREAM_OUTPUT,
+                1,
+                &mut out,
+            )
+            .unwrap();
+            let pdu = AemPdu::decode(&out[..length]).unwrap();
+            assert_eq!(pdu.command_type, command_type);
+            assert_eq!(pdu.payload, &[0, 6, 0, 1]);
+        }
     }
 
     #[test]

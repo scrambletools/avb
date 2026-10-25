@@ -1,7 +1,7 @@
 [package]
 name = "atdecc"
 description = "IEEE 1722.1 ATDECC (AVDECC) with Milan: frames, controller and entity state machines, without I/O"
-version = "0.1.1"
+version = "0.1.2"
 categories = ["network-programming", "multimedia::audio", "no-std"]
 keywords = ["atdecc", "avdecc", "avb", "milan", "1722"]
 edition.workspace = true

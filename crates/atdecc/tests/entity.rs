@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use atdecc::adp::{Adpdu, EntityCapabilities};
 use atdecc::aecp::{AaMode, AaStatus, AaTlv, AddressAccessPdu, AecpHeader, AecpMessageType};
-use atdecc::controller::{Config, Controller, Event, Outcome};
+use atdecc::controller::{Config, Controller, Event, Outcome, Refusal};
 use atdecc::descriptor::{DescriptorType, MemoryObjectDescriptor, MemoryObjectType};
 use atdecc::entity::{
     EndpointModel, Entity, EntityEvent, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel,
@@ -17,7 +17,8 @@ use atdecc::entity::{
 use atdecc::model::EnumerationState;
 use atdecc::stream_format::StreamFormat;
 use atdecc::{
-    ADP_ACMP_MULTICAST, ClockIdentity, EntityId, EntityModelId, Instant, MacAddress, StreamId,
+    ADP_ACMP_MULTICAST, AcmpMessageType, AcmpStatus, Acmpdu, AemStatus, ClockIdentity, EntityId,
+    EntityModelId, Instant, MacAddress, StreamId,
 };
 
 const CONTROLLER_MAC: MacAddress = MacAddress([0x02, 0, 0, 0, 0, 1]);
@@ -82,6 +83,9 @@ struct Network {
     /// place, as ESP32 endpoints answer them, in a response as long as the
     /// command, instead of by the talker.
     in_place: Option<Vec<u8>>,
+    /// The status the listener's unbind answers carry in place of its
+    /// own, as a listener outside Milan answers.
+    unbind_status: Option<AcmpStatus>,
 }
 
 impl Network {
@@ -99,6 +103,7 @@ impl Network {
             controller_events: Vec::new(),
             sent: Vec::new(),
             in_place: None,
+            unbind_status: None,
         }
     }
 
@@ -128,6 +133,11 @@ impl Network {
                         frames.push_back((HOST_MAC, destination, bytes));
                     }
                 }
+                if let Some(status) = self.unbind_status {
+                    for (_, _, bytes) in &mut frames {
+                        refuse_unbind(bytes, status);
+                    }
+                }
                 let Some((source, destination, bytes)) = frames.pop_front() else {
                     break;
                 };
@@ -154,6 +164,20 @@ impl Network {
                 .extend(std::iter::from_fn(|| self.controller.poll_event()));
         }
     }
+}
+
+/// Gives an unbind answer in `bytes` the status `status`.
+fn refuse_unbind(bytes: &mut Vec<u8>, status: AcmpStatus) {
+    let Ok(mut acmpdu) = Acmpdu::decode(bytes) else {
+        return;
+    };
+    if acmpdu.message_type != AcmpMessageType::DISCONNECT_RX_RESPONSE {
+        return;
+    }
+    acmpdu.status = status;
+    let mut out = [0; 128];
+    let length = acmpdu.encode(&mut out).unwrap();
+    *bytes = out[..length].to_vec();
 }
 
 impl Network {
@@ -270,6 +294,70 @@ fn binding_probes_the_talker_and_unbinding_undoes_it() {
     // The listener lets go of the talker, as one outside Milan keeps the
     // connection the probe made until told.
     assert_eq!(network.disconnects(), [(TALKER, 0, LISTENER, 0)]);
+}
+
+/// Stopping and starting a stream are sent as AEM commands for the
+/// stream named, and finish with the entity's answer: this entity does
+/// not implement them.
+#[test]
+fn streaming_commands_finish_with_the_answer() {
+    let mut network = Network::new();
+    network.controller.discover(None);
+    network.run(3000);
+    let now = network.now;
+    let stop = network
+        .controller
+        .stop_streaming(now, TALKER, DescriptorType::STREAM_OUTPUT, 0);
+    let start = network
+        .controller
+        .start_streaming(now, TALKER, DescriptorType::STREAM_OUTPUT, 0);
+    network.run(1000);
+    let refused = Outcome::Refused(Refusal::Aem(AemStatus::NOT_IMPLEMENTED));
+    for command in [stop, start] {
+        assert!(
+            network
+                .controller_events
+                .contains(&Event::CommandFinished(command, refused)),
+            "{:?}",
+            network.controller_events
+        );
+    }
+}
+
+/// A listener that answers an unbind NOT_CONNECTED, as one outside Milan
+/// does where its talker had let go of it, is asked how it stands, so the
+/// controller no longer holds it bound.
+#[test]
+fn a_refused_unbind_reads_the_binding_again() {
+    let mut network = Network::new();
+    network.controller.discover(None);
+    network.run(3000);
+    let now = network.now;
+    network.controller.connect(now, (TALKER, 0), (LISTENER, 0));
+    network.run(1000);
+    let bound = |network: &Network| {
+        network
+            .controller
+            .model(LISTENER)
+            .and_then(|model| model.binding(0))
+            .and_then(|binding| binding.talker_stream())
+    };
+    assert_eq!(bound(&network), Some((TALKER, 0)));
+
+    network.unbind_status = Some(AcmpStatus::NOT_CONNECTED);
+    let now = network.now;
+    let unbind = network.controller.disconnect(now, (LISTENER, 0));
+    network.run(1000);
+    let refused = Outcome::Refused(Refusal::Acmp(AcmpStatus::NOT_CONNECTED));
+    assert!(
+        network
+            .controller_events
+            .contains(&Event::CommandFinished(unbind, refused)),
+        "{:?}",
+        network.controller_events
+    );
+    assert_eq!(network.listener.input_binding(0), None);
+    assert_eq!(bound(&network), None);
 }
 
 /// A listener leaving, or handing over to an entity that does not carry

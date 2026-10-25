@@ -339,6 +339,13 @@ enum Request {
         set: SetStreamFormat,
         command: CommandId,
     },
+    /// START_STREAMING, or STOP_STREAMING where `start` is false.
+    Streaming {
+        descriptor_type: DescriptorType,
+        index: u16,
+        start: bool,
+        command: CommandId,
+    },
     SetSamplingRate {
         set: SetSamplingRate,
         command: CommandId,
@@ -494,6 +501,7 @@ impl Request {
             | Request::Unbind { command, .. }
             | Request::SetName { command, .. }
             | Request::SetStreamFormat { command, .. }
+            | Request::Streaming { command, .. }
             | Request::SetSamplingRate { command, .. }
             | Request::SetClockSource { command, .. }
             | Request::SetConfiguration { command, .. }
@@ -1402,6 +1410,25 @@ impl Controller {
                         .push_back(Event::CommandFinished(command, aem_outcome(aem)));
                 }
             }
+            Request::Streaming {
+                descriptor_type,
+                index,
+                command,
+                ..
+            } => {
+                // The stream info tells whether it runs now.
+                if aem.status().is_success() {
+                    self.queue_query(
+                        entity_id,
+                        Request::GetStreamInfo {
+                            descriptor_type,
+                            index,
+                        },
+                    );
+                }
+                self.events
+                    .push_back(Event::CommandFinished(command, aem_outcome(aem)));
+            }
             Request::SetControl { index, command } => {
                 self.control_values.remove(&command);
                 // The response holds the values the control has after,
@@ -1792,6 +1819,15 @@ impl Controller {
                 == Some(acmpdu.message_type)
         {
             self.complete(key, inflight);
+            // A listener that refuses a bind or unbind may be bound
+            // otherwise than the model holds, as one that answers
+            // NOT_CONNECTED to an unbind it was thought bound for: it is
+            // asked how it stands.
+            if let Request::Bind { input, .. } | Request::Unbind { input, .. } = inflight.request
+                && !acmpdu.status.is_success()
+            {
+                self.queue_query(addressed, Request::GetRxState { input });
+            }
             if let Request::GetTxState { output, .. } = inflight.request
                 && acmpdu.status.is_success()
                 && acmpdu.talker_unique_id == output
@@ -2701,6 +2737,12 @@ impl Controller {
                 .encode(addressing, &mut out)
             }
             Request::SetStreamFormat { set, .. } => set.encode(addressing, &mut out),
+            Request::Streaming {
+                descriptor_type,
+                index,
+                start,
+                ..
+            } => aem::encode_streaming(addressing, start, descriptor_type, index, &mut out),
             Request::SetSamplingRate { set, .. } => set.encode(addressing, &mut out),
             Request::SetClockSource { set, .. } => set.encode(addressing, &mut out),
             Request::SetConfiguration { configuration, .. } => {
@@ -2985,6 +3027,49 @@ impl Controller {
             format,
         };
         let request = Request::SetStreamFormat { set, command };
+        self.queue_command(now, entity_id, command, request);
+        command
+    }
+
+    /// Starts a STREAM_INPUT or STREAM_OUTPUT streaming again after
+    /// [`Controller::stop_streaming`] (START_STREAMING).
+    pub fn start_streaming(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        descriptor_type: DescriptorType,
+        index: u16,
+    ) -> CommandId {
+        self.streaming(now, entity_id, descriptor_type, index, true)
+    }
+
+    /// Stops a STREAM_INPUT or STREAM_OUTPUT streaming (STOP_STREAMING),
+    /// as entities take a new format only while the stream is stopped.
+    pub fn stop_streaming(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        descriptor_type: DescriptorType,
+        index: u16,
+    ) -> CommandId {
+        self.streaming(now, entity_id, descriptor_type, index, false)
+    }
+
+    fn streaming(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        descriptor_type: DescriptorType,
+        index: u16,
+        start: bool,
+    ) -> CommandId {
+        let command = self.next_command();
+        let request = Request::Streaming {
+            descriptor_type,
+            index,
+            start,
+            command,
+        };
         self.queue_command(now, entity_id, command, request);
         command
     }
@@ -3875,6 +3960,8 @@ fn command_type_of(request: Request) -> AemCommandType {
         Request::Identify { .. } => AemCommandType::SET_CONTROL,
         Request::SetName { .. } => AemCommandType::SET_NAME,
         Request::SetStreamFormat { .. } => AemCommandType::SET_STREAM_FORMAT,
+        Request::Streaming { start: true, .. } => AemCommandType::START_STREAMING,
+        Request::Streaming { start: false, .. } => AemCommandType::STOP_STREAMING,
         Request::SetSamplingRate { .. } => AemCommandType::SET_SAMPLING_RATE,
         Request::SetClockSource { .. } => AemCommandType::SET_CLOCK_SOURCE,
         Request::SetConfiguration { .. } => AemCommandType::SET_CONFIGURATION,
