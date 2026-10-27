@@ -192,6 +192,14 @@ struct Output {
     counters: [u32; 32],
 }
 
+impl Output {
+    /// Whether it streams, as Milan has it (5.3.7.3): declared, with a
+    /// listener ready for it.
+    fn streaming(&self) -> bool {
+        self.reservation.registering && self.reservation.ready_listeners > 0
+    }
+}
+
 /// A stream output's max transit time when none is set, by its class.
 fn default_transit(class_b: bool) -> u32 {
     if class_b {
@@ -489,6 +497,19 @@ impl Entity {
         };
         if output.destination != destination {
             output.destination = destination;
+            self.notify_stream_info(DescriptorType::STREAM_OUTPUT, index);
+        }
+    }
+
+    /// Sends output `index`'s stream as `stream_id` from now on, as when it
+    /// grew and a bridge may hold its old reservation a while, telling
+    /// registered controllers.
+    pub fn set_output_stream_id(&mut self, index: u16, stream_id: StreamId) {
+        let Some(output) = self.outputs.get_mut(usize::from(index)) else {
+            return;
+        };
+        if output.stream_id != stream_id {
+            output.stream_id = stream_id;
             self.notify_stream_info(DescriptorType::STREAM_OUTPUT, index);
         }
     }
@@ -1547,6 +1568,11 @@ impl Entity {
                         0 => default_transit(class_b),
                         nanoseconds => u32::try_from(nanoseconds).unwrap_or(u32::MAX),
                     };
+                    // A streaming output keeps it (Milan, 5.4.2.30).
+                    if output.streaming() && wanted != output.max_transit_time {
+                        answer.extend_from_slice(&u64::from(output.max_transit_time).to_be_bytes());
+                        return (AemStatus::STREAM_IS_RUNNING, answer, false);
+                    }
                     if wanted != output.max_transit_time {
                         output.max_transit_time = wanted;
                         self.events.push_back(EntityEvent::MaxTransitTimeChanged {
@@ -1692,6 +1718,18 @@ impl Entity {
         }
         let descriptor_type = DescriptorType(read_u16(payload, 0));
         let index = read_u16(payload, 2);
+        // A bound input or a streaming output keeps its format (Milan,
+        // 5.4.2.7).
+        let running = match descriptor_type {
+            DescriptorType::STREAM_INPUT => self
+                .inputs
+                .get(usize::from(index))
+                .is_some_and(|input| input.binding.is_some()),
+            _ => self
+                .outputs
+                .get(usize::from(index))
+                .is_some_and(Output::streaming),
+        };
         let streams = match descriptor_type {
             DescriptorType::STREAM_INPUT => &mut self.model.inputs,
             DescriptorType::STREAM_OUTPUT => &mut self.model.outputs,
@@ -1709,6 +1747,10 @@ impl Entity {
             if !stream.formats.iter().any(|entry| entry.admits(format)) {
                 answer.extend_from_slice(&stream.current_format.0.to_be_bytes());
                 return (AemStatus::BAD_ARGUMENTS, answer, false);
+            }
+            if running && format != stream.current_format {
+                answer.extend_from_slice(&stream.current_format.0.to_be_bytes());
+                return (AemStatus::STREAM_IS_RUNNING, answer, false);
             }
             if format != stream.current_format {
                 let before = stream.current_format;

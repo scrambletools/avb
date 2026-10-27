@@ -11,8 +11,8 @@ use atdecc::aecp::{AaMode, AaStatus, AaTlv, AddressAccessPdu, AecpHeader, AecpMe
 use atdecc::controller::{Config, Controller, Event, Outcome, Refusal};
 use atdecc::descriptor::{DescriptorType, MemoryObjectDescriptor, MemoryObjectType};
 use atdecc::entity::{
-    EndpointModel, Entity, EntityEvent, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel,
-    VENDOR_LOGO_ADDRESS,
+    EndpointModel, Entity, EntityEvent, LOGO_ADDRESS, MEMORY_SEGMENT, OutputReservation,
+    StreamModel, VENDOR_LOGO_ADDRESS,
 };
 use atdecc::model::EnumerationState;
 use atdecc::stream_format::StreamFormat;
@@ -469,6 +469,36 @@ fn a_talker_without_an_address_is_probed_again_until_it_has_one() {
     );
 }
 
+/// A talker's stream given a new ID, as when it grew: controllers hear
+/// of it, and a listener probing again settles on it.
+#[test]
+fn a_talker_streams_under_a_new_id() {
+    const GROWN: StreamId = StreamId(0x9c6b_0030_9a2b_0001);
+    let mut network = Network::new();
+    network.controller.discover(None);
+    network.run(3000);
+    let now = network.now;
+    network.controller.connect(now, (TALKER, 0), (LISTENER, 0));
+    network.run(1000);
+    network.talker.set_output_stream_id(0, GROWN);
+    assert_eq!(
+        network.talker.output_stream(0).map(|(id, _)| id),
+        Some(GROWN)
+    );
+    network.run(1000);
+    let read = network.controller.model(TALKER).unwrap();
+    let info = read.stream_info(DescriptorType::STREAM_OUTPUT, 0).unwrap();
+    assert_eq!(info.stream_id, GROWN);
+    network.entity_events.clear();
+    let now = network.now;
+    network.listener.probe_again(now, 0);
+    network.run(2000);
+    assert!(network.entity_events.iter().any(|event| matches!(
+        event,
+        EntityEvent::InputSettled { index: 0, stream } if stream.stream_id == GROWN
+    )));
+}
+
 /// An entity's AVB_INTERFACE counters, link up and down and grandmaster
 /// changes, as it is given them, read by a controller.
 #[test]
@@ -706,6 +736,80 @@ fn the_sampling_rate_and_stream_formats_move_together() {
             .next()
             .map(|stream| stream.current_format),
         Some(AAF_48K_8CH)
+    );
+}
+
+/// A streaming output keeps its format and max transit time, as Milan has
+/// it (5.4.2.7, 5.4.2.30), and takes either once no listener is ready.
+#[test]
+fn a_streaming_output_keeps_its_format() {
+    // AAF, 8 channels of 32-bit at 48 kHz, class B.
+    const CLASS_B_48K_8CH: StreamFormat = StreamFormat(0x0205_0220_0200_c000);
+    let mut network = Network::new();
+    let mut model = model(TALKER, "Talker", true);
+    model.outputs[0].formats = vec![AAF_48K_8CH, CLASS_B_48K_8CH];
+    let mut talker = Entity::new(model, &[(STREAM, DESTINATION)]);
+    talker.start(network.now);
+    network.talker = talker;
+    network.controller.discover(None);
+    network.run(3000);
+    let streaming = OutputReservation {
+        ready_listeners: 1,
+        registering: true,
+    };
+    network.talker.set_output_reservation(0, streaming);
+    let set = |network: &mut Network, format: StreamFormat| {
+        let now = network.now;
+        network
+            .controller
+            .set_stream_format(now, TALKER, DescriptorType::STREAM_OUTPUT, 0, format);
+        network.run(1000);
+        network.talker.model().outputs[0].current_format
+    };
+    assert_eq!(set(&mut network, CLASS_B_48K_8CH), AAF_48K_8CH, "streaming");
+    let now = network.now;
+    network
+        .controller
+        .set_max_transit_time(now, TALKER, 0, 5_000_000);
+    network.run(1000);
+    assert_eq!(network.talker.max_transit_time(0), Some(2_000_000));
+    network.talker.set_output_reservation(
+        0,
+        OutputReservation {
+            ready_listeners: 0,
+            ..streaming
+        },
+    );
+    assert_eq!(set(&mut network, CLASS_B_48K_8CH), CLASS_B_48K_8CH);
+}
+
+/// A bound input keeps its format, as Milan has it (5.4.2.7).
+#[test]
+fn a_bound_input_keeps_its_format() {
+    const AAF_48K_2CH: StreamFormat = StreamFormat(0x0205_0220_0080_6000);
+    let mut network = Network::new();
+    let mut model = model(LISTENER, "Listener", false);
+    model.inputs[0].formats = vec![AAF_48K_8CH, AAF_48K_2CH];
+    let mut listener = Entity::new(model, &[]);
+    listener.start(network.now);
+    network.listener = listener;
+    network.controller.discover(None);
+    network.run(3000);
+    let now = network.now;
+    network.controller.connect(now, (TALKER, 0), (LISTENER, 0));
+    network.run(1000);
+    let now = network.now;
+    network.controller.set_stream_format(
+        now,
+        LISTENER,
+        DescriptorType::STREAM_INPUT,
+        0,
+        AAF_48K_2CH,
+    );
+    network.run(1000);
+    assert_eq!(
+        network.listener.model().inputs[0].current_format,
+        AAF_48K_8CH
     );
 }
 
