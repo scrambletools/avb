@@ -1,7 +1,7 @@
 [package]
 name = "avb-mrp"
 description = "IEEE 802.1Q MRP, MSRP and MVRP: attribute declaration and stream reservation state machines, without I/O"
-version = "0.1.0"
+version = "0.1.1"
 categories = ["network-programming", "no-std"]
 keywords = ["avb", "tsn", "msrp", "mvrp", "srp"]
 edition.workspace = true

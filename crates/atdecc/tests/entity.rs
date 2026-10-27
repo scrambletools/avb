@@ -709,6 +709,77 @@ fn the_sampling_rate_and_stream_formats_move_together() {
     );
 }
 
+/// A stream offering an up-to format takes that format adapted to fewer
+/// or exactly its channels, as controllers set it to a talker's, keeps it
+/// adapted as the rate moves, and refuses what no format admits.
+#[test]
+fn an_up_to_format_takes_its_adaptations() {
+    use atdecc::descriptor::SamplingRate;
+
+    // AM824, non-blocking, up to 8 channels, at 48 and 96 kHz.
+    const UP_TO_48K: StreamFormat = StreamFormat(0x00a0_0208_6000_0800);
+    const UP_TO_96K: StreamFormat = StreamFormat(0x00a0_0408_6000_0800);
+    const EXACT_48K: StreamFormat = StreamFormat(0x00a0_0208_4000_0800);
+    const EXACT_96K: StreamFormat = StreamFormat(0x00a0_0408_4000_0800);
+    let mut network = Network::new();
+    let mut model = model(TALKER, "Talker", true);
+    model.sampling_rates = vec![48_000, 96_000];
+    model.outputs[0].formats = vec![UP_TO_48K, UP_TO_96K];
+    model.outputs[0].current_format = UP_TO_48K;
+    let mut talker = Entity::new(model, &[(STREAM, DESTINATION)]);
+    talker.start(network.now);
+    network.talker = talker;
+    network.controller.discover(None);
+    network.run(3000);
+
+    let now = network.now;
+    network
+        .controller
+        .set_stream_format(now, TALKER, DescriptorType::STREAM_OUTPUT, 0, EXACT_48K);
+    network.run(1000);
+    assert_eq!(network.talker.model().outputs[0].current_format, EXACT_48K);
+    assert!(
+        network
+            .entity_events
+            .contains(&EntityEvent::StreamFormatChanged {
+                descriptor_type: DescriptorType::STREAM_OUTPUT,
+                index: 0,
+                format: EXACT_48K,
+            })
+    );
+    let read = network.controller.model(TALKER).unwrap();
+    let current = read
+        .streams(false)
+        .next()
+        .map(|stream| stream.current_format);
+    assert_eq!(current, Some(EXACT_48K));
+    assert_eq!(EXACT_48K.channels(), Some(8));
+
+    // A new rate keeps it adapted.
+    let now = network.now;
+    network.controller.set_sampling_rate(
+        now,
+        TALKER,
+        DescriptorType::AUDIO_UNIT,
+        0,
+        SamplingRate(96_000),
+    );
+    network.run(1000);
+    assert_eq!(network.talker.model().outputs[0].current_format, EXACT_96K);
+
+    // More channels than the format offers stay refused.
+    let now = network.now;
+    network.controller.set_stream_format(
+        now,
+        TALKER,
+        DescriptorType::STREAM_OUTPUT,
+        0,
+        StreamFormat(0x00a0_0410_4000_1000),
+    );
+    network.run(1000);
+    assert_eq!(network.talker.model().outputs[0].current_format, EXACT_96K);
+}
+
 /// A stream whose channels take more than a frame at the new rate moves
 /// to its packing of the most channels that fit there.
 #[test]

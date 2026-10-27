@@ -400,7 +400,9 @@ impl Drift {
             }
             made += 1;
             self.position += self.ratio;
-            let passed = self.position as usize;
+            // At four times the device's rate or more, a step can pass
+            // frames yet to come: the rest is passed as they do.
+            let passed = (self.position as usize).min(self.held_frames());
             if passed > 0 {
                 self.held.drain(..passed * channels);
                 self.position -= passed as f64;
@@ -1259,6 +1261,43 @@ mod tests {
         // A 1 kHz sine at half scale steps at most 0.033 at 96 kHz.
         let most = steps.iter().fold(0.0f32, |most, step| most.max(*step));
         assert!(most < 0.04, "{most}");
+    }
+
+    /// A 192 kHz stream to a 48 kHz device, steered a little above four of
+    /// its frames for each of the device's, as a listener plays it: each
+    /// step passes as many as five input frames, never more than it holds.
+    #[test]
+    fn a_stream_at_four_times_the_devices_rate_is_made_whole() {
+        let mut drift = Drift::new(2, DeviceSide::Pulls, 4.0);
+        drift.ratio = 4.0 + 300e-6;
+        let mut out = Vec::new();
+        let mut made = 0;
+        let mut last: Option<f32> = None;
+        let mut most = 0.0f32;
+        for frame in 0..8000 * 10 {
+            let first = frame * 24;
+            let input: Vec<f32> = (first..first + 24)
+                .flat_map(|at| {
+                    let sample = (TAU as f64 * 1000.0 * at as f64 / 192_000.0).sin() as f32 * 0.5;
+                    [sample, -sample]
+                })
+                .collect();
+            drift.push(&input);
+            out.clear();
+            drift.make(&mut out, usize::MAX);
+            for pair in out.as_chunks::<2>().0 {
+                if let Some(previous) = last {
+                    most = most.max((pair[0] - previous).abs());
+                }
+                last = Some(pair[0]);
+                made += 1;
+            }
+        }
+        // 1.92 million input frames make about 480 thousand.
+        let expected = 8000.0 * 10.0 * 24.0 / drift.ratio;
+        assert!((made as f64 - expected).abs() < 4.0, "{made}");
+        // A 1 kHz sine at half scale steps at most 0.066 at 48 kHz.
+        assert!(most < 0.07, "{most}");
     }
 
     /// A listener's output to a device 50 ppm slow that plays each chunk

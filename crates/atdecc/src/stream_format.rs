@@ -319,6 +319,57 @@ impl StreamFormat {
             _ => false,
         }
     }
+
+    /// The bits an up-to format's adaptations change: the up-to flag and
+    /// the channels in AAF, the up-to flag, quadlets and labels in IEC
+    /// 61883-6.
+    fn adaptable_bits(self) -> u64 {
+        match self.kind() {
+            FormatKind::Aaf(_) => 0x0080_0000_0000_0000 | (0x3ff << 22),
+            FormatKind::Iec61883_6(_) => (0xff << 32) | (0x20 << 24) | 0x00ff_ffff,
+            _ => 0,
+        }
+    }
+
+    /// Whether a stream may be set to `set` where `self` is one of its
+    /// formats: `self` itself, or, `self` being an up-to format, `self`
+    /// with as many channels or fewer, the up-to flag set or not, as a
+    /// controller adapts it to a talker (IEEE 1722.1-2021, 7.3.3).
+    pub fn admits(self, set: StreamFormat) -> bool {
+        if self == set {
+            return true;
+        }
+        let mask = self.adaptable_bits();
+        if mask == 0 || self.0 & !mask != set.0 & !mask {
+            return false;
+        }
+        let quadlets = |labels: [u8; 4]| labels.iter().map(|&count| u16::from(count)).sum::<u16>();
+        match (self.kind(), set.kind()) {
+            (FormatKind::Aaf(entry), FormatKind::Aaf(adapted)) => {
+                entry.up_to && (1..=entry.channels).contains(&adapted.channels)
+            }
+            (FormatKind::Iec61883_6(entry), FormatKind::Iec61883_6(adapted)) => {
+                entry.up_to
+                    && (1..=entry.dbs).contains(&adapted.dbs)
+                    && entry
+                        .labels
+                        .iter()
+                        .zip(adapted.labels)
+                        .all(|(&most, count)| count <= most)
+                    // Labels that fill the entry's blocks fill the adapted ones.
+                    && (quadlets(entry.labels) != u16::from(entry.dbs)
+                        || quadlets(adapted.labels) == u16::from(adapted.dbs))
+            }
+            _ => false,
+        }
+    }
+
+    /// `self` adapted as `like` is: its channels and up-to flag, and in IEC
+    /// 61883-6 its quadlets and labels, the rest `self`'s.
+    pub fn adapted(self, like: StreamFormat) -> StreamFormat {
+        let mask = self.adaptable_bits();
+        StreamFormat(self.0 & !mask | like.0 & mask)
+    }
 }
 
 /// How a talker's stream fits a listener's stream input.
@@ -640,5 +691,71 @@ mod tests {
         assert_eq!(fit(eight, two, []), Fit::Incompatible);
         assert_eq!(fit(other_rate, eight, [eight, two]), Fit::Incompatible);
         assert_eq!(fit(clock, eight, [eight]), Fit::Incompatible);
+    }
+
+    #[test]
+    fn an_up_to_format_admits_its_adaptations() {
+        // AAF, 32-bit at 48 kHz, up to 8 channels.
+        let aaf_up_to = StreamFormat(0x0285_0220_0200_6000);
+        let aaf_eight = StreamFormat(0x0205_0220_0200_6000);
+        let aaf_two = StreamFormat(0x0205_0220_0080_6000);
+        assert!(aaf_up_to.admits(aaf_eight));
+        assert!(aaf_up_to.admits(aaf_two));
+        assert!(aaf_up_to.admits(StreamFormat(aaf_two.0 | 0x0080_0000_0000_0000)));
+        assert!(
+            !aaf_up_to.admits(StreamFormat(0x0205_0220_0000_6000)),
+            "no channels"
+        );
+        assert!(
+            !aaf_up_to.admits(StreamFormat(0x0205_0220_0400_6000)),
+            "16 channels"
+        );
+        assert!(
+            !aaf_up_to.admits(StreamFormat(0x0207_0220_0200_c000)),
+            "96 kHz"
+        );
+        assert!(
+            !aaf_up_to.admits(StreamFormat(0x0205_0218_0200_6000)),
+            "24 bits"
+        );
+        assert!(
+            !aaf_eight.admits(aaf_two),
+            "an exact format admits itself alone"
+        );
+
+        // AM824 at 48 kHz, non-blocking, up to 8 multi-bit linear audio
+        // quadlets, as MOTU's endpoints declare it, and the exact form.
+        let am824_up_to = StreamFormat(0x00a0_0208_6000_0800);
+        let am824_eight = StreamFormat(0x00a0_0208_4000_0800);
+        let am824_two = StreamFormat(0x00a0_0202_4000_0200);
+        assert!(am824_up_to.admits(am824_eight));
+        assert!(am824_up_to.admits(am824_two));
+        assert!(
+            !am824_up_to.admits(StreamFormat(0x00a0_0608_4000_0800)),
+            "192 kHz"
+        );
+        assert!(
+            !am824_up_to.admits(StreamFormat(0x00a0_0208_8000_0800)),
+            "blocking"
+        );
+        assert!(
+            !am824_up_to.admits(StreamFormat(0x00a0_0202_4000_0800)),
+            "8 labels in 2"
+        );
+        assert!(
+            !am824_up_to.admits(StreamFormat(0x00a0_0209_4000_0900)),
+            "9 quadlets"
+        );
+        assert!(!am824_eight.admits(am824_two));
+
+        // At another rate, the same adaptation.
+        assert_eq!(
+            StreamFormat(0x00a0_0608_6000_0800).adapted(am824_two),
+            StreamFormat(0x00a0_0602_4000_0200)
+        );
+        assert_eq!(
+            StreamFormat(0x0289_0220_0201_8000).adapted(aaf_two),
+            StreamFormat(0x0209_0220_0081_8000)
+        );
     }
 }

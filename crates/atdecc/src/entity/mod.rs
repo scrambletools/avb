@@ -1706,7 +1706,7 @@ impl Entity {
                 return (AemStatus::BAD_ARGUMENTS, echo, false);
             }
             let format = StreamFormat(read_u64(payload, 4));
-            if !stream.formats.contains(&format) {
+            if !stream.formats.iter().any(|entry| entry.admits(format)) {
                 answer.extend_from_slice(&stream.current_format.0.to_be_bytes());
                 return (AemStatus::BAD_ARGUMENTS, answer, false);
             }
@@ -1776,7 +1776,8 @@ impl Entity {
     /// Moves every stream but `except` to the format that packs samples as
     /// its current one does at `rate`, or, where its channels take more
     /// than a frame there, to that packing of the most channels it offers
-    /// at `rate`, telling registered controllers.
+    /// at `rate`, telling registered controllers. A current format adapted
+    /// from an up-to one moves adapted alike where the new one admits it.
     fn follow_rate(&mut self, rate: u32, except: Option<(DescriptorType, u16)>) {
         let mut moved = Vec::new();
         for (descriptor_type, streams) in [
@@ -1791,6 +1792,12 @@ impl Entity {
                     continue;
                 }
                 let current = stream.current_format;
+                let entry = stream
+                    .formats
+                    .iter()
+                    .copied()
+                    .find(|entry| entry.admits(current))
+                    .unwrap_or(current);
                 let at_rate = || {
                     stream
                         .formats
@@ -1798,13 +1805,19 @@ impl Entity {
                         .copied()
                         .filter(|format| format.sample_rate() == Some(rate))
                 };
-                let same = at_rate().find(|format| format.same_but_rate(current));
+                let same = at_rate().find(|format| format.same_but_rate(entry));
                 let fewer = || {
                     at_rate()
-                        .filter(|format| format.same_but_rate_and_channels(current))
+                        .filter(|format| format.same_but_rate_and_channels(entry))
                         .max_by_key(|format| format.channels())
                 };
-                if let Some(format) = same.or_else(fewer) {
+                if let Some(found) = same.or_else(fewer) {
+                    let adapted = found.adapted(current);
+                    let format = if entry != current && found.admits(adapted) {
+                        adapted
+                    } else {
+                        found
+                    };
                     stream.current_format = format;
                     moved.push((descriptor_type, index, format));
                 }

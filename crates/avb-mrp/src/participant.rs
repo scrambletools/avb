@@ -80,8 +80,8 @@ impl Applicant {
             (Step::Join, Ao) => Ap,
             (Step::Join, Qo) => Qp,
             (Step::Leave, Vp) => Vo,
-            (Step::Leave, Vo | Vn | An) => Lo,
-            (Step::Leave, Aa | Qa) => La,
+            // A New sent, or about to be, is left as a Join is.
+            (Step::Leave, Vn | An | Aa | Qa) => La,
             (Step::Leave, Ap) => Ao,
             (Step::Leave, Qp) => Qo,
             (Step::Received(Event::JoinIn), Vo) => Ao,
@@ -588,6 +588,59 @@ mod tests {
                 value: stream,
             }]
         );
+    }
+
+    /// Withdrawn while still new, after its first New went out, a
+    /// declaration still sends its Leave: the peer takes it off within a
+    /// leave time, not at its LeaveAll.
+    #[test]
+    fn a_declaration_withdrawn_while_new_still_leaves() {
+        let mut talker = Participant::new(msrp::FORMAT, ms(0), 7);
+        let mut listener = Participant::new(msrp::FORMAT, ms(0), 8);
+        let stream = advertise()[..8].to_vec();
+        let ready = Some(ListenerState::Ready.number());
+        listener.declare(ms(0), msrp::attribute::LISTENER, stream.clone(), ready);
+        let mut now = 0;
+        let mut joined = Vec::new();
+        while joined.is_empty() {
+            now += 10;
+            listener.handle_timeout(ms(now));
+            while let Some(pdu) = listener.poll_transmit() {
+                talker.handle_pdu(ms(now), &pdu);
+            }
+            joined.extend(core::iter::from_fn(|| talker.poll_event()));
+        }
+        listener.withdraw(ms(now), msrp::attribute::LISTENER, &stream);
+        let (heard, _) = run(&mut talker, &mut listener, now, now + 1500);
+        assert_eq!(
+            heard,
+            [Registration::Left {
+                attribute_type: msrp::attribute::LISTENER,
+                value: stream,
+            }]
+        );
+    }
+
+    /// Table 10-3's Lv! column.
+    #[test]
+    fn a_leave_request_moves_each_state_as_the_table_says() {
+        use Applicant::*;
+        for (from, to) in [
+            (Vo, Vo),
+            (Vp, Vo),
+            (Vn, La),
+            (An, La),
+            (Aa, La),
+            (Qa, La),
+            (La, La),
+            (Ao, Ao),
+            (Qo, Qo),
+            (Ap, Ao),
+            (Qp, Qo),
+            (Lo, Lo),
+        ] {
+            assert_eq!(from.step(Step::Leave), (to, None), "{from:?}");
+        }
     }
 
     #[test]
