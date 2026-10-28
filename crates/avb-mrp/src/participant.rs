@@ -440,17 +440,25 @@ impl Participant {
                 }),
             }
         }
-        if self.leave_all_due && messages.is_empty() {
-            // LeaveAll alone still goes out, for the first type known.
-            if let Some(kind) =
-                (1..=u8::MAX).find(|kind| (self.format.first_value_length)(*kind).is_some())
+        if self.leave_all_due {
+            // LeaveAll is the whole participant's: it goes for every type
+            // the application has, those declared nothing of too, so that
+            // peers declare again all they declare, of every type.
+            for kind in
+                (1..=u8::MAX).filter(|kind| (self.format.first_value_length)(*kind).is_some())
             {
-                messages.push(Message {
-                    attribute_type: kind,
-                    leave_all: true,
-                    values: Vec::new(),
-                });
+                if !messages
+                    .iter()
+                    .any(|message| message.attribute_type == kind)
+                {
+                    messages.push(Message {
+                        attribute_type: kind,
+                        leave_all: true,
+                        values: Vec::new(),
+                    });
+                }
             }
+            messages.sort_by_key(|message| message.attribute_type);
         }
         self.leave_all_due = false;
         if !messages.is_empty() {
@@ -662,6 +670,23 @@ mod tests {
                 four_packed: ready,
             })
         );
+    }
+
+    /// A LeaveAll goes for every MSRP attribute type, those declared
+    /// nothing of too, with what is declared.
+    #[test]
+    fn a_leave_all_goes_for_every_type() {
+        let mut listener = Participant::new(msrp::FORMAT, ms(0), 12);
+        let stream = advertise()[..8].to_vec();
+        let ready = Some(ListenerState::Ready.number());
+        listener.declare(ms(0), msrp::attribute::LISTENER, stream.clone(), ready);
+        // Past the longest the LeaveAll timer takes.
+        listener.handle_timeout(LEAVE_ALL_TIME + LEAVE_ALL_SPREAD);
+        let pdu = listener.poll_transmit().expect("a LeaveAll");
+        let decoded = mrpdu::decode(&pdu, &msrp::FORMAT);
+        assert_eq!(decoded.leave_all, [1, 2, 3, 4]);
+        assert_eq!(decoded.values.len(), 1);
+        assert_eq!(decoded.values[0].value, stream);
     }
 
     #[test]
