@@ -288,6 +288,18 @@ impl Participant {
         }
     }
 
+    /// Sends LeaveAll at `at`, or at the next `handle_timeout` once that
+    /// has passed, as its LeaveAll timer would, unless the timer or a
+    /// peer's LeaveAll comes first: every peer declares its attributes
+    /// again within its JoinTime, rather than at its own next LeaveAll,
+    /// as a participant that just took a port over from another needs.
+    /// Every registration starts leaving, and what is declared goes out
+    /// with the LeaveAll: so first declare all that should stay, as a
+    /// peer takes off what no declaration renews within its LeaveTime.
+    pub fn leave_all_at(&mut self, at: Duration) {
+        self.leave_all_at = self.leave_all_at.min(at);
+    }
+
     /// Handles a received MRPDU's payload.
     pub fn handle_pdu(&mut self, now: Duration, pdu: &[u8]) {
         let decoded = mrpdu::decode(pdu, &self.format);
@@ -669,6 +681,36 @@ mod tests {
                 value: stream,
                 four_packed: ready,
             })
+        );
+    }
+
+    /// A participant taking a port over from another, which the peer
+    /// cannot tell apart, hears the peer's declarations within a JoinTime
+    /// of its LeaveAll, not at the peer's next LeaveAll or, as here,
+    /// PeriodicTime, and the peer keeps what it declared at once.
+    #[test]
+    fn a_participant_taking_over_hears_its_peer_at_once() {
+        let mut talker = Participant::new(msrp::FORMAT, ms(0), 9);
+        let mut before = Participant::new(msrp::FORMAT, ms(0), 10);
+        talker.declare(ms(0), msrp::attribute::TALKER_ADVERTISE, advertise(), None);
+        let stream = advertise()[..8].to_vec();
+        let ready = Some(ListenerState::Ready.number());
+        before.declare(ms(0), msrp::attribute::LISTENER, stream.clone(), ready);
+        run(&mut talker, &mut before, 0, 3500);
+        assert_eq!(talker.registered().count(), 1);
+        // Gone without a Leave; another takes over, declaring the same.
+        let mut after = Participant::new(msrp::FORMAT, ms(3500), 11);
+        after.declare(ms(3500), msrp::attribute::LISTENER, stream.clone(), ready);
+        after.leave_all_at(ms(3500));
+        let (lost, heard) = run(&mut talker, &mut after, 3500, 3800);
+        assert!(lost.is_empty(), "{lost:?}");
+        assert_eq!(
+            heard,
+            [Registration::Joined {
+                attribute_type: msrp::attribute::TALKER_ADVERTISE,
+                value: advertise(),
+                four_packed: None,
+            }]
         );
     }
 

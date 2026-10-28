@@ -13,6 +13,12 @@
 //! and tells the program the port's mode and where to send each copy of
 //! its streams, as AVB Lite sends one to each listener.
 //!
+//! A participant that stops tells the programs it leaves. While the port
+//! runs AVB it sends no Leave for what those that say HANDOFF declared:
+//! they run their own participant at once and declare it all again, the
+//! bridge's registrations standing in between; as one starts again they
+//! stop their own with no Leave and share it once more.
+//!
 //! It serves on a Unix socket in the user's runtime folder, named for the
 //! interface, which only the same user reaches. Each message is an octet
 //! of kind, two octets of length, and the payload: a Talker Advertise as
@@ -50,6 +56,7 @@ mod kind {
     pub const COPIES: u8 = 13;
     pub const MODE: u8 = 14;
     pub const ESCALATION: u8 = 15;
+    pub const LEAVING: u8 = 16;
 }
 
 /// The version this module speaks: 1 since each end says hello and the
@@ -76,6 +83,14 @@ pub mod feature {
     /// port's Mode and each stream's Copies; the program follows them.
     /// Where either end lacks it, Unavailable stops them in AVB Lite.
     pub const AVB_LITE: u32 = 1 << 2;
+    /// Said by both ends: the participant says Leaving as it stops, and
+    /// while the port runs AVB sends no Leave for the program's talkers
+    /// and listeners, nor for anything else of the port's they need, such
+    /// as its SR class domains; the program runs its own participant at
+    /// once and declares them, before the bridge's next LeaveAll lets
+    /// them go. A program running its own participant as one starts stops
+    /// it with no Leave sent, then declares through the one it shares.
+    pub const HANDOFF: u32 = 1 << 3;
 }
 
 /// The state octet of a listener that left.
@@ -157,6 +172,12 @@ pub enum Notice {
     /// and listens again.
     Unavailable,
     Available,
+    /// The participant stops, on purpose, and closes the connection after.
+    /// Where both ends say HANDOFF and the port runs AVB, it leaves the
+    /// program's declarations registered, for the program to declare them
+    /// with its own participant at once; in AVB Lite it withdraws them, as
+    /// no bridge would.
+    Leaving,
     /// It declared the stream with this ID, as asked.
     Declared(u64),
     /// It did not declare the stream with this ID, zero where the Declare
@@ -362,6 +383,7 @@ pub fn write_notice(out: &mut impl Write, notice: &Notice) -> io::Result<()> {
         }
         Notice::Unavailable => write_message(out, kind::UNAVAILABLE, &[]),
         Notice::Available => write_message(out, kind::AVAILABLE, &[]),
+        Notice::Leaving => write_message(out, kind::LEAVING, &[]),
         Notice::Declared(stream_id) => write_message(out, kind::DECLARED, &stream_id.to_be_bytes()),
         Notice::Refused { stream_id, refusal } => {
             let mut payload = stream_id.to_be_bytes().to_vec();
@@ -469,6 +491,7 @@ pub fn read_notice(input: &mut impl Read) -> io::Result<Notice> {
             }),
             kind::UNAVAILABLE => Some(Notice::Unavailable),
             kind::AVAILABLE => Some(Notice::Available),
+            kind::LEAVING => Some(Notice::Leaving),
             kind::DECLARED => stream_id(&payload).map(Notice::Declared),
             kind::REFUSED => stream_id(&payload).and_then(|stream_id| {
                 Some(Notice::Refused {
@@ -562,6 +585,7 @@ mod tests {
             },
             Notice::Unavailable,
             Notice::Available,
+            Notice::Leaving,
             Notice::Declared(7),
             Notice::Refused {
                 stream_id: 7,
@@ -654,6 +678,7 @@ mod tests {
         assert!(HELLO.has(feature::LOCAL_LISTENERS));
         assert!(!HELLO.has(feature::LISTENERS));
         assert!(!HELLO.has(feature::LOCAL_LISTENERS | feature::AVB_LITE));
+        assert!(!HELLO.has(feature::HANDOFF));
         assert!(
             !Hello {
                 features: 0,
