@@ -12,7 +12,9 @@ use std::io;
 use std::time::Duration;
 
 /// The ethertypes of a VLAN tag: 802.1Q's, and 802.1ad's service tag.
+#[cfg(any(target_os = "linux", test))]
 const ETHERTYPE_VLAN: u16 = 0x8100;
+#[cfg(any(target_os = "linux", test))]
 const ETHERTYPE_SERVICE_VLAN: u16 = 0x88a8;
 
 /// Which way a captured frame crossed the interface.
@@ -121,12 +123,14 @@ impl Capture {
 const MOST_ETHERTYPES: usize = 100;
 
 /// A classic BPF instruction: code, jump if true, jump if false, constant.
+#[cfg(any(target_os = "linux", test))]
 type Step = (u16, u8, u8, u32);
 
 /// The filter keeping frames of any of `ethertypes`, after a VLAN tag or
 /// not, cut to `snap` octets; every frame when there are none. A packet
 /// socket's program sees a received frame with its tag already taken off,
 /// a sent one with the tag still in it.
+#[cfg(any(target_os = "linux", test))]
 fn program(ethertypes: &[u16], snap: u32) -> Vec<Step> {
     const LOAD_HALF: u16 = 0x28; // ldh [k]
     const JUMP_EQUAL: u16 = 0x15; // jeq #k
@@ -167,6 +171,7 @@ fn program(ethertypes: &[u16], snap: u32) -> Vec<Step> {
 /// Puts a VLAN tag of `tpid` and `tci` back after the source address of
 /// the `length` octets of frame in `buffer`, as it crossed the wire,
 /// cutting the end where the buffer has no room. The frame's new length.
+#[cfg(any(target_os = "linux", test))]
 fn put_back_tag(buffer: &mut [u8], length: usize, tpid: u16, tci: u16) -> usize {
     if length < 12 || buffer.len() < 16 {
         return length;
@@ -184,6 +189,7 @@ fn put_back_tag(buffer: &mut [u8], length: usize, tpid: u16, tci: u16) -> usize 
 /// starts with its status, its count of frames and where the first is;
 /// each frame with a header saying where the next is, then the link-layer
 /// address it came from or went to, then the frame.
+#[cfg(any(target_os = "linux", test))]
 mod ring {
     pub const BLOCK_STATUS: usize = 8;
     pub const BLOCK_FRAMES: usize = 12;
@@ -212,15 +218,18 @@ mod ring {
     pub const OUTGOING: u8 = 4;
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn word(block: &[u8], at: usize) -> Option<u32> {
     Some(u32::from_ne_bytes(block.get(at..at + 4)?.try_into().ok()?))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn half(block: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_ne_bytes(block.get(at..at + 2)?.try_into().ok()?))
 }
 
 /// How many frames a ring `block` holds and where the first starts.
+#[cfg(any(target_os = "linux", test))]
 fn block_frames(block: &[u8]) -> Option<(u32, usize)> {
     Some((
         word(block, ring::BLOCK_FRAMES)?,
@@ -232,6 +241,7 @@ fn block_frames(block: &[u8]) -> Option<(u32, usize)> {
 /// octets of it, its VLAN tag put back: the frame as captured, and how
 /// far on the next one starts. `None` when the block is not laid out as
 /// it should be.
+#[cfg(any(target_os = "linux", test))]
 fn read_frame(block: &[u8], at: usize, buffer: &mut [u8], snap: u32) -> Option<(Captured, usize)> {
     let field = |offset: usize| word(block, at + offset);
     let next = field(ring::NEXT)? as usize;
