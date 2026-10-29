@@ -1,7 +1,7 @@
 [package]
 name = "avb-net"
 description = "Raw Ethernet for AVB protocols: MAC addresses, interfaces, and frames with hardware timestamps"
-version = "0.1.0"
+version = "0.1.1"
 categories = ["network-programming", "no-std"]
 keywords = ["avb", "tsn", "ethernet", "raw-socket"]
 edition.workspace = true

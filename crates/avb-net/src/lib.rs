@@ -28,6 +28,9 @@ pub mod clock;
 pub mod stream;
 
 #[cfg(feature = "std")]
+pub mod capture;
+
+#[cfg(feature = "std")]
 pub use interfaces::{Interface, LinkPower, interfaces};
 #[cfg(feature = "std")]
 pub use socket::{Blocked, Received, Socket, check_access};

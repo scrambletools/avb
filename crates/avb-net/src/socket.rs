@@ -62,6 +62,14 @@ impl Socket {
         self.inner.send(destination, payload)
     }
 
+    /// Leaves out every frame this computer sends, other programs' and
+    /// what a bridge forwards out of the interface too, which would
+    /// otherwise come as if received on it: as a bridge port's own
+    /// protocols want. Linux only; elsewhere an `Unsupported` error.
+    pub fn ignore_outgoing(&self) -> io::Result<()> {
+        self.inner.ignore_outgoing()
+    }
+
     /// Keeps only frames whose payload starts with an octet in `first`,
     /// such as the AVTP subtypes of ATDECC, dropped before they reach the
     /// program.
@@ -353,6 +361,25 @@ mod platform {
 
         pub fn keep_payloads_starting(&self, first: u8, last: u8) -> io::Result<()> {
             self.attach(&self.program(Some((first, last))))
+        }
+
+        pub fn ignore_outgoing(&self) -> io::Result<()> {
+            let on: libc::c_int = 1;
+            // SAFETY: `on` is a valid c_int that lives through the call,
+            // and the length passed is its size.
+            let set = unsafe {
+                libc::setsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SOL_PACKET,
+                    libc::PACKET_IGNORE_OUTGOING,
+                    (&raw const on).cast(),
+                    size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if set < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
         }
 
         pub fn send(&self, destination: MacAddress, payload: &[u8]) -> io::Result<()> {
@@ -785,6 +812,13 @@ mod platform {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
+        }
+
+        pub fn ignore_outgoing(&self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "leaving out outgoing frames is for Linux",
+            ))
         }
 
         pub fn keep_payloads_starting(&self, first: u8, last: u8) -> io::Result<()> {
@@ -1235,6 +1269,13 @@ mod platform {
             Ok(())
         }
 
+        pub fn ignore_outgoing(&self) -> io::Result<()> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "leaving out outgoing frames is for Linux",
+            ))
+        }
+
         pub fn keep_payloads_starting(&self, first: u8, last: u8) -> io::Result<()> {
             let npcap = npcap()?;
             let receiver = self.receiver.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1364,6 +1405,10 @@ mod platform {
         }
 
         pub fn keep_payloads_starting(&self, _first: u8, _last: u8) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub fn ignore_outgoing(&self) -> io::Result<()> {
             Err(unsupported())
         }
 

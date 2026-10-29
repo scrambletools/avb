@@ -14,7 +14,7 @@ daemon, a GUI, or firmware on a microcontroller.
 | `atdecc` | IEEE 1722.1-2021 with Milan 1.3, MAAP and AVB Lite's vendor unique messages: frame codecs, controller state machines (discovery, AECP commands, enumeration, ACMP, unsolicited notifications), entity state machines (AEM responder, Milan listener binding, ACMP talker) and the entity model as data |
 | `avb-lite` | The AVB Lite profile: falling back from AVB where no bridge reserves streams, and CVU SRP's declarations, admission and escalation |
 | `avb-mrp` | IEEE 802.1Q MRP (applicant, registrar, LeaveAll, periodic timers), MSRP and MVRP, and a port's participant shared between programs on one computer |
-| `avb-net` | Raw Ethernet per operating system: interfaces, frames, multicast membership, the PTP hardware clock, link settings |
+| `avb-net` | Raw Ethernet per operating system: interfaces, frames, multicast membership, the PTP hardware clock, link settings, and capturing frames both ways (Linux) |
 | `avb-stream` | AVTP audio: AAF and AM824 talkers and listeners paced on gPTP time, CRF media clock streams, and audio to and from the computer's devices through cpal |
 
 ## Rules for the protocol crates
