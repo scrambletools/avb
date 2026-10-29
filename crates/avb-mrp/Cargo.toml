@@ -1,7 +1,7 @@
 [package]
 name = "avb-mrp"
 description = "IEEE 802.1Q MRP, MSRP and MVRP: attribute declaration and stream reservation state machines, without I/O"
-version = "0.1.2"
+version = "0.1.3"
 categories = ["network-programming", "no-std"]
 keywords = ["avb", "tsn", "msrp", "mvrp", "srp"]
 edition.workspace = true
@@ -18,6 +18,10 @@ default = ["std"]
 # Raw Ethernet on Linux, macOS and Windows through avb-net, and a blocking
 # driver for apps that do not bring their own loop.
 std = ["avb-net/std"]
+# A bridge's MSRP and MVRP: attribute propagation between ports, stream
+# admission and the forwarding and queue changes that follow. Endpoints
+# need none of it; it builds alongside them, for a device that is both.
+bridge = []
 
 [dependencies]
 avb-net.workspace = true

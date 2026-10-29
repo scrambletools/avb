@@ -31,9 +31,13 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: |
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy -p avb-mrp --features bridge --all-targets --locked -- -D warnings
       - name: Test
-        run: cargo test --workspace --locked
+        run: |
+          cargo test --workspace --locked
+          cargo test -p avb-mrp --features bridge --locked
 
   # The protocol crates must build without std, for apps with other
   # constraints, down to microcontrollers such as the ESP32-C6
@@ -50,11 +54,13 @@ jobs:
         run: |
           cargo build -p avb-net -p atdecc -p avb-mrp --no-default-features --target riscv32imac-unknown-none-elf
           cargo build -p atdecc --no-default-features --features alloc --target riscv32imac-unknown-none-elf
+          cargo build -p avb-mrp --no-default-features --features bridge --target riscv32imac-unknown-none-elf
       - name: Test each on its own
         run: |
           for crate in avb-net atdecc avb-mrp; do
             cargo test -p "$crate"
           done
+          cargo test -p avb-mrp --features bridge
 
   deny:
     runs-on: ubuntu-latest

@@ -11,6 +11,9 @@
 //! Features:
 //! - `std` (default): raw Ethernet on Linux, macOS and Windows through
 //!   `avb-net`, and a blocking driver. Without it the crate is `no_std`.
+//! - `bridge`: a bridge's MSRP and MVRP, propagating attributes between
+//!   its ports and admitting streams on each. It needs no `std`, and an
+//!   endpoint's participant can run beside it on the same device.
 
 #![cfg_attr(not(any(feature = "std", test)), no_std)]
 
@@ -30,6 +33,8 @@ pub const MSRP_DESTINATION: MacAddress = MacAddress([0x01, 0x80, 0xc2, 0x00, 0x0
 /// Destination of MVRP: the customer bridge MVRP address.
 pub const MVRP_DESTINATION: MacAddress = MacAddress([0x01, 0x80, 0xc2, 0x00, 0x00, 0x21]);
 
+#[cfg(feature = "bridge")]
+pub mod bridge;
 pub mod mrpdu;
 pub mod msrp;
 pub mod mvrp;
