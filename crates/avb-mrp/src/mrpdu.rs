@@ -324,6 +324,23 @@ mod tests {
         assert_eq!(encode(&[message], &msrp::FORMAT), pdu);
     }
 
+    /// Classes B and A in one vector, as 802.1Q 35.2.2.9's example and
+    /// bridges send them: the VLAN stays, class and priority count on.
+    #[test]
+    fn a_domain_vector_keeps_its_vlan() {
+        let pdu = [0, 4, 4, 0, 9, 0x00, 0x02, 5, 2, 0, 2, 36 + 6, 0, 0];
+        let decoded = decode(&pdu, &msrp::FORMAT);
+        let domains: Vec<Option<msrp::Domain>> = decoded
+            .values
+            .iter()
+            .map(|value| msrp::Domain::decode(&value.value))
+            .collect();
+        assert_eq!(
+            domains,
+            [Some(msrp::Domain::CLASS_B), Some(msrp::Domain::CLASS_A)]
+        );
+    }
+
     #[test]
     fn vectors_count_values_on_from_the_first() {
         // Two listeners in one vector: Ready, then AskingFailed.

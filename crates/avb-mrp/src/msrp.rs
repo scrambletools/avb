@@ -47,14 +47,14 @@ fn key_length(attribute_type: u8) -> usize {
 }
 
 /// Values after the first count on its stream ID, and a talker's
-/// destination too (35.2.2.8.x); a domain's class, priority and VLAN.
+/// destination too (35.2.2.8.x); a domain's class and priority, its VLAN
+/// staying the same (35.2.2.9).
 fn nth_value(attribute_type: u8, first: &[u8], index: u16) -> Vec<u8> {
     let mut value = Vec::from(first);
     match attribute_type {
         attribute::DOMAIN if value.len() >= 4 => {
             value[0] = value[0].wrapping_add(index as u8);
             value[1] = value[1].wrapping_add(index as u8);
-            add(&mut value[2..4], index);
         }
         attribute::TALKER_ADVERTISE | attribute::TALKER_FAILED if value.len() >= 14 => {
             add(&mut value[..8], index);
@@ -157,6 +157,17 @@ pub fn talker_value(declaration: &TalkerDeclaration) -> Vec<u8> {
         value.push(failure.code);
     }
     value
+}
+
+/// The other talker attribute type: a stream's Talker Advertise and
+/// Talker Failed displace each other at a port (802.1Q-2022 35.2.6), for
+/// [`crate::Participant::with_twins`].
+pub fn twin(attribute_type: u8) -> Option<u8> {
+    match attribute_type {
+        attribute::TALKER_ADVERTISE => Some(attribute::TALKER_FAILED),
+        attribute::TALKER_FAILED => Some(attribute::TALKER_ADVERTISE),
+        _ => None,
+    }
 }
 
 /// The talker declaration a Talker Advertise or Talker Failed value

@@ -71,12 +71,16 @@ enum Step {
 }
 
 impl Applicant {
-    /// Table 10-3, sending only from the states that must on shared media.
-    fn step(self, step: Step) -> (Applicant, Option<Send>) {
+    /// Table 10-3 for a full participant, on a point-to-point link
+    /// (operPointToPointMAC TRUE, as full-duplex Ethernet is) or on
+    /// shared media. The In and Mt messages its `s` sends are left out:
+    /// they only tell what this participant registers.
+    fn step(self, step: Step, point_to_point: bool) -> (Applicant, Option<Send>) {
         use Applicant::*;
         let next = match (step, self) {
             (Step::New, _) => Vn,
-            (Step::Join, Vo | La | Lo) => Vp,
+            (Step::Join, Vo | Lo) => Vp,
+            (Step::Join, La) => Aa,
             (Step::Join, Ao) => Ap,
             (Step::Join, Qo) => Qp,
             (Step::Leave, Vp) => Vo,
@@ -84,44 +88,65 @@ impl Applicant {
             (Step::Leave, Vn | An | Aa | Qa) => La,
             (Step::Leave, Ap) => Ao,
             (Step::Leave, Qp) => Qo,
-            (Step::Received(Event::JoinIn), Vo) => Ao,
-            (Step::Received(Event::JoinIn), Vp) => Ap,
-            (Step::Received(Event::JoinIn | Event::In), Aa) => Qa,
+            // Note 4: on a point-to-point link another's Join cannot stand
+            // for this participant's, as only it reaches the peer.
+            (Step::Received(Event::JoinIn), Vo) if !point_to_point => Ao,
+            (Step::Received(Event::JoinIn), Vp) if !point_to_point => Ap,
+            (Step::Received(Event::JoinIn), Aa) => Qa,
+            // Note 5: In confirms the peer registers it only there too.
+            (Step::Received(Event::In), Aa) if point_to_point => Qa,
             (Step::Received(Event::JoinIn), Ao) => Qo,
             (Step::Received(Event::JoinIn), Ap) => Qp,
             (Step::Received(Event::JoinMt | Event::Mt), Qa) => Aa,
+            (Step::Received(Event::JoinMt | Event::Mt), Qo) => Ao,
+            (Step::Received(Event::JoinMt | Event::Mt), Qp) => Ap,
+            (Step::Received(Event::JoinMt | Event::Mt), Lo) => Vo,
             (Step::Received(Event::Lv) | Step::ReceivedLeaveAll, state) => match state {
                 Vo | Ao | Qo => Lo,
                 An => Vn,
                 Aa | Qa | Ap | Qp => Vp,
-                Lo => Vo,
                 other => other,
             },
-            (Step::Transmit | Step::TransmitLeaveAll, state) => {
+            (Step::Transmit, state) => {
                 return match state {
                     Vp => (Aa, Some(Send::Join)),
                     Vn => (An, Some(Send::New)),
                     An => (Qa, Some(Send::New)),
-                    Aa => (Qa, Some(Send::Join)),
+                    Aa | Ap => (Qa, Some(Send::Join)),
                     La => (Vo, Some(Send::Leave)),
                     Lo => (Vo, None),
-                    Qa if step == Step::TransmitLeaveAll => (Aa, Some(Send::Join)),
                     other => (other, None),
                 };
             }
+            // With LeaveAll, what is declared goes out again with it, and
+            // what was leaving needs no Leave of its own.
+            (Step::TransmitLeaveAll, state) => {
+                return match state {
+                    Vp => (Aa, Some(Send::Join)),
+                    Vn => (An, Some(Send::New)),
+                    An => (Qa, Some(Send::New)),
+                    Aa | Qa | Ap | Qp => (Qa, Some(Send::Join)),
+                    Vo | La | Ao | Qo => (Lo, None),
+                    Lo => (Lo, None),
+                };
+            }
             (Step::Periodic, Qa) => Aa,
-            (Step::Periodic, Qo) => Ao,
             (Step::Periodic, Qp) => Ap,
             (_, state) => state,
         };
         (next, None)
     }
 
-    /// Whether it waits to send at the next transmit opportunity.
+    /// Whether it waits to send at the next transmit opportunity (note 6).
     fn anxious(self) -> bool {
         matches!(
             self,
-            Applicant::Vp | Applicant::Vn | Applicant::An | Applicant::Aa | Applicant::La
+            Applicant::Vp
+                | Applicant::Vn
+                | Applicant::An
+                | Applicant::Aa
+                | Applicant::La
+                | Applicant::Ap
         )
     }
 
@@ -188,6 +213,12 @@ pub struct Participant {
     random: u64,
     outgoing: VecDeque<Vec<u8>>,
     events: VecDeque<Registration>,
+    /// The attribute type whose registration under the same key a
+    /// declaration of a type displaces, if any.
+    twin: fn(u8) -> Option<u8>,
+    /// Whether the port's link joins it to one peer only
+    /// (operPointToPointMAC), as full-duplex Ethernet does.
+    point_to_point: bool,
 }
 
 impl Participant {
@@ -204,9 +235,37 @@ impl Participant {
             random: seed | 1,
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
+            twin: |_| None,
+            point_to_point: true,
         };
         participant.leave_all_at = now + participant.leave_all_period();
         participant
+    }
+
+    /// Has the participant work on shared media, where several peers hear
+    /// each other, rather than on a point-to-point link, as AVB's
+    /// full-duplex Ethernet always is: a peer's JoinIn of an attribute then
+    /// stands for this participant's own until a LeaveAll (Table 10-3).
+    pub fn on_shared_media(mut self) -> Self {
+        self.point_to_point = false;
+        self
+    }
+
+    /// Has a peer's declaration of one attribute type take its
+    /// registration of the type `twin` names, under the same key, off at
+    /// once: MSRP's Talker Advertise and Talker Failed of one stream, with
+    /// [`crate::msrp::twin`]. A port registers at most one of the two for
+    /// a stream (802.1Q-2022 35.2.6), so a talker changing between them
+    /// with a Join of the new type alone leaves no stale registration of
+    /// the old one, which would hide the old type's next Join.
+    ///
+    /// The displaced type's [`Registration::Left`] comes after the new
+    /// type's [`Registration::Joined`]: keep talkers by type and stream,
+    /// or have a Left take off only a talker of its own type, not every
+    /// talker of the stream.
+    pub fn with_twins(mut self, twin: fn(u8) -> Option<u8>) -> Self {
+        self.twin = twin;
+        self
     }
 
     fn next_random(&mut self) -> u64 {
@@ -272,7 +331,7 @@ impl Participant {
         } else {
             Step::Join
         };
-        attribute.applicant = attribute.applicant.step(step).0;
+        attribute.applicant = attribute.applicant.step(step, self.point_to_point).0;
         self.arm_join(now);
     }
 
@@ -283,7 +342,7 @@ impl Participant {
         if let Some(attribute) = self.attributes.get_mut(&key)
             && attribute.declared.is_some()
         {
-            attribute.applicant = attribute.applicant.step(Step::Leave).0;
+            attribute.applicant = attribute.applicant.step(Step::Leave, self.point_to_point).0;
             self.arm_join(now);
         }
     }
@@ -312,8 +371,17 @@ impl Participant {
         }
         for received in decoded.values {
             let key = self.key(received.attribute_type, &received.value);
+            let twin = received
+                .event
+                .declares()
+                .then(|| (self.twin)(received.attribute_type))
+                .flatten()
+                .map(|twin| self.key(twin, &received.value));
             let attribute = self.attributes.entry(key).or_insert_with(Attribute::new);
-            attribute.applicant = attribute.applicant.step(Step::Received(received.event)).0;
+            attribute.applicant = attribute
+                .applicant
+                .step(Step::Received(received.event), self.point_to_point)
+                .0;
             let before = attribute.registrar;
             match received.event {
                 Event::New | Event::JoinIn | Event::JoinMt => {
@@ -343,6 +411,26 @@ impl Participant {
             if attribute.applicant.anxious() {
                 self.arm_join(now);
             }
+            if let Some(twin) = twin {
+                self.displace(&twin);
+            }
+        }
+    }
+
+    /// Takes a peer's registration of `key` off at once, as an rLv! whose
+    /// leave timer runs out at once (802.1Q-2022 35.2.6).
+    fn displace(&mut self, key: &(u8, Vec<u8>)) {
+        if let Some(attribute) = self.attributes.get_mut(key)
+            && attribute.registrar != Registrar::Mt
+        {
+            attribute.registrar = Registrar::Mt;
+            attribute.leave_at = None;
+            if let Some((value, _)) = attribute.registered.take() {
+                self.events.push_back(Registration::Left {
+                    attribute_type: key.0,
+                    value,
+                });
+            }
         }
     }
 
@@ -354,7 +442,10 @@ impl Participant {
             if attribute_type.is_some_and(|wanted| wanted != *kind) {
                 continue;
             }
-            attribute.applicant = attribute.applicant.step(Step::ReceivedLeaveAll).0;
+            attribute.applicant = attribute
+                .applicant
+                .step(Step::ReceivedLeaveAll, self.point_to_point)
+                .0;
             if attribute.registrar == Registrar::In {
                 attribute.registrar = Registrar::Lv;
                 attribute.leave_at = Some(now + LEAVE_TIME);
@@ -393,7 +484,10 @@ impl Participant {
             self.periodic_at = now + PERIODIC_TIME;
             let mut anxious = false;
             for attribute in self.attributes.values_mut() {
-                attribute.applicant = attribute.applicant.step(Step::Periodic).0;
+                attribute.applicant = attribute
+                    .applicant
+                    .step(Step::Periodic, self.point_to_point)
+                    .0;
                 anxious |= attribute.applicant.anxious();
             }
             if anxious {
@@ -422,9 +516,14 @@ impl Participant {
         };
         let mut messages: Vec<Message> = Vec::new();
         for ((kind, _), attribute) in self.attributes.iter_mut() {
-            let (next, send) = attribute.applicant.step(step);
+            let leaving = attribute.applicant == Applicant::La;
+            let (next, send) = attribute.applicant.step(step, self.point_to_point);
             attribute.applicant = next;
             attribute.send = send;
+            // A withdrawal the LeaveAll completes, with no Leave of its own.
+            if leaving && next != Applicant::La && send.is_none() {
+                attribute.declared = None;
+            }
             let Some(send) = send else {
                 continue;
             };
@@ -659,8 +758,53 @@ mod tests {
             (Qp, Qo),
             (Lo, Lo),
         ] {
-            assert_eq!(from.step(Step::Leave), (to, None), "{from:?}");
+            assert_eq!(from.step(Step::Leave, true), (to, None), "{from:?}");
         }
+    }
+
+    /// Table 10-3's tx! and txLA! columns. With LeaveAll, VP sends its Join
+    /// rather than the table's In or Mt, as all that is declared goes out
+    /// with a LeaveAll.
+    #[test]
+    fn transmitting_moves_each_state_as_the_table_says() {
+        use Applicant::*;
+        let join = Some(Send::Join);
+        let new = Some(Send::New);
+        for (from, transmit, with_leave_all) in [
+            (Vo, (Vo, None), (Lo, None)),
+            (Vp, (Aa, join), (Aa, join)),
+            (Vn, (An, new), (An, new)),
+            (An, (Qa, new), (Qa, new)),
+            (Aa, (Qa, join), (Qa, join)),
+            (Qa, (Qa, None), (Qa, join)),
+            (La, (Vo, Some(Send::Leave)), (Lo, None)),
+            (Ao, (Ao, None), (Lo, None)),
+            (Qo, (Qo, None), (Lo, None)),
+            (Ap, (Qa, join), (Qa, join)),
+            (Qp, (Qp, None), (Qa, join)),
+            (Lo, (Vo, None), (Lo, None)),
+        ] {
+            assert_eq!(from.step(Step::Transmit, true), transmit, "{from:?}");
+            assert_eq!(
+                from.step(Step::TransmitLeaveAll, true),
+                with_leave_all,
+                "{from:?}"
+            );
+        }
+    }
+
+    /// Note 4: a peer's JoinIn stands for this participant's own Join, and
+    /// quiets it, only on shared media.
+    #[test]
+    fn a_peers_join_in_stands_for_ours_only_on_shared_media() {
+        use Applicant::*;
+        let join_in = Step::Received(Event::JoinIn);
+        assert_eq!(Vp.step(join_in, true).0, Vp);
+        assert_eq!(Vo.step(join_in, true).0, Vo);
+        assert_eq!(Vp.step(join_in, false).0, Ap);
+        assert_eq!(Vo.step(join_in, false).0, Ao);
+        // Passive, it still sends its Join when it next may.
+        assert_eq!(Ap.step(Step::Transmit, false), (Qa, Some(Send::Join)));
     }
 
     #[test]
@@ -729,6 +873,138 @@ mod tests {
         assert_eq!(decoded.leave_all, [1, 2, 3, 4]);
         assert_eq!(decoded.values.len(), 1);
         assert_eq!(decoded.values[0].value, stream);
+    }
+
+    /// A peer's Talker Failed takes its Talker Advertise of the same
+    /// stream off at once and the other way round, so only one is ever
+    /// registered, and a talker changing back with a Join alone, its
+    /// Advertise never withdrawn, registers again.
+    #[test]
+    fn a_talker_turning_failed_and_back_displaces_its_twin() {
+        let mut talker = Participant::new(msrp::FORMAT, ms(0), 13);
+        let mut bridge = Participant::new(msrp::FORMAT, ms(0), 14).with_twins(msrp::twin);
+        let failed = {
+            let mut declaration = msrp::decode_talker(
+                msrp::attribute::TALKER_ADVERTISE,
+                &advertise(),
+                Event::JoinIn,
+            )
+            .unwrap();
+            declaration.failure = Some(msrp::TalkerFailure {
+                bridge_id: 0x8000_000a_92ff_fe02,
+                code: 8,
+            });
+            msrp::talker_value(&declaration)
+        };
+        let types = |participant: &Participant| -> Vec<u8> {
+            participant.registered().map(|(kind, _, _)| kind).collect()
+        };
+        talker.declare(ms(0), msrp::attribute::TALKER_ADVERTISE, advertise(), None);
+        run(&mut talker, &mut bridge, 0, 500);
+        // Failed declared over the Advertise, which is not withdrawn.
+        talker.declare(
+            ms(500),
+            msrp::attribute::TALKER_FAILED,
+            failed.clone(),
+            None,
+        );
+        let (_, heard) = run(&mut talker, &mut bridge, 500, 1000);
+        assert_eq!(
+            heard,
+            [
+                Registration::Joined {
+                    attribute_type: msrp::attribute::TALKER_FAILED,
+                    value: failed.clone(),
+                    four_packed: None,
+                },
+                Registration::Left {
+                    attribute_type: msrp::attribute::TALKER_ADVERTISE,
+                    value: advertise(),
+                },
+            ]
+        );
+        assert_eq!(types(&bridge), [msrp::attribute::TALKER_FAILED]);
+        // Failed withdrawn: the Advertise, still declared, comes back.
+        talker.withdraw(ms(1000), msrp::attribute::TALKER_FAILED, &advertise()[..8]);
+        let (_, heard) = run(&mut talker, &mut bridge, 1000, 3000);
+        assert!(
+            heard.contains(&Registration::Joined {
+                attribute_type: msrp::attribute::TALKER_ADVERTISE,
+                value: advertise(),
+                four_packed: None,
+            }),
+            "{heard:?}"
+        );
+        assert_eq!(types(&bridge), [msrp::attribute::TALKER_ADVERTISE]);
+    }
+
+    /// Both ends of a link declaring the same attribute, as a bridge and
+    /// its neighbor both declare VLAN 2 or an SR class domain, each answer
+    /// the other's LeaveAll with their own Join within a JoinTime: another's
+    /// JoinIn cannot stand for theirs on a point-to-point link (Table 10-3
+    /// note 4), so neither's registration of the other ever lapses.
+    #[test]
+    fn peers_declaring_the_same_attribute_keep_registering_each_other() {
+        let mut one = Participant::new(crate::mvrp::FORMAT, ms(0), 15);
+        let mut other = Participant::new(crate::mvrp::FORMAT, ms(0), 16);
+        for participant in [&mut one, &mut other] {
+            participant.declare(ms(0), crate::mvrp::VID, crate::mvrp::value(2), None);
+        }
+        let (heard_by_one, heard_by_other) = run(&mut one, &mut other, 0, 120_000);
+        for heard in [heard_by_one, heard_by_other] {
+            assert!(
+                !heard
+                    .iter()
+                    .any(|change| matches!(change, Registration::Left { .. })),
+                "{heard:?}"
+            );
+        }
+        assert_eq!(one.registered().count(), 1);
+        assert_eq!(other.registered().count(), 1);
+    }
+
+    /// A peer whose LeaveAll carries its own declaration as JoinIn, as
+    /// macOS's and the ESP boards' do, gets this participant's Join of the
+    /// same attribute back within a JoinTime, and again after every
+    /// LeaveAll, rather than a silence that lets the peer's registration
+    /// of it lapse.
+    #[test]
+    fn a_leave_all_carrying_the_peers_join_in_is_answered() {
+        let vlan = crate::mvrp::value(2);
+        let mut bridge = Participant::new(crate::mvrp::FORMAT, ms(0), 17);
+        bridge.declare(ms(0), crate::mvrp::VID, vlan.clone(), None);
+        let leave_all = mrpdu::encode(
+            &[Message {
+                attribute_type: crate::mvrp::VID,
+                leave_all: true,
+                values: Vec::from([(vlan.clone(), Event::JoinIn, None)]),
+            }],
+            &crate::mvrp::FORMAT,
+        );
+        let mut now = 0;
+        for round in 0..3 {
+            // Between the peer's LeaveAlls, which come before this
+            // participant's own LeaveAll timer runs out.
+            let peer_leave_all = now + 2000;
+            while now < peer_leave_all {
+                now += 10;
+                bridge.handle_timeout(ms(now));
+                while bridge.poll_transmit().is_some() {}
+            }
+            bridge.handle_pdu(ms(now), &leave_all);
+            let mut answered = false;
+            for _ in 0..30 {
+                now += 10;
+                bridge.handle_timeout(ms(now));
+                while let Some(pdu) = bridge.poll_transmit() {
+                    answered |= mrpdu::decode(&pdu, &crate::mvrp::FORMAT)
+                        .values
+                        .iter()
+                        .any(|value| value.value == vlan && value.event.declares());
+                }
+            }
+            assert!(answered, "LeaveAll {round} went unanswered");
+        }
     }
 
     #[test]
