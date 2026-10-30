@@ -295,7 +295,8 @@ impl Participant {
 
     /// Declares the attribute `value` names, with `four_packed` for the
     /// types that carry one. Declaring it again with a different value or
-    /// four-packed event withdraws the old one first.
+    /// four-packed event sends the new one as a New, which the peer
+    /// registers in place of the old.
     pub fn declare(
         &mut self,
         now: Duration,
@@ -311,22 +312,10 @@ impl Participant {
         if same && !leaving && !attribute.applicant.observes() {
             return;
         }
-        if !same
-            && let Some((old, old_four)) = attribute.declared.clone()
-            && !attribute.applicant.observes()
-        {
-            // A new value replaces the old: the old leaves at once.
-            let message = Message {
-                attribute_type,
-                leave_all: false,
-                values: Vec::from([(old, Event::Lv, old_four)]),
-            };
-            self.outgoing
-                .push_back(mrpdu::encode(&[message], &self.format));
-            attribute.applicant = Applicant::Vo;
-        }
         attribute.declared = wanted;
-        let step = if attribute.applicant.observes() {
+        // No Leave between the old and the new: the peer would take the
+        // attribute off, a stream with it, until the New came.
+        let step = if !same || attribute.applicant.observes() {
             Step::New
         } else {
             Step::Join
@@ -819,12 +808,51 @@ mod tests {
         listener.declare(ms(500), msrp::attribute::LISTENER, stream.clone(), ready);
         let (heard, _) = run(&mut talker, &mut listener, 500, 1000);
         assert_eq!(
-            heard.last(),
-            Some(&Registration::Joined {
+            heard,
+            [Registration::Joined {
                 attribute_type: msrp::attribute::LISTENER,
                 value: stream,
                 four_packed: ready,
-            })
+            }]
+        );
+    }
+
+    /// A talker's new accumulated latency reaches the listener in place
+    /// of the old, without a Leave that would stop the stream.
+    #[test]
+    fn a_new_value_replaces_the_old_without_a_leave() {
+        let mut talker = Participant::new(msrp::FORMAT, ms(0), 5);
+        let mut listener = Participant::new(msrp::FORMAT, ms(0), 6);
+        talker.declare(ms(0), msrp::attribute::TALKER_ADVERTISE, advertise(), None);
+        run(&mut talker, &mut listener, 0, 500);
+        let mut later = advertise();
+        let last = later.len() - 1;
+        later[last] ^= 0x01;
+        talker.declare(
+            ms(500),
+            msrp::attribute::TALKER_ADVERTISE,
+            later.clone(),
+            None,
+        );
+        let mut sent = Vec::new();
+        for now in (500..=1000).step_by(10).map(ms) {
+            talker.handle_timeout(now);
+            while let Some(pdu) = talker.poll_transmit() {
+                sent.extend(mrpdu::decode(&pdu, &msrp::FORMAT).values);
+                listener.handle_pdu(now, &pdu);
+            }
+        }
+        assert!(
+            sent.iter().all(|value| value.event != Event::Lv),
+            "{sent:?}"
+        );
+        assert_eq!(
+            core::iter::from_fn(|| listener.poll_event()).collect::<Vec<_>>(),
+            [Registration::Joined {
+                attribute_type: msrp::attribute::TALKER_ADVERTISE,
+                value: later,
+                four_packed: None,
+            }]
         );
     }
 
