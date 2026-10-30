@@ -24,6 +24,14 @@ impl HardwareClock {
         self.inner.now()
     }
 
+    /// How far this clock is ahead of `other`, in nanoseconds: each read
+    /// by its driver between two readings of the system clock, the
+    /// tightest of several pairs kept, so the system clock drops out.
+    /// Linux only; elsewhere unsupported.
+    pub fn offset_from(&self, other: &HardwareClock) -> io::Result<i128> {
+        Ok(self.inner.offset_from_system()? - other.inner.offset_from_system()?)
+    }
+
     /// How far the clock is ahead of this computer's monotonic clock, in
     /// nanoseconds, read between two readings of the monotonic clock: of
     /// a few tries, the closest-read of those near their median, as a
@@ -68,6 +76,7 @@ pub fn precise_sleeps() {
 #[allow(unsafe_code)]
 mod platform {
     use std::io;
+    use std::mem::size_of;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::time::Duration;
 
@@ -107,6 +116,62 @@ mod platform {
         pub fn now(&self) -> io::Result<Duration> {
             read(self.id)
         }
+
+        /// The clock less the system clock, in nanoseconds, from its
+        /// driver's tightest of several readings between two of the system
+        /// clock (PTP_SYS_OFFSET_EXTENDED).
+        pub fn offset_from_system(&self) -> io::Result<i128> {
+            /// struct ptp_clock_time, from linux/ptp_clock.h.
+            #[repr(C)]
+            #[derive(Clone, Copy, Default)]
+            struct Time {
+                seconds: i64,
+                nanoseconds: u32,
+                reserved: u32,
+            }
+            /// struct ptp_sys_offset_extended: system, clock and system
+            /// again, for each sample.
+            #[repr(C)]
+            struct Extended {
+                samples: u32,
+                clock: i32,
+                reserved: [u32; 2],
+                times: [[Time; 3]; 25],
+            }
+            /// _IOWR('=', 9, struct ptp_sys_offset_extended).
+            const PTP_SYS_OFFSET_EXTENDED: libc::c_ulong =
+                0xc000_0000 | ((size_of::<Extended>() as libc::c_ulong) << 16) | (0x3d << 8) | 9;
+            let mut request = Extended {
+                samples: 9,
+                clock: libc::CLOCK_REALTIME,
+                reserved: [0; 2],
+                times: [[Time::default(); 3]; 25],
+            };
+            // SAFETY: `request` is the struct the ioctl takes, and lives
+            // through the call.
+            if unsafe {
+                libc::ioctl(
+                    self._fd.as_raw_fd(),
+                    PTP_SYS_OFFSET_EXTENDED as _,
+                    &raw mut request,
+                )
+            } < 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let nanos = |time: Time| {
+                i128::from(time.seconds) * 1_000_000_000 + i128::from(time.nanoseconds)
+            };
+            request.times[..request.samples.min(25) as usize]
+                .iter()
+                .map(|[before, clock, after]| {
+                    let (before, after) = (nanos(*before), nanos(*after));
+                    (after - before, nanos(*clock) - (before + after) / 2)
+                })
+                .min_by_key(|(span, _)| *span)
+                .map(|(_, offset)| offset)
+                .ok_or_else(|| io::Error::other("the clock gave no samples"))
+        }
     }
 
     pub fn monotonic_now() -> Duration {
@@ -139,6 +204,13 @@ mod platform {
 
         pub fn now(&self) -> io::Result<Duration> {
             Ok(Duration::ZERO)
+        }
+
+        pub fn offset_from_system(&self) -> io::Result<i128> {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "hardware clocks are not supported on this system yet",
+            ))
         }
     }
 

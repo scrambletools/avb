@@ -37,6 +37,17 @@ pub enum Addressed {
     Elsewhere,
 }
 
+/// Which clock gave a captured frame its time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Clock {
+    /// The system clock, when the kernel saw the frame.
+    System,
+    /// The interface's PTP hardware clock, when the frame crossed the
+    /// wire: received frames of a capture opened with
+    /// [`Capture::open_stamped`].
+    Hardware,
+}
+
 /// A frame a [`Capture`] took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Captured {
@@ -48,9 +59,9 @@ pub struct Captured {
     pub direction: Direction,
     /// `None` for an outbound frame.
     pub addressed: Option<Addressed>,
-    /// When the kernel saw the frame, since the Unix epoch by the system
-    /// clock.
+    /// When the frame was seen, since the epoch of the clock that saw it.
     pub time: Duration,
+    pub clock: Clock,
 }
 
 /// What a capture took and what its ring had no room for.
@@ -58,7 +69,8 @@ pub struct Captured {
 pub struct Statistics {
     /// Frames that passed the filter, those dropped included.
     pub passed: u64,
-    /// Frames dropped because the ring was full: the program fell behind.
+    /// Frames dropped because the ring, or for a stamped capture the
+    /// socket's queue, was full: the program fell behind.
     pub dropped: u64,
 }
 
@@ -116,6 +128,40 @@ impl Capture {
     /// What the capture took since last asked.
     pub fn statistics(&self) -> io::Result<Statistics> {
         self.inner.statistics()
+    }
+
+    /// Opens `interface` as [`open`](Self::open) does, but timing received
+    /// frames by the interface's PTP hardware clock, as they crossed the
+    /// wire, rather than by when the kernel saw them, which interrupt
+    /// moderation and a busy computer delay. The interface must stamp
+    /// received frames: ptp4l, for one, turns that on, for every frame on
+    /// interfaces that stamp all or none. Frames sent, and any the
+    /// interface did not stamp, keep the system clock's time.
+    ///
+    /// The kernel hands such frames over one at a time rather than in a
+    /// shared ring, as some drivers' time stamps (Intel's igc among them)
+    /// reach the program no other way, so it costs more for a busy
+    /// interface: it suits measuring, not long captures.
+    pub fn open_stamped(
+        interface: &str,
+        ethertypes: &[u16],
+        snap: u32,
+        promiscuous: bool,
+    ) -> io::Result<Self> {
+        if ethertypes.len() > MOST_ETHERTYPES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a capture takes at most {MOST_ETHERTYPES} ethertypes"),
+            ));
+        }
+        Ok(Self {
+            inner: platform::Capture::open_stamped(
+                interface,
+                ethertypes,
+                snap.max(1),
+                promiscuous,
+            )?,
+        })
     }
 }
 
@@ -279,8 +325,54 @@ fn read_frame(block: &[u8], at: usize, buffer: &mut [u8], snap: u32) -> Option<(
         direction,
         addressed,
         time,
+        clock: Clock::System,
     };
     Some((captured, next))
+}
+
+/// A frame `recvmsg` wrote to `buffer`, its first `length` octets: its
+/// VLAN tag, where the kernel had `tag` (TPID and TCI) off, put back; its
+/// whole length `original` where the kernel says; timed by the interface's
+/// hardware clock where it was received and stamped, by `now` otherwise.
+#[cfg(any(target_os = "linux", test))]
+#[allow(clippy::too_many_arguments)]
+fn stamped_frame(
+    buffer: &mut [u8],
+    length: usize,
+    packet_type: u8,
+    original: Option<usize>,
+    tag: Option<(u16, u16)>,
+    hardware: Option<Duration>,
+    now: Duration,
+    snap: u32,
+) -> Captured {
+    let mut length = length.min(buffer.len());
+    let mut original = original.unwrap_or(length);
+    if let Some((tpid, tci)) = tag {
+        length = put_back_tag(buffer, length, tpid, tci);
+        original += 4;
+    }
+    let (direction, addressed) = match packet_type {
+        ring::OUTGOING => (Direction::Outbound, None),
+        ring::HOST => (Direction::Inbound, Some(Addressed::Unicast)),
+        ring::MULTICAST => (Direction::Inbound, Some(Addressed::Multicast)),
+        ring::BROADCAST => (Direction::Inbound, Some(Addressed::Broadcast)),
+        _ => (Direction::Inbound, Some(Addressed::Elsewhere)),
+    };
+    // A forwarded frame going out carries its arrival's stamp, from
+    // another port's clock: not its time here.
+    let (time, clock) = match hardware.filter(|_| direction == Direction::Inbound) {
+        Some(time) => (time, Clock::Hardware),
+        None => (now, Clock::System),
+    };
+    Captured {
+        length: length.min(snap as usize),
+        original,
+        direction,
+        addressed,
+        time,
+        clock,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -293,7 +385,7 @@ mod platform {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    use super::{Captured, Statistics, ring};
+    use super::{Captured, ETHERTYPE_VLAN, Statistics, ring};
 
     /// A ring block's size: room for the largest frame worth keeping.
     const BLOCK: usize = 1 << 16;
@@ -306,6 +398,24 @@ mod platform {
     /// before handing it over: how late a frame may come to the program.
     const HAND_OVER_MS: u32 = 100;
 
+    /// SO_TIMESTAMPING, its control messages SCM_TIMESTAMPING, and
+    /// PACKET_AUXDATA, from Linux's headers, which libc lacks for Linux.
+    const SO_TIMESTAMPING: libc::c_int = 37;
+    const PACKET_AUXDATA: libc::c_int = 8;
+
+    /// struct tpacket_auxdata, from linux/if_packet.h.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct Auxdata {
+        status: u32,
+        length: u32,
+        snap: u32,
+        mac: u16,
+        net: u16,
+        vlan_tci: u16,
+        vlan_tpid: u16,
+    }
+
     pub struct Capture {
         fd: OwnedFd,
         snap: u32,
@@ -317,6 +427,9 @@ mod platform {
         block: Cell<usize>,
         left: Cell<u32>,
         next: Cell<usize>,
+        /// Frames come one at a time, with their hardware time stamps,
+        /// rather than through a ring.
+        stamped: bool,
     }
 
     // SAFETY: the ring is mapped for this capture alone and touched only
@@ -366,21 +479,20 @@ mod platform {
     }
 
     impl Capture {
-        pub fn open(
-            interface: &str,
-            ethertypes: &[u16],
-            snap: u32,
-            promiscuous: bool,
-            room: usize,
-        ) -> io::Result<Self> {
-            let index = crate::interfaces::index_of(interface).ok_or_else(|| {
+        /// The index of the interface named `interface`.
+        fn index(interface: &str) -> io::Result<i32> {
+            crate::interfaces::index_of(interface).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     format!("no interface named {interface}"),
                 )
-            })?;
-            // Opened for no protocol, so nothing arrives before the filter
-            // and the ring are on.
+            })
+        }
+
+        /// A raw socket keeping only frames of `ethertypes`, cut to `snap`.
+        /// Opened for no protocol, so nothing arrives before the filter, and
+        /// the ring, are on.
+        fn filtered(ethertypes: &[u16], snap: u32) -> io::Result<OwnedFd> {
             let fd = crate::broker::open(crate::broker::Kind::Raw)?;
             let program: Vec<libc::sock_filter> = super::program(ethertypes, snap)
                 .into_iter()
@@ -391,6 +503,57 @@ mod platform {
                 filter: program.as_ptr().cast_mut(),
             };
             set_raw(&fd, libc::SOL_SOCKET, libc::SO_ATTACH_FILTER, &filter)?;
+            Ok(fd)
+        }
+
+        pub fn open_stamped(
+            interface: &str,
+            ethertypes: &[u16],
+            snap: u32,
+            promiscuous: bool,
+        ) -> io::Result<Self> {
+            /// A stamped capture's receive buffer, in octets: a quarter
+            /// second of a class A stream.
+            const STAMPED_ROOM: libc::c_int = 4 << 20;
+            let index = Self::index(interface)?;
+            let fd = Self::filtered(ethertypes, snap)?;
+            set(
+                &fd,
+                libc::SOL_SOCKET,
+                SO_TIMESTAMPING,
+                (libc::SOF_TIMESTAMPING_RX_HARDWARE | libc::SOF_TIMESTAMPING_RAW_HARDWARE)
+                    as libc::c_int,
+            )?;
+            // The VLAN tag the kernel took off, to put back.
+            set(&fd, libc::SOL_PACKET, PACKET_AUXDATA, 1)?;
+            // Room for frames to wait while the program is busy: the
+            // kernel's default holds a class A stream for some 30 ms. Past
+            // the system's limit only with CAP_NET_ADMIN.
+            if set(&fd, libc::SOL_SOCKET, libc::SO_RCVBUFFORCE, STAMPED_ROOM).is_err() {
+                set(&fd, libc::SOL_SOCKET, libc::SO_RCVBUF, STAMPED_ROOM)?;
+            }
+            let capture = Self {
+                fd,
+                snap,
+                ring: std::ptr::null_mut(),
+                blocks: 0,
+                block: Cell::new(0),
+                left: Cell::new(0),
+                next: Cell::new(0),
+                stamped: true,
+            };
+            Self::attach(capture, index, promiscuous)
+        }
+
+        pub fn open(
+            interface: &str,
+            ethertypes: &[u16],
+            snap: u32,
+            promiscuous: bool,
+            room: usize,
+        ) -> io::Result<Self> {
+            let index = Self::index(interface)?;
+            let fd = Self::filtered(ethertypes, snap)?;
             set(
                 &fd,
                 libc::SOL_PACKET,
@@ -434,7 +597,14 @@ mod platform {
                 block: Cell::new(0),
                 left: Cell::new(0),
                 next: Cell::new(0),
+                stamped: false,
             };
+            Self::attach(capture, index, promiscuous)
+        }
+
+        /// Binds the capture to the interface with `index`, promiscuous
+        /// if asked.
+        fn attach(capture: Self, index: i32, promiscuous: bool) -> io::Result<Self> {
             // SAFETY: sockaddr_ll is plain data, valid when zeroed.
             let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
             address.sll_family = libc::AF_PACKET as u16;
@@ -494,6 +664,9 @@ mod platform {
 
         /// The next frame waiting, without waiting for one.
         fn take(&self, buffer: &mut [u8]) -> Option<Captured> {
+            if self.stamped {
+                return self.take_stamped(buffer);
+            }
             loop {
                 if self.left.get() == 0 {
                     if self.status().load(Ordering::Acquire) & ring::USER == 0 {
@@ -530,6 +703,87 @@ mod platform {
                     None => self.release(),
                 }
             }
+        }
+
+        /// The next frame waiting with its control messages, without
+        /// waiting for one.
+        fn take_stamped(&self, buffer: &mut [u8]) -> Option<Captured> {
+            // SAFETY: plain data, valid when zeroed.
+            let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
+            let mut control = [0u64; 64];
+            let mut part = libc::iovec {
+                iov_base: buffer.as_mut_ptr().cast(),
+                iov_len: buffer.len(),
+            };
+            // SAFETY: plain data, valid when zeroed.
+            let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
+            message.msg_name = (&raw mut address).cast();
+            message.msg_namelen = size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+            message.msg_iov = &raw mut part;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = size_of_val(&control) as _;
+            // SAFETY: every buffer the message points to lives through the
+            // call, with its length given.
+            let length =
+                unsafe { libc::recvmsg(self.fd.as_raw_fd(), &raw mut message, libc::MSG_DONTWAIT) };
+            if length < 0 {
+                return None;
+            }
+            let mut hardware = None;
+            let mut original = None;
+            let mut tag = None;
+            // SAFETY: the kernel wrote the control messages within
+            // `control`, and msg_controllen says how far; CMSG_FIRSTHDR and
+            // CMSG_NXTHDR stay within it.
+            let mut header = unsafe { libc::CMSG_FIRSTHDR(&raw const message) };
+            while !header.is_null() {
+                // SAFETY: a header the kernel wrote, its data after it.
+                let (level, kind, data) = unsafe {
+                    (
+                        (*header).cmsg_level,
+                        (*header).cmsg_type,
+                        libc::CMSG_DATA(header),
+                    )
+                };
+                if level == libc::SOL_SOCKET && kind == SO_TIMESTAMPING {
+                    // SAFETY: SCM_TIMESTAMPING carries three timespecs, the
+                    // last the raw hardware time.
+                    let stamps: [libc::timespec; 3] =
+                        unsafe { std::ptr::read_unaligned(data.cast()) };
+                    let raw = stamps[2];
+                    if raw.tv_sec > 0 || raw.tv_nsec > 0 {
+                        hardware = Some(Duration::new(raw.tv_sec as u64, raw.tv_nsec as u32));
+                    }
+                } else if level == libc::SOL_PACKET && kind == PACKET_AUXDATA {
+                    // SAFETY: PACKET_AUXDATA carries a tpacket_auxdata.
+                    let aux: Auxdata = unsafe { std::ptr::read_unaligned(data.cast()) };
+                    original = Some(aux.length as usize);
+                    if aux.status & ring::VLAN_VALID != 0 {
+                        let tpid = if aux.status & ring::VLAN_TPID_VALID != 0 {
+                            aux.vlan_tpid
+                        } else {
+                            ETHERTYPE_VLAN
+                        };
+                        tag = Some((tpid, aux.vlan_tci));
+                    }
+                }
+                // SAFETY: as above.
+                header = unsafe { libc::CMSG_NXTHDR(&raw const message, header) };
+            }
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            Some(super::stamped_frame(
+                buffer,
+                length as usize,
+                address.sll_pkttype,
+                original,
+                tag,
+                hardware,
+                now,
+                self.snap,
+            ))
         }
 
         pub fn receive(
@@ -620,6 +874,9 @@ mod platform {
 
     impl Drop for Capture {
         fn drop(&mut self) {
+            if self.ring.is_null() {
+                return;
+            }
             // SAFETY: unmaps the ring this capture mapped, its whole
             // length; nothing refers into it once the capture is gone.
             unsafe {
@@ -669,6 +926,15 @@ mod platform {
         }
 
         pub fn statistics(&self) -> io::Result<Statistics> {
+            Err(unsupported())
+        }
+
+        pub fn open_stamped(
+            _interface: &str,
+            _ethertypes: &[u16],
+            _snap: u32,
+            _promiscuous: bool,
+        ) -> io::Result<Self> {
             Err(unsupported())
         }
     }
@@ -825,6 +1091,57 @@ mod tests {
         assert_eq!(captured.original, 134);
         assert_eq!(&buffer[12..16], &[0x81, 0x00, 0x60, 0x02]);
         assert_eq!(&buffer[16..34], &second[12..]);
+    }
+
+    #[test]
+    fn a_received_frame_takes_its_hardware_time() {
+        let mut buffer = [0u8; 64];
+        buffer[..20].copy_from_slice(&(0..20).collect::<Vec<u8>>());
+        let wire = Duration::new(265_258, 495_597_656);
+        let now = Duration::new(1_793_300_000, 0);
+        let captured = stamped_frame(
+            &mut buffer,
+            20,
+            ring::MULTICAST,
+            Some(120),
+            None,
+            Some(wire),
+            now,
+            64,
+        );
+        assert_eq!((captured.time, captured.clock), (wire, Clock::Hardware));
+        assert_eq!(captured.direction, Direction::Inbound);
+        assert_eq!((captured.length, captured.original), (20, 120));
+    }
+
+    #[test]
+    fn a_frame_going_out_keeps_the_system_time_and_gets_its_tag_back() {
+        let mut buffer = [0u8; 64];
+        buffer[..20].copy_from_slice(&(0..20).collect::<Vec<u8>>());
+        let now = Duration::new(1_793_300_000, 7);
+        let captured = stamped_frame(
+            &mut buffer,
+            20,
+            ring::OUTGOING,
+            Some(20),
+            Some((ETHERTYPE_VLAN, 0x6002)),
+            Some(Duration::new(265_258, 0)),
+            now,
+            64,
+        );
+        assert_eq!((captured.time, captured.clock), (now, Clock::System));
+        assert_eq!(captured.direction, Direction::Outbound);
+        assert_eq!((captured.length, captured.original), (24, 24));
+        assert_eq!(&buffer[12..16], &[0x81, 0x00, 0x60, 0x02]);
+    }
+
+    #[test]
+    fn a_frame_without_a_stamp_keeps_the_system_time() {
+        let mut buffer = [0u8; 64];
+        let now = Duration::new(1_793_300_000, 9);
+        let captured = stamped_frame(&mut buffer, 20, ring::HOST, None, None, None, now, 64);
+        assert_eq!((captured.time, captured.clock), (now, Clock::System));
+        assert_eq!(captured.original, 20);
     }
 
     #[test]

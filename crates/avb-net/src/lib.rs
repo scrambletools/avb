@@ -31,6 +31,9 @@ pub mod stream;
 pub mod capture;
 
 #[cfg(feature = "std")]
+pub mod stamped;
+
+#[cfg(feature = "std")]
 pub use interfaces::{Interface, LinkPower, interfaces};
 #[cfg(feature = "std")]
 pub use socket::{Blocked, Received, Socket, check_access};
