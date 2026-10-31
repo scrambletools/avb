@@ -52,12 +52,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build without std
         run: |
-          cargo build -p avb-net -p atdecc -p avb-mrp -p avb-gptp --no-default-features --target riscv32imac-unknown-none-elf
+          cargo build -p avb-net -p atdecc -p avb-mrp -p gptp --no-default-features --target riscv32imac-unknown-none-elf
           cargo build -p atdecc --no-default-features --features alloc --target riscv32imac-unknown-none-elf
           cargo build -p avb-mrp --no-default-features --features bridge --target riscv32imac-unknown-none-elf
       - name: Test each on its own
         run: |
-          for crate in avb-net atdecc avb-mrp avb-gptp; do
+          for crate in avb-net atdecc avb-mrp gptp; do
             cargo test -p "$crate"
           done
           cargo test -p avb-mrp --features bridge
