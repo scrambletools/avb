@@ -489,6 +489,15 @@ fn take_changes(shared: &Shared, running: &mut [Option<Running>]) {
     }
 }
 
+/// Whether an AVTPDU is of stream `stream_id`, whatever its format: the
+/// stream ID of AVTP's common stream header.
+fn of_stream(pdu: &[u8], stream_id: u64) -> bool {
+    pdu.get(4..12)
+        .and_then(|id| id.try_into().ok())
+        .map(u64::from_be_bytes)
+        == Some(stream_id)
+}
+
 /// Counts one frame of a stream and plays its samples.
 fn take_frame(stream: &mut Running, frame: &[u8], samples: &mut Vec<f32>, clock: &MediaClock) {
     let Running {
@@ -503,6 +512,12 @@ fn take_frame(stream: &mut Running, frame: &[u8], samples: &mut Vec<f32>, clock:
         return;
     };
     let Some(header) = media::read(pdu, &opened.media, samples) else {
+        // The stream it waits for, in a format it was not opened for, as
+        // when a controller binds a talker of another format: counted, so
+        // the controller sees why nothing plays.
+        if of_stream(pdu, opened.config.stream_id) {
+            counters.unsupported_formats.fetch_add(1, Ordering::Relaxed);
+        }
         return;
     };
     if header.stream_id != opened.config.stream_id {
@@ -638,5 +653,17 @@ mod tests {
         let mut out = Vec::new();
         remap(&samples, 3, &[Some(2), None, Some(0)], &mut out);
         assert_eq!(out, [0.3, 0.0, 0.1, 0.6, 0.0, 0.4]);
+    }
+
+    /// A frame of the stream waited for is known by its stream ID alone,
+    /// so one in another format still counts as unsupported.
+    #[test]
+    fn a_frame_of_the_stream_is_known_by_its_id() {
+        let mut am824 = [0u8; 32];
+        am824[0] = 0x00; // IEC 61883
+        am824[4..12].copy_from_slice(&0x0001_f201_62e5_0000u64.to_be_bytes());
+        assert!(of_stream(&am824, 0x0001_f201_62e5_0000));
+        assert!(!of_stream(&am824, 0x0001_f201_62e5_0001));
+        assert!(!of_stream(&am824[..11], 0x0001_f201_62e5_0000));
     }
 }
