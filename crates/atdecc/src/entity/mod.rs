@@ -35,7 +35,9 @@ use crate::pdu::{self, Pdu};
 use crate::stream_format::StreamFormat;
 use crate::time::Instant;
 
-pub use model::{EndpointModel, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel, VENDOR_LOGO_ADDRESS};
+pub use model::{
+    ClockQuality, EndpointModel, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel, VENDOR_LOGO_ADDRESS,
+};
 use model::{EntityState, name_field};
 
 /// How long the advertisement stays valid, in units of 2 s.
@@ -651,6 +653,14 @@ impl Entity {
         adpdu.message_type = AdpMessageType::ENTITY_DEPARTING;
         adpdu.valid_time = 0;
         self.send_adp(&adpdu);
+    }
+
+    /// Takes the interface's own PTP Instance, as whatever runs gPTP says
+    /// once it answers: its clock identity and how the BTCA ranks it, as
+    /// the AVB_INTERFACE reports them.
+    pub fn set_clock(&mut self, identity: ClockIdentity, quality: ClockQuality) {
+        self.model.clock_identity = identity;
+        self.model.clock_quality = quality;
     }
 
     /// Takes what gPTP says: a new grandmaster is advertised at once, and

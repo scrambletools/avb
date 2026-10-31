@@ -55,6 +55,54 @@ impl StreamModel {
     }
 }
 
+/// The interface's PTP Instance as the BTCA ranks it (802.1AS-2020
+/// 8.6.2), as its AVB_INTERFACE reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClockQuality {
+    pub priority1: u8,
+    pub clock_class: u8,
+    pub clock_accuracy: u8,
+    pub offset_scaled_log_variance: u16,
+    pub priority2: u8,
+}
+
+impl ClockQuality {
+    /// A PTP Instance that is not grandmaster capable (8.6.2.1, 8.6.2.2).
+    pub const NOT_GRANDMASTER_CAPABLE: Self = Self {
+        priority1: 255,
+        clock_class: 255,
+        clock_accuracy: 0xfe,
+        offset_scaled_log_variance: 0x436a,
+        priority2: 248,
+    };
+
+    /// A grandmaster capable one of `priority1`, its clock otherwise
+    /// unknown (8.6.2.2 to 8.6.2.5). Milan asks 248 of a talker
+    /// (4.2.6.2.1).
+    pub const fn grandmaster_capable(priority1: u8) -> Self {
+        Self {
+            priority1,
+            clock_class: 248,
+            clock_accuracy: 0xfe,
+            offset_scaled_log_variance: 0x436a,
+            priority2: 248,
+        }
+    }
+
+    /// Of a PTP Instance of `priority1`: grandmaster capable below 255.
+    pub const fn of_priority1(priority1: u8) -> Self {
+        if priority1 == 255 {
+            Self::NOT_GRANDMASTER_CAPABLE
+        } else {
+            Self::grandmaster_capable(priority1)
+        }
+    }
+
+    pub const fn is_grandmaster_capable(&self) -> bool {
+        self.priority1 < 255
+    }
+}
+
 /// What a talker or listener entity is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EndpointModel {
@@ -70,6 +118,7 @@ pub struct EndpointModel {
     pub interface_name: String,
     /// The interface's gPTP clock identity.
     pub clock_identity: ClockIdentity,
+    pub clock_quality: ClockQuality,
     pub sampling_rates: Vec<u32>,
     pub current_sampling_rate: u32,
     pub outputs: Vec<StreamModel>,
@@ -409,24 +458,31 @@ impl EndpointModel {
                 }
                 writer.done()
             }
-            DescriptorType::AVB_INTERFACE if index == 0 => writer
-                .name(&self.interface_name)
-                .u16(NO_STRING)
-                .bytes(&self.mac.0)
-                .u16((InterfaceFlags::GPTP_SUPPORTED | InterfaceFlags::SRP_SUPPORTED).0)
-                .u64(self.clock_identity.0)
-                .u8(255) // priority1
-                .u8(248) // clock_class
-                .u16(0x436a) // offset_scaled_log_variance
-                .u8(0xfe) // clock_accuracy
-                .u8(255) // priority2
-                .u8(0) // domain_number
-                .u8(0xfd) // log_sync_interval, -3
-                .u8(0) // log_announce_interval
-                .u8(0) // log_pdelay_interval
-                .u16(1) // port_number
-                .pad_to(110)
-                .done(),
+            DescriptorType::AVB_INTERFACE if index == 0 => {
+                let quality = self.clock_quality;
+                let mut flags = InterfaceFlags::GPTP_SUPPORTED | InterfaceFlags::SRP_SUPPORTED;
+                if quality.is_grandmaster_capable() {
+                    flags |= InterfaceFlags::GPTP_GRANDMASTER_SUPPORTED;
+                }
+                writer
+                    .name(&self.interface_name)
+                    .u16(NO_STRING)
+                    .bytes(&self.mac.0)
+                    .u16(flags.0)
+                    .u64(self.clock_identity.0)
+                    .u8(quality.priority1)
+                    .u8(quality.clock_class)
+                    .u16(quality.offset_scaled_log_variance)
+                    .u8(quality.clock_accuracy)
+                    .u8(quality.priority2)
+                    .u8(0) // domain_number
+                    .u8(0xfd) // log_sync_interval, -3
+                    .u8(0) // log_announce_interval
+                    .u8(0) // log_pdelay_interval
+                    .u16(1) // port_number
+                    .pad_to(110)
+                    .done()
+            }
             DescriptorType::CLOCK_SOURCE if index < self.clock_sources() => {
                 if index == 0 {
                     writer

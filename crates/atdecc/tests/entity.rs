@@ -9,10 +9,13 @@ use std::time::Duration;
 use atdecc::adp::{Adpdu, EntityCapabilities};
 use atdecc::aecp::{AaMode, AaStatus, AaTlv, AddressAccessPdu, AecpHeader, AecpMessageType};
 use atdecc::controller::{Config, Controller, Event, Outcome, Refusal};
-use atdecc::descriptor::{DescriptorType, MemoryObjectDescriptor, MemoryObjectType};
+use atdecc::descriptor::{
+    AvbInterfaceDescriptor, DescriptorType, InterfaceFlags, MemoryObjectDescriptor,
+    MemoryObjectType,
+};
 use atdecc::entity::{
-    EndpointModel, Entity, EntityEvent, LOGO_ADDRESS, MEMORY_SEGMENT, OutputReservation,
-    StreamModel, VENDOR_LOGO_ADDRESS,
+    ClockQuality, EndpointModel, Entity, EntityEvent, LOGO_ADDRESS, MEMORY_SEGMENT,
+    OutputReservation, StreamModel, VENDOR_LOGO_ADDRESS,
 };
 use atdecc::model::EnumerationState;
 use atdecc::stream_format::StreamFormat;
@@ -51,6 +54,7 @@ fn model(entity_id: EntityId, name: &str, talker: bool) -> EndpointModel {
         mac: HOST_MAC,
         interface_name: "enp2s0".into(),
         clock_identity: ClockIdentity(0x9c6b_00ff_fe30_9a2b),
+        clock_quality: ClockQuality::grandmaster_capable(248),
         sampling_rates: vec![48_000],
         current_sampling_rate: 48_000,
         outputs: if talker {
@@ -1594,4 +1598,48 @@ fn an_entity_advertises_again_as_its_link_comes_up() {
     now += Duration::from_millis(500);
     entity.handle_timeout(now);
     assert_eq!(advertisements(&mut entity), 1);
+}
+
+/// The AVB_INTERFACE says whether the entity's PTP Instance can be
+/// grandmaster, and with what priority, as Milan asks of a talker.
+#[test]
+fn the_interface_tells_its_grandmaster_capability() {
+    let mut network = Network::new();
+    network.listener = Entity::new(
+        EndpointModel {
+            clock_quality: ClockQuality::NOT_GRANDMASTER_CAPABLE,
+            ..model(LISTENER, "Listener", false)
+        },
+        &[],
+    );
+    network.listener.start(Instant::ZERO);
+    network.controller.discover(None);
+    network.run(3000);
+    let interface = |entity_id| {
+        let model = network.controller.model(entity_id).expect("read");
+        model
+            .descriptor(DescriptorType::AVB_INTERFACE, 0)
+            .expect("its AVB_INTERFACE")
+            .to_vec()
+    };
+    let talker = interface(TALKER);
+    let talker = AvbInterfaceDescriptor::decode(&talker).unwrap();
+    assert!(
+        talker
+            .interface_flags
+            .contains(InterfaceFlags::GPTP_GRANDMASTER_SUPPORTED)
+    );
+    assert_eq!(
+        (talker.priority1, talker.clock_class, talker.priority2),
+        (248, 248, 248)
+    );
+    assert_eq!(talker.offset_scaled_log_variance, 0x436a);
+    let listener = interface(LISTENER);
+    let listener = AvbInterfaceDescriptor::decode(&listener).unwrap();
+    assert!(
+        !listener
+            .interface_flags
+            .contains(InterfaceFlags::GPTP_GRANDMASTER_SUPPORTED)
+    );
+    assert_eq!((listener.priority1, listener.clock_class), (255, 255));
 }
