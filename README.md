@@ -16,11 +16,10 @@ daemon, a GUI, or firmware on a microcontroller.
 | `avb-mrp` | IEEE 802.1Q MRP (applicant, registrar, LeaveAll, periodic timers), MSRP and MVRP, and a port's participant shared between programs on one computer; with the `bridge` feature, a bridge's MSRP and MVRP: attribute propagation between ports, stream admission, and the forwarding and idle slope changes that follow |
 | `avb-net` | Raw Ethernet per operating system: interfaces, frames, multicast membership, the PTP hardware clock, link settings, and capturing frames both ways (Linux) |
 | `avb-stream` | AVTP audio: AAF and AM824 talkers and listeners paced on gPTP time, CRF media clock streams, and audio to and from the computer's devices through cpal |
-| `gptp` | IEEE 802.1AS gPTP messages and TLVs, toward a time-aware relay whose port clocks are never moved |
 
 ## Rules for the protocol crates
 
-`atdecc`, `avb-mrp`, `avb-net` and `gptp` keep to these:
+`atdecc`, `avb-mrp` and `avb-net` keep to these:
 
 1. **Sans-I/O core.** No sockets, threads, clock or runtime in the protocol
    code. The caller feeds received frames and the current time
@@ -63,7 +62,7 @@ avb-lite = { path = "../avb/crates/avb-lite" }
 avb-mrp = { path = "../avb/crates/avb-mrp" }
 avb-net = { path = "../avb/crates/avb-net" }
 avb-stream = { path = "../avb/crates/avb-stream" }
-gptp = { path = "../avb/crates/gptp" }
+gptp = { path = "../gptp/crates/gptp" }
 ```
 
 ## Platform needs
@@ -87,7 +86,7 @@ gptp = { path = "../avb/crates/gptp" }
 ```sh
 cargo test --workspace
 cargo test -p avb-mrp --features bridge
-cargo build -p avb-net -p atdecc -p avb-mrp -p gptp --no-default-features --target riscv32imac-unknown-none-elf
+cargo build -p avb-net -p atdecc -p avb-mrp --no-default-features --target riscv32imac-unknown-none-elf
 cargo build -p avb-mrp --no-default-features --features bridge --target riscv32imac-unknown-none-elf
 ```
 
