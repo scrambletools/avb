@@ -79,8 +79,8 @@ raw-ether = { path = "../gptp/crates/raw-ether" }
   and at start `install` a `Broker::start(<helper>)`: every raw socket
   `avb-net` and `avb-stream` open then comes from the helper, passed over
   a Unix socket. `raw-ether`'s `netraw` example is such a helper. gPTP
-  comes from ptp4l; the stream crates read its time from the
-  interface's PTP hardware clock, which must be readable.
+  comes from gptpd, in gptp's repository; the stream crates read the
+  grandmaster's time from the record it keeps for the interface.
 - **macOS:** raw Ethernet needs read and write access to `/dev/bpf*`.
 - **Windows:** raw Ethernet needs [Npcap](https://npcap.com).
 

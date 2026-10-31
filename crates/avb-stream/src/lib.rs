@@ -5,7 +5,7 @@
 //! nothing; and media clock streams, CRF (10), on the same time.
 //!
 //! The media clock is gPTP's: a talker sends its samples at the nominal
-//! rate of gPTP time, read from the interface's PTP hardware clock, and
+//! rate of gPTP time, as gptpd gives it for the interface, and
 //! the audio device, on its own clock, is kept in step by resampling
 //! between the two, the ratio steered by the fill of a buffer between
 //! them.

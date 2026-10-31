@@ -97,6 +97,12 @@ pub struct TalkerStats {
     pub frames_sent: u64,
     /// Frames that went out too late and started the media clock again.
     pub media_resets: u64,
+    /// Of those, the ones for a frame due too late to send, as when the
+    /// thread woke late.
+    pub late_resets: u64,
+    /// Of those, the ones for gPTP time jumping, as to a grandmaster of
+    /// other time, or going back.
+    pub clock_resets: u64,
     /// Times the input dropped frames as its device ran far ahead, and
     /// reads that found it empty.
     pub adjustments: u64,
@@ -122,6 +128,8 @@ struct StreamCounters {
 #[derive(Default)]
 struct GroupCounters {
     media_resets: AtomicU64,
+    late_resets: AtomicU64,
+    clock_resets: AtomicU64,
     adjustments: AtomicU64,
     underruns: AtomicU64,
     realtime: AtomicBool,
@@ -282,6 +290,8 @@ impl TalkerGroup {
         TalkerStats {
             frames_sent,
             media_resets: read(&group.media_resets),
+            late_resets: read(&group.late_resets),
+            clock_resets: read(&group.clock_resets),
             adjustments: read(&group.adjustments),
             underruns: read(&group.underruns),
             send_errors,
@@ -646,6 +656,7 @@ fn run(
     let mut frames: u64 = 0;
     let mut follow: Option<RecoveredClock> = None;
     let mut switched = false;
+    let mut generation = clock.generation();
     while !stop.load(Ordering::Relaxed) {
         let changes = shared.changes.load(Ordering::Relaxed);
         if changes != seen {
@@ -668,10 +679,19 @@ fn run(
         // comes, goes or starts again starts them again on it, or on gPTP
         // time.
         let retime = timeline.take(follow.as_ref().and_then(RecoveredClock::fit));
-        if (retime || std::mem::take(&mut switched)) && running.iter().any(Option::is_some) {
+        // gPTP time jumped, as to a new grandmaster: the timeline built on
+        // the old one is no good, and the streams start again on the new.
+        let jumped = clock.generation() != generation;
+        generation = clock.generation();
+        if (retime || jumped || std::mem::take(&mut switched))
+            && running.iter().any(Option::is_some)
+        {
             restart(&mut running, &mut timeline, clock);
             media_reset = !media_reset;
             shared.group.media_resets.fetch_add(1, Ordering::Relaxed);
+            if jumped {
+                shared.group.clock_resets.fetch_add(1, Ordering::Relaxed);
+            }
         }
         // The stream whose frame is due first.
         let Some((place, due)) = running
@@ -699,6 +719,7 @@ fn run(
                     restart(&mut running, &mut timeline, clock);
                     media_reset = !media_reset;
                     shared.group.media_resets.fetch_add(1, Ordering::Relaxed);
+                    shared.group.clock_resets.fetch_add(1, Ordering::Relaxed);
                 }
                 continue;
             }
@@ -716,6 +737,7 @@ fn run(
             restart(&mut running, &mut timeline, clock);
             media_reset = !media_reset;
             shared.group.media_resets.fetch_add(1, Ordering::Relaxed);
+            shared.group.late_resets.fetch_add(1, Ordering::Relaxed);
             continue;
         }
         if let Some(input) = &mut stream.input {
