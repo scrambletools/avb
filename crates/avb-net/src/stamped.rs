@@ -80,6 +80,15 @@ impl StampedSocket {
     }
 }
 
+/// Waits up to `timeout` (forever when `None`) for a frame on any of
+/// `sockets`: the positions of those with one to receive, none when the
+/// time ran out. Times that came too late for
+/// [`StampedSocket::transmit_time`] are dropped meanwhile.
+pub fn wait_any(sockets: &[&StampedSocket], timeout: Option<Duration>) -> io::Result<Vec<usize>> {
+    let inner: Vec<&platform::StampedSocket> = sockets.iter().map(|socket| &socket.inner).collect();
+    platform::wait_any(&inner, timeout)
+}
+
 /// Has `interface` stamp every frame it receives and the frames sent that
 /// ask for it, as a gPTP program needs. This changes the interface for
 /// every program, and needs `CAP_NET_ADMIN`; an interface already set so,
@@ -209,6 +218,57 @@ mod platform {
             };
         }
         Ok(ready > 0 && poll.revents & (events | libc::POLLERR) != 0)
+    }
+
+    pub fn wait_any(
+        sockets: &[&StampedSocket],
+        timeout: Option<Duration>,
+    ) -> io::Result<Vec<usize>> {
+        let deadline = timeout.map(|timeout| std::time::Instant::now() + timeout);
+        let mut polls: Vec<libc::pollfd> = sockets
+            .iter()
+            .map(|socket| libc::pollfd {
+                fd: socket.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            })
+            .collect();
+        loop {
+            let left = deadline
+                .map(|deadline| deadline.saturating_duration_since(std::time::Instant::now()));
+            // SAFETY: `polls` holds one valid pollfd per socket, and lives
+            // through the call.
+            let ready = unsafe {
+                libc::poll(
+                    polls.as_mut_ptr(),
+                    polls.len() as libc::nfds_t,
+                    timeout_ms(left),
+                )
+            };
+            if ready < 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            let readable: Vec<usize> = polls
+                .iter()
+                .enumerate()
+                .filter(|(_, poll)| poll.revents & libc::POLLIN != 0)
+                .map(|(position, _)| position)
+                .collect();
+            // A time on the error queue that no one waited for would wake
+            // every poll until taken.
+            for (socket, poll) in sockets.iter().zip(&polls) {
+                if poll.revents & libc::POLLERR != 0 {
+                    socket.drop_late_times()?;
+                }
+            }
+            if !readable.is_empty() || ready == 0 || left.is_some_and(|left| left.is_zero()) {
+                return Ok(readable);
+            }
+        }
     }
 
     /// Receives one message on `fd` with `flags` into `buffer`, its
@@ -375,13 +435,18 @@ mod platform {
             Ok(())
         }
 
-        pub fn send_stamped(&self, destination: MacAddress, payload: &[u8]) -> io::Result<()> {
+        fn drop_late_times(&self) -> io::Result<()> {
             // SAFETY: plain data, valid when zeroed.
             let mut stale: libc::sockaddr_ll = unsafe { zeroed() };
             let mut buffer = [0u8; 64];
             while receive_message(&self.fd, &mut buffer, &mut stale, libc::MSG_ERRQUEUE)?.is_some()
             {
             }
+            Ok(())
+        }
+
+        pub fn send_stamped(&self, destination: MacAddress, payload: &[u8]) -> io::Result<()> {
+            self.drop_late_times()?;
             let mut address = self.address(Some(destination));
             let mut part = libc::iovec {
                 iov_base: payload.as_ptr().cast_mut().cast(),
@@ -482,6 +547,13 @@ mod platform {
     }
 
     pub fn enable(_interface: &str) -> io::Result<()> {
+        Err(unsupported())
+    }
+
+    pub fn wait_any(
+        _sockets: &[&StampedSocket],
+        _timeout: Option<Duration>,
+    ) -> io::Result<Vec<usize>> {
         Err(unsupported())
     }
 

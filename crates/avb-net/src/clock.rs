@@ -1,7 +1,8 @@
 //! A network interface's PTP hardware clock, which gPTP keeps on the
-//! network's time, read from Linux's `/dev/ptpN`. Elsewhere opening fails
-//! as unsupported.
+//! network's time, read from Linux's `/dev/ptpN`, and two such clocks
+//! compared. Elsewhere opening fails as unsupported.
 
+use std::collections::VecDeque;
 use std::io;
 use std::time::Duration;
 
@@ -15,8 +16,28 @@ impl HardwareClock {
     /// [`crate::Interface::hardware_clock`].
     pub fn open(index: u32) -> io::Result<Self> {
         Ok(Self {
-            inner: platform::HardwareClock::open(index)?,
+            inner: platform::HardwareClock::open(index, false)?,
         })
+    }
+
+    /// Opens the clock with `index` to adjust it as well as read it.
+    pub fn open_adjustable(index: u32) -> io::Result<Self> {
+        Ok(Self {
+            inner: platform::HardwareClock::open(index, true)?,
+        })
+    }
+
+    /// How far the clock's frequency is adjusted from its oscillator's, in
+    /// parts per billion.
+    pub fn frequency_adjustment(&self) -> io::Result<f64> {
+        self.inner.frequency_adjustment()
+    }
+
+    /// Adjusts the clock's frequency to `ppb` parts per billion from its
+    /// oscillator's: 0 lets it run free. Needs the clock opened with
+    /// [`open_adjustable`](Self::open_adjustable).
+    pub fn set_frequency_adjustment(&self, ppb: f64) -> io::Result<()> {
+        self.inner.set_frequency_adjustment(ppb)
     }
 
     /// The clock's time, from the PTP epoch.
@@ -55,6 +76,91 @@ impl HardwareClock {
             .filter(|(_, offset)| (offset - median).abs() <= 10_000)
             .min_by_key(|(span, _)| *span)
             .map_or(median, |(_, offset)| *offset))
+    }
+}
+
+/// How far back comparisons count towards the rate, in nanoseconds: long
+/// enough that each comparison's own error hardly moves it.
+const SPAN: i128 = 2_000_000_000;
+
+/// Two clocks compared now and then, with the rate between them, so that
+/// a time on one is put on the other as the two stood when it was taken,
+/// not as at the last comparison: clocks some ppm apart drift hundreds of
+/// ns between comparisons. A line fitted through the comparisons kept
+/// gives both, so no one comparison's error carries over whole.
+#[derive(Debug, Clone, Default)]
+pub struct Comparison {
+    /// (when, on the clock compared, in ns; its time less the other's)
+    kept: VecDeque<(i128, i128)>,
+}
+
+impl Comparison {
+    /// The clock compared read `at`, and `offset` ahead of the other.
+    pub fn update(&mut self, at: i128, offset: i128) {
+        if self.kept.back().is_some_and(|(last, _)| at <= *last) {
+            return;
+        }
+        self.kept.push_back((at, offset));
+        while self
+            .kept
+            .front()
+            .is_some_and(|(first, _)| at - first > SPAN)
+            && self.kept.len() > 2
+        {
+            self.kept.pop_front();
+        }
+    }
+
+    /// How far ahead of the other the clock compared was at `at`, a time
+    /// on it.
+    pub fn offset_at(&self, at: i128) -> i128 {
+        let Some(&(last_at, last_offset)) = self.kept.back() else {
+            return 0;
+        };
+        let Some((mean_at, mean_offset, rate)) = self.fit() else {
+            return last_offset;
+        };
+        last_offset + (mean_offset + rate * ((at - last_at) as f64 - mean_at)).round() as i128
+    }
+
+    /// How much faster the clock compared runs than the other, as a
+    /// fraction, once compared twice.
+    pub fn rate(&self) -> Option<f64> {
+        self.fit().map(|(_, _, rate)| rate)
+    }
+
+    /// The least-squares line through the comparisons kept: their mean
+    /// time and offset, each from the last's so as to keep the precision,
+    /// and the slope.
+    fn fit(&self) -> Option<(f64, f64, f64)> {
+        let &(last_at, last_offset) = self.kept.back()?;
+        if self.kept.len() < 2 {
+            return None;
+        }
+        let count = self.kept.len() as f64;
+        let points = || {
+            self.kept
+                .iter()
+                .map(move |&(at, offset)| ((at - last_at) as f64, (offset - last_offset) as f64))
+        };
+        let mean_at = points().map(|(at, _)| at).sum::<f64>() / count;
+        let mean_offset = points().map(|(_, offset)| offset).sum::<f64>() / count;
+        let (spread, covariance) =
+            points().fold((0.0, 0.0), |(spread, covariance), (at, offset)| {
+                let at = at - mean_at;
+                (spread + at * at, covariance + at * (offset - mean_offset))
+            });
+        (spread > 0.0).then(|| (mean_at, mean_offset, covariance / spread))
+    }
+
+    /// Whether the clocks have been compared yet.
+    pub fn is_empty(&self) -> bool {
+        self.kept.is_empty()
+    }
+
+    /// Forgets every comparison, as after one of the clocks was set.
+    pub fn clear(&mut self) {
+        self.kept.clear();
     }
 }
 
@@ -98,10 +204,15 @@ mod platform {
     }
 
     impl HardwareClock {
-        pub fn open(index: u32) -> io::Result<Self> {
+        pub fn open(index: u32, adjustable: bool) -> io::Result<Self> {
             let path = format!("/dev/ptp{index}\0");
+            let mode = if adjustable {
+                libc::O_RDWR
+            } else {
+                libc::O_RDONLY
+            };
             // SAFETY: `path` is NUL-terminated and lives through the call.
-            let raw = unsafe { libc::open(path.as_ptr().cast(), libc::O_RDONLY | libc::O_CLOEXEC) };
+            let raw = unsafe { libc::open(path.as_ptr().cast(), mode | libc::O_CLOEXEC) };
             if raw < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -115,6 +226,35 @@ mod platform {
 
         pub fn now(&self) -> io::Result<Duration> {
             read(self.id)
+        }
+
+        /// clock_adjtime on the clock: sets what `modes` names, here no
+        /// more than the frequency, and gives the adjustments as they stand.
+        fn adjust(&self, modes: libc::c_uint, frequency: libc::c_long) -> io::Result<libc::timex> {
+            // SAFETY: timex is plain data, valid when zeroed.
+            let mut time: libc::timex = unsafe { std::mem::zeroed() };
+            time.modes = modes;
+            time.freq = frequency;
+            // SAFETY: `time` is a valid timex that lives through the call.
+            if unsafe { libc::clock_adjtime(self.id, &raw mut time) } < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(time)
+        }
+
+        /// timex's freq is in ppm with 16 fractional bits.
+        const SCALED_PPB: f64 = 65.536;
+
+        pub fn frequency_adjustment(&self) -> io::Result<f64> {
+            Ok(self.adjust(0, 0)?.freq as f64 / Self::SCALED_PPB)
+        }
+
+        pub fn set_frequency_adjustment(&self, ppb: f64) -> io::Result<()> {
+            self.adjust(
+                libc::ADJ_FREQUENCY,
+                (ppb * Self::SCALED_PPB).round() as libc::c_long,
+            )
+            .map(|_| ())
         }
 
         /// The clock less the system clock, in nanoseconds, from its
@@ -195,23 +335,32 @@ mod platform {
     pub struct HardwareClock;
 
     impl HardwareClock {
-        pub fn open(_index: u32) -> io::Result<Self> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "hardware clocks are not supported on this system yet",
-            ))
+        pub fn open(_index: u32, _adjustable: bool) -> io::Result<Self> {
+            Err(unsupported())
         }
 
         pub fn now(&self) -> io::Result<Duration> {
             Ok(Duration::ZERO)
         }
 
-        pub fn offset_from_system(&self) -> io::Result<i128> {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "hardware clocks are not supported on this system yet",
-            ))
+        pub fn frequency_adjustment(&self) -> io::Result<f64> {
+            Err(unsupported())
         }
+
+        pub fn set_frequency_adjustment(&self, _ppb: f64) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub fn offset_from_system(&self) -> io::Result<i128> {
+            Err(unsupported())
+        }
+    }
+
+    fn unsupported() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::Unsupported,
+            "hardware clocks are not supported on this system yet",
+        )
     }
 
     pub fn monotonic_now() -> Duration {
@@ -221,6 +370,56 @@ mod platform {
     }
 
     pub fn precise_sleeps() {}
+}
+
+#[cfg(test)]
+mod comparison_tests {
+    use super::*;
+
+    #[test]
+    fn a_steady_drift_is_followed_between_comparisons() {
+        let mut comparison = Comparison::default();
+        // 6 ppm apart: 600 ns more every 100 ms.
+        for step in 0..30i128 {
+            comparison.update(step * 100_000_000, 1_000 + step * 600);
+        }
+        let last = 29 * 100_000_000;
+        assert_eq!(comparison.offset_at(last), 1_000 + 29 * 600);
+        assert_eq!(
+            comparison.offset_at(last + 50_000_000),
+            1_000 + 29 * 600 + 300
+        );
+        assert_eq!(
+            comparison.offset_at(last - 50_000_000),
+            1_000 + 29 * 600 - 300
+        );
+        assert!((comparison.rate().unwrap() - 6e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_error_of_one_comparison_is_mostly_filtered_out() {
+        let mut comparison = Comparison::default();
+        // 6 ppm apart, each comparison 50 ns off one way or the other.
+        for step in 0..20i128 {
+            let error = if step % 2 == 0 { 50 } else { -50 };
+            comparison.update(step * 100_000_000, step * 600 + error);
+        }
+        let last = 19 * 100_000_000;
+        let off = comparison.offset_at(last) - 19 * 600;
+        assert!(off.abs() <= 15, "off by {off} ns");
+    }
+
+    #[test]
+    fn one_comparison_is_taken_as_it_is() {
+        let mut comparison = Comparison::default();
+        assert!(comparison.is_empty());
+        assert_eq!(comparison.offset_at(5), 0);
+        comparison.update(10, 42);
+        assert_eq!(comparison.offset_at(1_000_000), 42);
+        assert_eq!(comparison.rate(), None);
+        comparison.clear();
+        assert!(comparison.is_empty());
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
