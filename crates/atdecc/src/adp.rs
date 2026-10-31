@@ -133,10 +133,25 @@ impl Adpdu {
     }
 
     /// Decodes an ADPDU from the octets after the Ethernet header. Octets
-    /// past the ADPDU, such as Ethernet padding, are ignored.
+    /// past the ADPDU, such as Ethernet padding, are ignored. An
+    /// ENTITY_DISCOVER cut short, as some controllers send it, is taken
+    /// whole as long as it names the entity: the rest of a discover is
+    /// zero.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let header =
-            ControlHeader::decode_expecting(bytes, subtype::ADP, Self::CONTROL_DATA_LENGTH)?;
+            match ControlHeader::decode_expecting(bytes, subtype::ADP, Self::CONTROL_DATA_LENGTH) {
+                Err(DecodeError::Truncated { .. })
+                    if bytes.len() >= 12
+                        && ControlHeader::decode(bytes).is_ok_and(|header| {
+                            header.message_type == AdpMessageType::ENTITY_DISCOVER.0
+                        }) =>
+                {
+                    let mut whole = [0; Self::LEN];
+                    whole[..bytes.len()].copy_from_slice(bytes);
+                    return Self::decode(&whole);
+                }
+                header => header?,
+            };
         Ok(Self {
             message_type: AdpMessageType(header.message_type),
             valid_time: header.status,
@@ -279,6 +294,20 @@ mod tests {
         let bytes = Adpdu::discover(EntityId(0)).to_bytes().unwrap();
         assert_eq!(&bytes[..4], &[0xfa, 0x02, 0x00, 0x38]);
         assert!(bytes[4..].iter().all(|&octet| octet == 0));
+    }
+
+    /// A discover cut to 60 octets, its control_data_length still 56,
+    /// still asks for its entity.
+    #[test]
+    fn a_short_discover_still_asks() {
+        let whole = Adpdu::discover(EntityId(0xa010_a3ff_fea5_1726))
+            .to_bytes()
+            .unwrap();
+        assert_eq!(
+            Adpdu::decode(&whole[..60]),
+            Ok(Adpdu::discover(EntityId(0xa010_a3ff_fea5_1726)))
+        );
+        assert!(Adpdu::decode(&whole[..11]).is_err());
     }
 
     #[test]
