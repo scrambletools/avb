@@ -1,6 +1,6 @@
 [package]
 name = "avb-net"
-description = "Raw Ethernet for AVB protocols: MAC addresses, interfaces, and frames with hardware timestamps"
+description = "Raw Ethernet for AVB protocols: raw-ether's interfaces, sockets, hardware time stamps and clocks, and AVTP stream frames"
 version = "0.1.1"
 categories = ["network-programming", "no-std"]
 keywords = ["avb", "tsn", "ethernet", "raw-socket"]
@@ -17,30 +17,15 @@ workspace = true
 default = ["std"]
 # Interfaces and frame I/O on Linux, macOS and Windows. Without it only the
 # address types remain, for protocol crates built for microcontrollers.
-std = ["dep:libc", "dep:windows-sys"]
+std = ["raw-ether/std", "dep:libc"]
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+[dependencies]
+# In gptp's repository, scrambletools/gptp.
+raw-ether = { version = "0.1.0", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
 libc = { version = "0.2", optional = true }
-
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", optional = true, features = [
-    "Win32_Foundation",
-    "Win32_NetworkManagement_IpHelper",
-    "Win32_NetworkManagement_Ndis",
-    "Win32_Networking_WinSock",
-    "Win32_System_LibraryLoader",
-    "Win32_System_SystemInformation",
-    "Win32_System_Threading",
-] }
 
 [[example]]
 name = "listen"
-required-features = ["std"]
-
-[[example]]
-name = "phc_watch"
-required-features = ["std"]
-
-[[example]]
-name = "netraw"
 required-features = ["std"]

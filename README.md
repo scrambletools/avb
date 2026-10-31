@@ -14,7 +14,7 @@ daemon, a GUI, or firmware on a microcontroller.
 | `atdecc` | IEEE 1722.1-2021 with Milan 1.3, MAAP and AVB Lite's vendor unique messages: frame codecs, controller state machines (discovery, AECP commands, enumeration, ACMP, unsolicited notifications), entity state machines (AEM responder, Milan listener binding, ACMP talker) and the entity model as data |
 | `avb-lite` | The AVB Lite profile: falling back from AVB where no bridge reserves streams, and CVU SRP's declarations, admission and escalation |
 | `avb-mrp` | IEEE 802.1Q MRP (applicant, registrar, LeaveAll, periodic timers), MSRP and MVRP, and a port's participant shared between programs on one computer; with the `bridge` feature, a bridge's MSRP and MVRP: attribute propagation between ports, stream admission, and the forwarding and idle slope changes that follow |
-| `avb-net` | Raw Ethernet per operating system: interfaces, frames, multicast membership, the PTP hardware clock, link settings, and capturing frames both ways (Linux) |
+| `avb-net` | Raw Ethernet for AVB: `raw-ether`'s interfaces, frames, multicast membership, hardware time stamps, the PTP hardware clock, link settings and captures, under the paths AVB crates use, and whole frames for AVTP streams |
 | `avb-stream` | AVTP audio: AAF and AM824 talkers and listeners paced on gPTP time, CRF media clock streams, and audio to and from the computer's devices through cpal |
 
 ## Rules for the protocol crates
@@ -33,9 +33,11 @@ daemon, a GUI, or firmware on a microcontroller.
    frame decodes and encodes back unchanged. State machines need `alloc`
    only. The `std` feature (default) adds the `avb-net` transports and a
    small blocking driver for simple apps.
-3. **No dependencies beyond each other.** `avb-net` depends only on what
-   its platform needs (`libc` on Linux and macOS, `windows-sys` on
-   Windows). No serde, no logging framework, no async runtime.
+3. **No dependencies beyond each other.** `avb-net` depends only on
+   `raw-ether`, in gptp's repository, which holds the platform code
+   (`libc` on Linux and macOS, `windows-sys` on Windows), and on `libc`
+   for AVTP streams on Linux. No serde, no logging framework, no async
+   runtime.
 4. **Never panic on input.** Malformed frames are errors.
 5. **Checked in CI**: each crate tested on its own, and built with
    `--no-default-features` for `riscv32imac-unknown-none-elf` (the
@@ -63,6 +65,7 @@ avb-mrp = { path = "../avb/crates/avb-mrp" }
 avb-net = { path = "../avb/crates/avb-net" }
 avb-stream = { path = "../avb/crates/avb-stream" }
 gptp = { path = "../gptp/crates/gptp" }
+raw-ether = { path = "../gptp/crates/raw-ether" }
 ```
 
 ## Platform needs
@@ -75,9 +78,9 @@ gptp = { path = "../gptp/crates/gptp" }
   the capability to that alone (`sudo setcap cap_net_raw+ep <helper>`),
   and at start `install` a `Broker::start(<helper>)`: every raw socket
   `avb-net` and `avb-stream` open then comes from the helper, passed over
-  a Unix socket. The `netraw` example is such a helper. gPTP comes from
-  ptp4l; the stream crates read its time from the interface's PTP
-  hardware clock, which must be readable.
+  a Unix socket. `raw-ether`'s `netraw` example is such a helper. gPTP
+  comes from ptp4l; the stream crates read its time from the
+  interface's PTP hardware clock, which must be readable.
 - **macOS:** raw Ethernet needs read and write access to `/dev/bpf*`.
 - **Windows:** raw Ethernet needs [Npcap](https://npcap.com).
 
