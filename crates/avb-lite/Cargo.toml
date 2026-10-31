@@ -1,7 +1,7 @@
 [package]
 name = "avb-lite"
-description = "The AVB Lite profile: falling back from AVB where no bridge reserves streams, and CVU SRP's declarations, admission and escalation, without I/O"
-version = "0.1.0"
+description = "The AVB Lite profile: CVU SRP's declarations, admission and escalation, without I/O"
+version = "0.2.0"
 categories = ["network-programming", "no-std"]
 keywords = ["avb", "avb-lite", "srp", "milan", "1722"]
 edition.workspace = true
