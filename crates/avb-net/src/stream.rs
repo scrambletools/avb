@@ -109,6 +109,10 @@ mod platform {
     /// of a class A stream of 1500-octet frames, as the kernel counts them.
     const RECEIVE_ROOM: libc::c_int = 1 << 20;
 
+    /// The priority a stream's frames are sent with: class A's in the usual
+    /// mqprio maps. Any priority up to 6 needs no capability.
+    const SEND_PRIORITY: libc::c_int = 3;
+
     fn open_raw(interface: &str) -> io::Result<(OwnedFd, i32)> {
         let index = crate::interfaces::index_of(interface).ok_or_else(|| {
             io::Error::new(
@@ -150,6 +154,24 @@ mod platform {
             let (fd, index) = open_raw(interface)?;
             // Bound for no protocol: it sends, and hears nothing.
             bind(&fd, index, 0)?;
+            // Under the default mq and fq_codel, a frame's priority files it
+            // before its hash does, and the hash takes in the AVTP header:
+            // with no priority, each frame of a stream can land in a flow of
+            // its own and leave out of order when the queue backs up. With
+            // one, they share one flow and keep their order. A refusal
+            // leaves them as they were.
+            let priority = SEND_PRIORITY;
+            // SAFETY: `priority` is a c_int that lives through the call, and
+            // the length passed is its size.
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_PRIORITY,
+                    (&raw const priority).cast(),
+                    size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
             Ok(Self { fd })
         }
 
