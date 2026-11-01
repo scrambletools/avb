@@ -436,6 +436,34 @@ struct Running {
     frame_samples: u64,
     /// The first sample of its next frame.
     next: u64,
+    /// The mr bit its frames carry.
+    media_reset: MediaReset,
+}
+
+/// A stream's mr bit, which changes as its media clock starts again. A
+/// start no frame has carried yet goes out with the one before it: two
+/// changes with no frame between would cancel, and a listener would see
+/// the timeline jump with the bit as it was.
+#[derive(Debug, Default)]
+struct MediaReset {
+    bit: bool,
+    /// Whether a frame sent has carried the bit since it last changed.
+    carried: bool,
+}
+
+impl MediaReset {
+    /// The media clock starts again.
+    fn restart(&mut self) {
+        if self.carried {
+            self.bit = !self.bit;
+            self.carried = false;
+        }
+    }
+
+    /// A frame with the bit went out, to at least one destination.
+    fn sent(&mut self) {
+        self.carried = true;
+    }
 }
 
 impl Running {
@@ -459,6 +487,7 @@ impl Running {
             channels: usize::from(media.channels()),
             frame_samples: frame_samples.max(1),
             next: 0,
+            media_reset: MediaReset::default(),
         }
     }
 
@@ -652,7 +681,6 @@ fn run(
         wanted: None,
     };
     let mut seen = u64::MAX;
-    let mut media_reset = false;
     let mut frames: u64 = 0;
     let mut follow: Option<RecoveredClock> = None;
     let mut switched = false;
@@ -687,7 +715,6 @@ fn run(
             && running.iter().any(Option::is_some)
         {
             restart(&mut running, &mut timeline, clock);
-            media_reset = !media_reset;
             shared.group.media_resets.fetch_add(1, Ordering::Relaxed);
             if jumped {
                 shared.group.clock_resets.fetch_add(1, Ordering::Relaxed);
@@ -717,7 +744,6 @@ fn run(
                 // went back, and the streams start again from it.
                 if due - clock.now() > 2 * LONGEST_SLEEP.as_nanos() as i64 {
                     restart(&mut running, &mut timeline, clock);
-                    media_reset = !media_reset;
                     shared.group.media_resets.fetch_add(1, Ordering::Relaxed);
                     shared.group.clock_resets.fetch_add(1, Ordering::Relaxed);
                 }
@@ -735,7 +761,6 @@ fn run(
             // Too late for the presentation time to mean anything: the
             // media clock starts again, which the mr bit tells.
             restart(&mut running, &mut timeline, clock);
-            media_reset = !media_reset;
             shared.group.media_resets.fetch_add(1, Ordering::Relaxed);
             shared.group.late_resets.fetch_add(1, Ordering::Relaxed);
             continue;
@@ -747,16 +772,21 @@ fn run(
         counters.peaks.raise(&stream.samples, stream.channels);
         stream.packetizer.write(
             due + transit,
-            media_reset,
+            stream.media_reset.bit,
             &stream.samples,
             &mut stream.frame[ETHERNET_LEN..],
         );
         for destination in &stream.stream.destinations {
             stream.frame[..6].copy_from_slice(&destination.0);
             match sender.send(&stream.frame) {
-                Ok(()) => counters.frames_sent.fetch_add(1, Ordering::Relaxed),
-                Err(_) => counters.send_errors.fetch_add(1, Ordering::Relaxed),
-            };
+                Ok(()) => {
+                    counters.frames_sent.fetch_add(1, Ordering::Relaxed);
+                    stream.media_reset.sent();
+                }
+                Err(_) => {
+                    counters.send_errors.fetch_add(1, Ordering::Relaxed);
+                }
+            }
         }
         stream.next += stream.frame_samples();
         frames += 1;
@@ -783,12 +813,14 @@ fn run(
     }
 }
 
-/// Starts every stream again on the clock as it is now.
+/// Starts every stream again on the clock as it is now, which the mr
+/// bit tells.
 fn restart(running: &mut [Option<Running>], timeline: &mut Timeline, clock: &MediaClock) {
     let now = clock.now();
     let first = timeline.restart(timeline.sample_at(now), now);
     for stream in running.iter_mut().flatten() {
         stream.next = stream.first_from(first);
+        stream.media_reset.restart();
     }
 }
 
@@ -870,5 +902,26 @@ mod tests {
         timeline.restart(first + 192_000, 22_500_000_000);
         assert!(timeline.follow.is_none());
         assert!(!timeline.take(None));
+    }
+
+    /// The mr bit changes for a start of the media clock once a frame sent
+    /// has carried it as it was: two starts with no frame sent between, as
+    /// a late send and then a jump of gPTP time, or a frame no destination
+    /// took, change it once, and a start before the first frame not at all.
+    #[test]
+    fn the_mr_bit_tells_each_start() {
+        let mut media_reset = MediaReset::default();
+        media_reset.restart();
+        assert!(!media_reset.bit, "nothing to tell before the first frame");
+        media_reset.sent();
+        media_reset.restart();
+        media_reset.restart();
+        assert!(media_reset.bit, "two starts change the bit once");
+        // A frame that went nowhere tells nothing.
+        media_reset.restart();
+        assert!(media_reset.bit);
+        media_reset.sent();
+        media_reset.restart();
+        assert!(!media_reset.bit);
     }
 }
