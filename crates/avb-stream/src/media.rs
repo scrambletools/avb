@@ -174,6 +174,20 @@ impl Packetizer {
         }
         self.sequence = self.sequence.wrapping_add(1);
     }
+
+    /// Leaves out the next `frames` PDUs: those after count on past them,
+    /// so a listener sees them missing.
+    pub fn skip(&mut self, frames: u64) {
+        // Both counts wrap at 256, so only the frames past whole wraps
+        // move them.
+        let frames = frames as u8;
+        self.sequence = self.sequence.wrapping_add(frames);
+        if let Media::Am824(layout) = self.media {
+            self.dbc = self
+                .dbc
+                .wrapping_add(frames.wrapping_mul(layout.samples_per_frame as u8));
+        }
+    }
 }
 
 /// What a listener takes from one PDU.
@@ -313,6 +327,28 @@ mod tests {
         let received = read(&pdu, &clock, &mut Vec::new()).unwrap();
         assert!(received.matches);
         assert_eq!(received.timestamp, Some(3_000_000_000));
+    }
+
+    /// Frames left out count on in the sequence number and, in AM824, the
+    /// data blocks, past a wrap too: the next PDU is the one that would
+    /// have gone.
+    #[test]
+    fn frames_left_out_count_on() {
+        for format in [AAF_48K_8CH_32, AM824_48K_8CH] {
+            let media = Media::of(format).unwrap();
+            let samples = [0.25; 48];
+            let mut every = Packetizer::new(media, 1);
+            let mut pdu = vec![0; media.pdu_length()];
+            for _ in 0..259 {
+                every.write(0, false, &samples, &mut pdu);
+            }
+            let mut skipping = Packetizer::new(media, 1);
+            skipping.skip(259);
+            let mut next = vec![0; media.pdu_length()];
+            every.write(7_000_000, false, &samples, &mut pdu);
+            skipping.write(7_000_000, false, &samples, &mut next);
+            assert_eq!(pdu, next);
+        }
     }
 
     #[test]

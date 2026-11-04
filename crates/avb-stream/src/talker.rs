@@ -95,11 +95,11 @@ pub struct GroupStream {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TalkerStats {
     pub frames_sent: u64,
-    /// Frames that went out too late and started the media clock again.
+    /// Frames left out as due too late to arrive in time, as when the
+    /// thread woke late: the stream goes on past them on its timeline.
+    pub frames_late: u64,
+    /// Times the media clock started again, which the mr bit tells.
     pub media_resets: u64,
-    /// Of those, the ones for a frame due too late to send, as when the
-    /// thread woke late.
-    pub late_resets: u64,
     /// Of those, the ones for gPTP time jumping, as to a grandmaster of
     /// other time, or going back.
     pub clock_resets: u64,
@@ -120,6 +120,7 @@ pub struct TalkerStats {
 #[derive(Default)]
 struct StreamCounters {
     frames_sent: AtomicU64,
+    frames_late: AtomicU64,
     send_errors: AtomicU64,
     peaks: Peaks,
 }
@@ -128,7 +129,6 @@ struct StreamCounters {
 #[derive(Default)]
 struct GroupCounters {
     media_resets: AtomicU64,
-    late_resets: AtomicU64,
     clock_resets: AtomicU64,
     adjustments: AtomicU64,
     underruns: AtomicU64,
@@ -283,14 +283,21 @@ impl TalkerGroup {
     pub fn stats(&self, place: usize) -> TalkerStats {
         let read = |counter: &AtomicU64| counter.load(Ordering::Relaxed);
         let group = &self.shared.group;
-        let (frames_sent, send_errors) =
-            self.shared.counters.get(place).map_or((0, 0), |counters| {
-                (read(&counters.frames_sent), read(&counters.send_errors))
-            });
+        let (frames_sent, frames_late, send_errors) =
+            self.shared
+                .counters
+                .get(place)
+                .map_or((0, 0, 0), |counters| {
+                    (
+                        read(&counters.frames_sent),
+                        read(&counters.frames_late),
+                        read(&counters.send_errors),
+                    )
+                });
         TalkerStats {
             frames_sent,
+            frames_late,
             media_resets: read(&group.media_resets),
-            late_resets: read(&group.late_resets),
             clock_resets: read(&group.clock_resets),
             adjustments: read(&group.adjustments),
             underruns: read(&group.underruns),
@@ -498,6 +505,20 @@ impl Running {
     /// Its next frame's first sample at or after sample `from`.
     fn first_from(&self, from: u64) -> u64 {
         from.div_ceil(self.frame_samples()) * self.frame_samples()
+    }
+
+    /// Leaves out its frames before sample `from`, as too late to send,
+    /// and gives how many: what comes after stays on the timeline, so a
+    /// listener misses those frames alone, where a restart would have it
+    /// lock again.
+    fn skip_to(&mut self, from: u64) -> u64 {
+        let frames = self.first_from(from).saturating_sub(self.next) / self.frame_samples();
+        if let Some(input) = &mut self.input {
+            input.skip(frames as usize * self.samples.len() / self.channels.max(1));
+        }
+        self.packetizer.skip(frames);
+        self.next += frames * self.frame_samples();
+        frames
     }
 }
 
@@ -756,19 +777,21 @@ fn run(
         // A frame sent late still arrives in time while its presentation
         // time is far enough ahead.
         let transit = stream.stream.max_transit_time.as_nanos() as i64;
-        let late = clock.now() - due;
-        if late > (transit - CROSSING).max(transit / 2) {
-            // Too late for the presentation time to mean anything: the
-            // media clock starts again, which the mr bit tells.
-            restart(&mut running, &mut timeline, clock);
-            shared.group.media_resets.fetch_add(1, Ordering::Relaxed);
-            shared.group.late_resets.fetch_add(1, Ordering::Relaxed);
+        let allowed = (transit - CROSSING).max(transit / 2);
+        let now = clock.now();
+        let counters = &shared.counters[place];
+        if now - due > allowed {
+            // Too late to arrive in time, as when the thread woke late:
+            // the stream goes on from its first frame that still would,
+            // past one at least.
+            let from = timeline.sample_at(now - allowed).max(stream.next + 1);
+            let skipped = stream.skip_to(from);
+            counters.frames_late.fetch_add(skipped, Ordering::Relaxed);
             continue;
         }
         if let Some(input) = &mut stream.input {
             input.read_as(&mut stream.samples, stream.channels);
         }
-        let counters = &shared.counters[place];
         counters.peaks.raise(&stream.samples, stream.channels);
         stream.packetizer.write(
             due + transit,
@@ -902,6 +925,72 @@ mod tests {
         timeline.restart(first + 192_000, 22_500_000_000);
         assert!(timeline.follow.is_none());
         assert!(!timeline.take(None));
+    }
+
+    /// Frames too late to send are left out on the stream's timeline: the
+    /// next goes out as it would have, its sequence number, presentation
+    /// time, samples and mr bit, with only those between missing.
+    #[test]
+    fn late_frames_are_left_out() {
+        let format = StreamFormat(0x0205_0220_0200_6000);
+        let media = Media::of(format).unwrap();
+        let source = Source::Tone {
+            hertz: 1000.0,
+            level: 0.5,
+        };
+        let stream = GroupStream {
+            stream_id: 1,
+            destinations: Vec::new(),
+            vlan_id: 2,
+            priority: 3,
+            format,
+            max_transit_time: Duration::from_millis(2),
+            source: source.clone(),
+            channels: 8,
+        };
+        let start = || {
+            let input = Input::open(&source, 8, 48_000).unwrap();
+            let mut made = Running::new(MacAddress([0; 6]), stream.clone(), media, Some(input), 6);
+            made.next = 480;
+            made
+        };
+        let send = |running: &mut Running| {
+            let input = running.input.as_mut().unwrap();
+            input.read_as(&mut running.samples, running.channels);
+            let presentation = 9_000_000 + running.next as i64 * 1_000_000_000 / 48_000;
+            running.packetizer.write(
+                presentation,
+                running.media_reset.bit,
+                &running.samples,
+                &mut running.frame[ETHERNET_LEN..],
+            );
+            running.next += running.frame_samples();
+            let mut samples = Vec::new();
+            let received =
+                crate::media::read(&running.frame[ETHERNET_LEN..], &media, &mut samples).unwrap();
+            (received, samples)
+        };
+        let (mut every, mut late) = (start(), start());
+        for _ in 0..4 {
+            send(&mut every);
+        }
+        // Sample 500 falls in the fourth frame, so the fifth is next.
+        assert_eq!(late.skip_to(500), 4);
+        assert_eq!(late.next, every.next);
+        let (wanted, wanted_samples) = send(&mut every);
+        let (got, samples) = send(&mut late);
+        assert_eq!(got, wanted);
+        assert_eq!(got.sequence, 4);
+        assert!(!got.media_reset);
+        assert!(
+            samples
+                .iter()
+                .zip(&wanted_samples)
+                .all(|(sample, wanted)| (sample - wanted).abs() < 1e-4),
+            "the tone goes on where it would have"
+        );
+        // A sample the stream is past leaves nothing out.
+        assert_eq!(late.skip_to(late.next), 0);
     }
 
     /// The mr bit changes for a start of the media clock once a frame sent

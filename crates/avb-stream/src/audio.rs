@@ -797,6 +797,22 @@ impl Input {
         respread(&spread, self.channels, out, channels);
         self.spread = spread;
     }
+
+    /// Leaves out the next `frames` frames, as for frames too late to
+    /// send, so those after come when they would have.
+    pub fn skip(&mut self, frames: usize) {
+        match &mut self.kind {
+            InputKind::Silence => {}
+            InputKind::Tone { phase, step, .. } => {
+                let turned = f64::from(*phase) + f64::from(*step) * frames as f64;
+                *phase = (turned % std::f64::consts::TAU) as f32;
+            }
+            // The device's frames those would have been made from.
+            InputKind::Device { buffer, drift, .. } => {
+                buffer.drop_oldest((frames as f64 * drift.ratio()).round() as usize);
+            }
+        }
+    }
 }
 
 /// `samples`, frames of `channels` interleaved, into `out`'s frames of
