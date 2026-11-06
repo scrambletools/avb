@@ -799,6 +799,14 @@ fn run(
             &stream.samples,
             &mut stream.frame[ETHERNET_LEN..],
         );
+        // The thread can be held up after the check as well, reading the
+        // source or preempted: a frame that would now arrive late is left
+        // out, the packetizer having counted past it already.
+        if clock.now() - due > allowed {
+            stream.next += stream.frame_samples();
+            counters.frames_late.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
         for destination in &stream.stream.destinations {
             stream.frame[..6].copy_from_slice(&destination.0);
             match sender.send(&stream.frame) {
