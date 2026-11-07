@@ -16,12 +16,14 @@ use std::collections::VecDeque;
 use std::f32::consts::TAU;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError, mpsc};
+use std::sync::{Arc, mpsc};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, SizedSample};
+
+use crate::lock::{Guard, Lock};
 
 /// Where a talker's samples come from.
 #[derive(Debug, Clone, PartialEq)]
@@ -87,7 +89,7 @@ pub enum Sink {
 /// Interleaved sample frames passed between an audio device's callback
 /// and a stream's thread.
 pub struct FrameBuffer {
-    held: Mutex<Held>,
+    held: Lock<Held>,
     channels: usize,
     /// The fill kept beyond the device's own chunks, in frames.
     margin: usize,
@@ -128,7 +130,7 @@ impl FrameBuffer {
     pub fn new(channels: u16, margin: usize) -> Self {
         let channels = usize::from(channels).max(1);
         FrameBuffer {
-            held: Mutex::new(Held {
+            held: Lock::new(Held {
                 samples: VecDeque::with_capacity(4 * margin * channels),
                 pushed: 0,
                 more: 0,
@@ -141,8 +143,8 @@ impl FrameBuffer {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Held> {
-        self.held.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> Guard<'_, Held> {
+        self.held.lock()
     }
 
     /// Adds interleaved frames, keeping no more than four times the
@@ -874,7 +876,7 @@ struct Playing {
 pub struct Output {
     buffer: Option<Arc<FrameBuffer>>,
     _thread: Option<DeviceThread>,
-    playing: Mutex<Playing>,
+    playing: Lock<Playing>,
     /// Input frames a second.
     rate: u32,
     /// The loudest sample since the last look, as f32 bits.
@@ -950,7 +952,7 @@ impl Output {
         Output {
             buffer,
             _thread: thread,
-            playing: Mutex::new(Playing {
+            playing: Lock::new(Playing {
                 drift: Drift::new(channels, DeviceSide::Pulls, nominal),
                 made: Vec::new(),
                 next_in: None,
@@ -966,8 +968,8 @@ impl Output {
         }
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Playing> {
-        self.playing.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> Guard<'_, Playing> {
+        self.playing.lock()
     }
 
     /// Takes interleaved frames, and when they are due where the stream

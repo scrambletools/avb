@@ -9,7 +9,9 @@
 
 use std::collections::VecDeque;
 use std::fmt;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::Arc;
+
+use crate::lock::{Guard, Lock};
 
 /// How much of the stream the rate is taken over, in nanoseconds.
 const WINDOW: i64 = 2_000_000_000;
@@ -93,7 +95,7 @@ impl State {
 /// that takes the stream and the talkers that follow it. Clones share it.
 #[derive(Clone, Default)]
 pub struct RecoveredClock {
-    state: Arc<Mutex<State>>,
+    state: Arc<Lock<State>>,
 }
 
 impl PartialEq for RecoveredClock {
@@ -116,8 +118,8 @@ impl RecoveredClock {
         Self::default()
     }
 
-    fn lock(&self) -> MutexGuard<'_, State> {
-        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> Guard<'_, State> {
+        self.state.lock()
     }
 
     /// The clock as a line, once it is recovered.

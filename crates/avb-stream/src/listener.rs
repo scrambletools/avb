@@ -7,8 +7,8 @@
 //! [`Listener`] is a group of one.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,7 @@ use avb_net::MacAddress;
 use avb_net::stream::{FrameReceiver, avtp_payload};
 
 use crate::audio::{Output, Presented, Sink};
+use crate::lock::Lock;
 use crate::media::{self, Media};
 use crate::meter::Peaks;
 use crate::{MediaClock, RecoveredClock, crf};
@@ -138,10 +139,10 @@ struct Shared {
     /// Each place's stream opened, waiting for the thread, or `None` to
     /// stop it; and how often they changed, which the thread compares
     /// with what it last took.
-    waiting: Mutex<Vec<Option<Option<Opened>>>>,
+    waiting: Lock<Vec<Option<Option<Opened>>>>,
     changes: AtomicU64,
     /// Each place's counters, made anew for each stream.
-    counters: Mutex<Vec<Arc<Counters>>>,
+    counters: Lock<Vec<Arc<Counters>>>,
     realtime: AtomicBool,
 }
 
@@ -158,9 +159,9 @@ impl ListenerGroup {
     pub fn start(places: usize, clock: Arc<MediaClock>) -> io::Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
-            waiting: Mutex::new((0..places).map(|_| None).collect()),
+            waiting: Lock::new((0..places).map(|_| None).collect()),
             changes: AtomicU64::new(0),
-            counters: Mutex::new((0..places).map(|_| Arc::default()).collect()),
+            counters: Lock::new((0..places).map(|_| Arc::default()).collect()),
             realtime: AtomicBool::new(false),
         });
         let handle = {
@@ -209,21 +210,12 @@ impl ListenerGroup {
             }
             None => None,
         };
-        let mut waiting = self
-            .shared
-            .waiting
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut waiting = self.shared.waiting.lock();
         let Some(slot) = waiting.get_mut(place) else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "no such place"));
         };
         if opened.is_some()
-            && let Some(counters) = self
-                .shared
-                .counters
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get_mut(place)
+            && let Some(counters) = self.shared.counters.lock().get_mut(place)
         {
             *counters = Arc::default();
         }
@@ -236,7 +228,6 @@ impl ListenerGroup {
         self.shared
             .counters
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
             .get(place)
             .cloned()
             .unwrap_or_default()
@@ -380,11 +371,7 @@ fn run(shared: &Shared, clock: &MediaClock, stop: &AtomicBool) {
     shared
         .realtime
         .store(crate::realtime::raise(), Ordering::Relaxed);
-    let places = shared
-        .waiting
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .len();
+    let places = shared.waiting.lock().len();
     let mut running: Vec<Option<Running>> = (0..places).map(|_| None).collect();
     let mut seen = u64::MAX;
     let mut frame = vec![0u8; 1522];
@@ -458,14 +445,8 @@ fn run(shared: &Shared, clock: &MediaClock, stop: &AtomicBool) {
 
 /// Takes the streams opened for it and stops those asked to stop.
 fn take_changes(shared: &Shared, running: &mut [Option<Running>]) {
-    let mut waiting = shared
-        .waiting
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let counters = shared
-        .counters
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
+    let mut waiting = shared.waiting.lock();
+    let counters = shared.counters.lock();
     for (place, slot) in waiting.iter_mut().enumerate() {
         let Some(change) = slot.take() else {
             continue;

@@ -9,8 +9,8 @@
 //! they fall on. A [`Talker`] is a group of one.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -21,6 +21,7 @@ use avb_net::stream::FrameSender;
 
 use crate::MediaClock;
 use crate::audio::{Input, Source};
+use crate::lock::{Guard, Lock};
 use crate::media::{Media, Packetizer};
 use crate::meter::Peaks;
 use crate::recovered::{Fit, RecoveredClock, div_ceil};
@@ -140,20 +141,20 @@ struct GroupCounters {
 struct Shared {
     /// The streams wanted, by place, and how often they changed, which
     /// the thread compares with what it last took.
-    streams: Mutex<Vec<Option<GroupStream>>>,
+    streams: Lock<Vec<Option<GroupStream>>>,
     changes: AtomicU64,
     /// Each new stream's source, opened for the thread to take; none for
     /// a media clock.
-    inputs: Mutex<Vec<Option<Input>>>,
+    inputs: Lock<Vec<Option<Input>>>,
     /// The media clock the streams follow, none for gPTP time itself.
-    follow: Mutex<Option<RecoveredClock>>,
+    follow: Lock<Option<RecoveredClock>>,
     counters: Vec<StreamCounters>,
     group: GroupCounters,
 }
 
 impl Shared {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<Option<GroupStream>>> {
-        self.streams.lock().unwrap_or_else(PoisonError::into_inner)
+    fn lock(&self) -> Guard<'_, Vec<Option<GroupStream>>> {
+        self.streams.lock()
     }
 }
 
@@ -172,10 +173,10 @@ impl TalkerGroup {
         let sender = FrameSender::open(&config.interface)?;
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
-            streams: Mutex::new(vec![None; places]),
+            streams: Lock::new(vec![None; places]),
             changes: AtomicU64::new(0),
-            inputs: Mutex::new((0..places).map(|_| None).collect()),
-            follow: Mutex::new(None),
+            inputs: Lock::new((0..places).map(|_| None).collect()),
+            follow: Lock::new(None),
             counters: (0..places).map(|_| StreamCounters::default()).collect(),
             group: GroupCounters::default(),
         });
@@ -229,13 +230,7 @@ impl TalkerGroup {
         let Some(slot) = streams.get_mut(place) else {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "no such place"));
         };
-        if let Some(waiting) = self
-            .shared
-            .inputs
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .get_mut(place)
-        {
+        if let Some(waiting) = self.shared.inputs.lock().get_mut(place) {
             *waiting = input;
         }
         *slot = stream;
@@ -258,11 +253,7 @@ impl TalkerGroup {
     /// on gPTP time alone. The streams start again on each change of
     /// clock, as a media reset tells their listeners.
     pub fn follow(&self, clock: Option<RecoveredClock>) {
-        let mut follow = self
-            .shared
-            .follow
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let mut follow = self.shared.follow.lock();
         if *follow != clock {
             *follow = clock;
             self.shared.changes.fetch_add(1, Ordering::Relaxed);
@@ -625,7 +616,7 @@ fn take_changes(
     clock: &MediaClock,
 ) {
     let wanted = shared.lock().clone();
-    let mut inputs = shared.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut inputs = shared.inputs.lock();
     let idle = running.iter().all(Option::is_none);
     let mut from = None;
     for (place, wanted) in wanted.into_iter().enumerate() {
@@ -710,11 +701,7 @@ fn run(
         let changes = shared.changes.load(Ordering::Relaxed);
         if changes != seen {
             seen = changes;
-            let wanted = shared
-                .follow
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .clone();
+            let wanted = shared.follow.lock().clone();
             // Leaving a clock followed starts again; samples on gPTP time
             // start again once the new clock is recovered.
             if wanted != follow {
@@ -782,9 +769,11 @@ fn run(
         let counters = &shared.counters[place];
         if now - due > allowed {
             // Too late to arrive in time, as when the thread woke late:
-            // the stream goes on from its first frame that still would,
-            // past one at least.
-            let from = timeline.sample_at(now - allowed).max(stream.next + 1);
+            // the stream goes on from its first frame late by half the
+            // allowance at most, past one at least. The other half is left
+            // for sending it, which a thread just held up often finds slow
+            // as well.
+            let from = timeline.sample_at(now - allowed / 2).max(stream.next + 1);
             let skipped = stream.skip_to(from);
             counters.frames_late.fetch_add(skipped, Ordering::Relaxed);
             continue;

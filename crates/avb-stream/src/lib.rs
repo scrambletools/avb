@@ -17,6 +17,7 @@ pub mod clock;
 pub mod crf;
 pub mod formats;
 pub mod listener;
+mod lock;
 pub mod media;
 mod meter;
 pub mod realtime;

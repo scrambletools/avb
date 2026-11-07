@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "avb-stream"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "atdecc",
  "avb-net",
