@@ -5,7 +5,9 @@
 //! as from a grandmaster with time of its own, is a discontinuity the
 //! streams start again across, once records in a row confirm it; one that
 //! does, as gptpd restarting or taking over as grandmaster, is not,
-//! whatever gptpd numbers it.
+//! whatever gptpd numbers it. The line is read only while something asks
+//! for the time; one nothing read for a while has drifted, and the next
+//! record replaces it at once, as the first does.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Mutex, PoisonError};
@@ -29,6 +31,13 @@ const CARRIED: i64 = 10_000;
 /// discontinuity.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 const CONFIRMATIONS: u8 = 3;
+/// How long the line may go unread and still judge the next record: ten
+/// reads missed. The line runs on at the rate of the record it came from,
+/// and the monotonic clock's rate moves under it, as NTP moves it, so
+/// that after minutes or hours it stands far past [`CARRIED`] from gPTP
+/// time with no discontinuity in gPTP time at all.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const STALE: Duration = Duration::from_secs(1);
 
 /// A new line waiting to be confirmed, and the records in a row that
 /// agreed with it.
@@ -120,7 +129,8 @@ pub struct MediaClock {
     #[cfg(target_os = "linux")]
     source: Option<Mutex<gptp::time::Reader>>,
     line: Line,
-    /// The line is a grandmaster's, not the monotonic clock's.
+    /// The line is a grandmaster's, not the monotonic clock's, and read
+    /// recently enough to judge the next record by.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     held: AtomicBool,
     /// A line that does not carry the current one on, until confirmed.
@@ -132,8 +142,9 @@ pub struct MediaClock {
     /// A grandmaster's time is followed, or this system's given, as gptpd
     /// last said within the second.
     locked: AtomicBool,
-    /// Counts the discontinuities: the first grandmaster's line, and each
-    /// that does not carry the last one on.
+    /// Counts the discontinuities: the first grandmaster's line, the first
+    /// after the line went unread past [`STALE`], and each that does not
+    /// carry the last one on.
     generation: AtomicU32,
     /// How far the last discontinuity moved gPTP time, in nanoseconds.
     last_step: AtomicI64,
@@ -192,10 +203,26 @@ impl MediaClock {
             let Ok(mut reader) = source.try_lock() else {
                 return;
             };
-            self.measured.store(monotonic, Ordering::Relaxed);
+            // Swapped under the reader's lock, the last read's time is the
+            // one before this, not one another thread has just replaced.
+            let last = self.measured.swap(monotonic, Ordering::Relaxed);
             let mapping = reader.read(monotonic).ok().flatten();
-            self.apply(mapping);
+            self.take(mapping, monotonic.saturating_sub(last));
         }
+    }
+
+    /// Takes a mapping read `since` nanoseconds after the read before it.
+    /// A line nothing read for longer than [`STALE`], as while no stream
+    /// ran, says nothing of where the next record should stand, so that
+    /// record goes in at once, as the first does: a stream starting then
+    /// starts on the new line, rather than on the old one until records
+    /// confirm the new and then again across the change.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn take(&self, mapping: Option<Mapping>, since: i64) {
+        if since > STALE.as_nanos() as i64 {
+            self.held.store(false, Ordering::Relaxed);
+        }
+        self.apply(mapping);
     }
 
     /// Takes a mapping read, or none. Without a grandmaster's time the
@@ -435,6 +462,50 @@ mod tests {
         )));
         assert_eq!(clock.generation(), 1);
         assert_eq!(clock.line.gptp_at(3 * SECOND), 1_003 * SECOND);
+    }
+
+    /// A line nothing read for hours has drifted with the monotonic
+    /// clock's rate, and the next record goes in at once, as the first
+    /// does; a record a tenth of a second after its last read still waits
+    /// for confirmation.
+    #[test]
+    fn a_line_unread_for_long_gives_way_at_once() {
+        let clock = MediaClock::monotonic();
+        clock.take(
+            Some(mapping(1, 0, 1_000 * i128::from(SECOND), 1.0)),
+            i64::MAX,
+        );
+        assert_eq!(clock.generation(), 1);
+        // Read again a tenth of a second on, 20 us off: a candidate.
+        clock.take(
+            Some(mapping(
+                1,
+                SECOND / 10,
+                1_000 * i128::from(SECOND) + i128::from(SECOND / 10) + 20_000,
+                1.0,
+            )),
+            SECOND / 10,
+        );
+        assert_eq!(clock.generation(), 1);
+        // Five hours unread, gPTP time where a rate 0.04 ppm off puts it,
+        // 720 us from the line: taken at its first record.
+        let later = 5 * 3600 * SECOND;
+        let base = 1_000 * i128::from(SECOND) + i128::from(later) + 720_000;
+        clock.take(Some(mapping(1, later, base, 1.0)), later - SECOND / 10);
+        assert_eq!(clock.generation(), 2);
+        assert_eq!(clock.line.gptp_at(later), base as i64);
+        assert_eq!(clock.last_step(), 720_000);
+        // The next read, on time and on the new line, carries it on.
+        clock.take(
+            Some(mapping(
+                1,
+                later + SECOND / 10,
+                base + i128::from(SECOND / 10),
+                1.0,
+            )),
+            SECOND / 10,
+        );
+        assert_eq!(clock.generation(), 2);
     }
 
     /// While gptpd says no grandmaster is present the line holds, and the
