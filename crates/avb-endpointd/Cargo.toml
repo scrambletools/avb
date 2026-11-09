@@ -1,7 +1,7 @@
 [package]
 name = "avb-endpointd"
 description = "This computer's AVB entities for any app: the files apps share with the daemon, and, with its feature, the daemon itself"
-version = "0.1.0"
+version = "0.1.1"
 categories = ["network-programming", "multimedia::audio"]
 keywords = ["avb", "atdecc", "milan", "pipewire"]
 edition.workspace = true

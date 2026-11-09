@@ -68,8 +68,11 @@ behavior.
 
 ## The queue
 
+- Since 2026-11-09 the link units give that queue fq_codel instead (the
+  user's decision): on the bench, fq made frames arrive late even
+  unstamped. What follows is what launch time on fq would take.
 - The link units (plaa-link@ and triib-link@ now, avb-link@ with avb-endpointd)
-  give the interface's first transmit queue, the one every CPU's frames
+  gave the interface's first transmit queue, the one every CPU's frames
   go to, its own fq: `tc qdisc replace dev IF root handle 1: mq`, then
   `tc qdisc replace dev IF parent 1:1 fq flow_limit 2000`. An interface
   with one transmit queue, as many Realtek and USB adapters have, has no

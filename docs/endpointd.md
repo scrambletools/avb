@@ -151,9 +151,9 @@ The daemon and the apps no longer ship together, so:
   and triib-link-reset@, with a polkit rule for the active local
   session.
   - At step 1, avb-link@ carries what triib-link@ carries then.
-  - The transmit queue's discipline follows the launch-time decision.
-    The bench found fq on the first queue sends frames late and out of
-    order, and enp2s0 runs a stopgap.
+  - The first transmit queue gets fq_codel, whatever the system's
+    default. The bench found fq there made frames arrive late, stamped
+    or not; departure times wait for a card that keeps them itself.
   - The daemon retries the link unit after a refusal, as it retries
     gptpd's start. Today start_link runs once.
   - While the three names can be live, an active avb-, triib- or
@@ -517,6 +517,8 @@ The link units stay as they are.
 - The configuration lives in `$XDG_CONFIG_HOME/avb-endpointd/`
   (`~/.config`), not triib's data folder, as a file a person may edit
   or back up (the user, 2026-11-08).
+- The link units give the first transmit queue fq_codel, not fq (the
+  user, 2026-11-09).
 - avb-streamd is shelved: the streams' data path stays in avb-endpointd,
   with locked pages and launch time as later steps (the user,
   2026-11-08).
