@@ -36,8 +36,7 @@ It does, as triib-endpointd does now:
   file: ADP, the AEM responder, ACMP, MAAP, MSRP and MVRP in one shared
   participant, CVU SRP for AVB Lite, and gPTP from gptpd;
 - send and receive each entity's streams with avb-stream's threads,
-  under RealtimeKit, as now, until avb-streamd takes the data path
-  (see "With avb-streamd");
+  under RealtimeKit, as now (see "The data path");
 - give each stream output a PipeWire playback device, and each stream
   input a recording device. A stream can instead use a cpal device, a
   tone or silence;
@@ -262,18 +261,46 @@ name = "Host entity 1"
 Each entity's identity in AEM comes from a model file the owning app's
 package installs, `/usr/share/avb-endpointd/models/<model>.toml`:
 
-- the entity model ID, vendor and model names;
+- the vendor and model names;
 - the firmware version, from the app's package version;
-- the logo images;
-- the device checks that go with the model (for triib,
-  `is_device_model`'s).
+- the logo images.
+
+A model file gives no entity model ID. The daemon makes every one as it
+makes triib's now, `DEVICE_MODELS` with a 24-bit hash whose bit 16 is
+always set. The hash covers the streams, the daemon's own revision, and
+the model file's names and logos:
+
+- The model ID changes whenever what controllers cache under it does, as
+  AEM asks: an edit to an entity's streams, or another model. Controllers
+  cache an entity's descriptors by its model ID, so a pinned ID would go
+  stale.
+- The firmware version stays out of the hash. Controllers read it again
+  at each enumeration, as la_avdecc (and so Hive) keeps it with the
+  entity's dynamic state, so a new version shows without a new model ID.
+  Hashed, every release, and every rebuild whose version names a commit,
+  would make each controller read the whole model again for nothing.
+- Two entities with the same streams but different models get different
+  IDs, though both use the one family.
+- All the daemon's model IDs stay in the one registered family, the
+  values of the registry's entity model pool (`8C:1F:64:36:C0:xx:xx:xx`)
+  with bit 16 set, which `is_device_model` checks. A base for each
+  model would need a new pool, and would leave fewer bits for the hash.
 
 Each identity moves out of the daemon's code and into its app's file:
 
-- triib's: today's LOGO, VENDOR_LOGO and `is_device_model`;
-- plaa's: what plaa's entity has now (entity model `0x8c1f6436c0200005`,
-  "Scramble Tools", "plaa", plaa's and the vendor's logos), so
-  controllers see the same entity as before.
+- triib's: today's model name, LOGO and VENDOR_LOGO;
+- plaa's: what plaa's entity shows now ("Scramble Tools", "plaa",
+  plaa's and the vendor's logos).
+
+plaa's entity therefore takes a new model ID, in place of
+`0x8c1f6436c0200005`. The daemon serves its own descriptor tree for
+it, which differs from plaa's own.rs, such as in media clock inputs as
+clock sources and dynamic input mappings, so controllers must read it
+afresh. That costs a read of the new model once. plaa's entity ID
+(instance 0x70) stays, and so does every binding by entity ID and
+stream index. Its stream ID follows the daemon's rule. When plaa moves
+onto the daemon, it tells the ESP session that the model ID and the
+stream ID change, and the registry retires plaa's model block.
 
 A model the daemon can't find falls back to a generic one, and the
 status says so.
@@ -388,17 +415,26 @@ On Windows there is no entity, as decided.
   steps aside from MRP on its own MAC as now, so an old plaa and a new
   daemon don't fight.
 
-## With avb-streamd
+## The data path
 
-avb-endpointd is the program that `streamd.md` describes:
+The stream threads stay in the daemon, with no second daemon for them
+(avb-streamd is shelved; `streamd.md` says why). Two later steps make
+their timing firmer:
 
-- It keeps AVDECC, MRP, MAAP and the audio devices.
-- It hands each stream's data path to `avb-streamd@<interface>` through
-  avb-stream's client once that exists.
-- Its devices' buffers become streamd's rings.
-- With streamd, the link units give way to streamd's link setup.
+- **Locked pages:** the daemon locks (mlock) and touches ahead of time
+  only what the stream threads use, their stacks, rings and frame
+  buffers, so a page fault never holds one up. That stays under the
+  8 MiB a user unit may lock (systemd's DefaultLimitMEMLOCK, 8388608).
+  The package sets `vm.compact_unevictable_allowed = 0`, so compaction
+  leaves locked pages alone. This waits on the pages being counted.
+- **Launch time** (`launch-time.md`), once gptpd's follow-tai keeps the
+  PTP hardware clock near CLOCK_TAI: the link units, as root, put mqprio
+  and ETF on the interface, and avb-netraw sets SO_TXTIME with
+  CLOCK_TAI on a stream's socket before passing it over, as a clock
+  other than CLOCK_MONOTONIC takes CAP_NET_ADMIN. Giving avb-netraw
+  `cap_net_admin` is the user's decision.
 
-Nothing here waits on streamd.
+The link units stay as they are.
 
 ## Packaging
 
@@ -426,6 +462,8 @@ Nothing here waits on streamd.
   - two owners and the daemon changing one file under the lock;
   - instances pinned on import;
   - a missing model;
+  - model IDs: the same streams under two models, and an edit to the
+    streams, each give a new ID, and a new firmware version doesn't;
   - importing triib's file;
   - stable node names.
 - **One host:**
@@ -479,6 +517,9 @@ Nothing here waits on streamd.
 - The configuration lives in `$XDG_CONFIG_HOME/avb-endpointd/`
   (`~/.config`), not triib's data folder, as a file a person may edit
   or back up (the user, 2026-11-08).
+- avb-streamd is shelved: the streams' data path stays in avb-endpointd,
+  with locked pages and launch time as later steps (the user,
+  2026-11-08).
 - plaa on Linux runs its entity only through avb-endpointd, and its
   packages depend on it (the user, 2026-11-08). The in-process entity,
   its MRP sharing and step-aside code, and plaa-netraw go.
