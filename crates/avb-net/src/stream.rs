@@ -809,7 +809,8 @@ mod tests {
             ]),
             None
         );
-        // As the link units make it: mq 1:, fq at 1:1.
+        // mq 1: with fq at 1:1, as the link units made it before they
+        // set fq_codel there (2026-11-09).
         assert_eq!(
             paced(&[
                 discipline(0x0001_0000, root, "mq", None),
