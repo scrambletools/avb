@@ -1,0 +1,37 @@
+[Unit]
+Description=AVB entities on %i
+Documentation=https://github.com/scrambletools/avb/blob/main/docs/endpointd.md
+# Its devices are in the session's PipeWire, and start again with it.
+After=pipewire.service graphical-session.target
+Wants=pipewire.service
+PartOf=pipewire.service graphical-session.target
+
+# Started by an app as it adds the interface's first entity, and enabled
+# so that it starts with the desktop after. With the graphical session
+# only: elsewhere, as under linger or over SSH, polkit refuses gptpd and
+# the link units, and RealtimeKit the streams' priority.
+#
+# With no entities listed it ends at once. The exit statuses that are
+# not crashes, as when another person's daemon holds the interface, the
+# interface is not there or the configuration does not parse, end it
+# without starting again.
+#
+# The instance is the interface's name as it is, %i, as for gptpd@ and
+# the link units: unescaping it, as %I does, would turn a dash into a
+# slash.
+#
+# No hardening that implies NoNewPrivileges: the raw Ethernet helper it
+# starts, avb-netraw, holds CAP_NET_RAW by its file's capability, which
+# NoNewPrivileges would take away.
+[Service]
+Type=exec
+ExecStart=/usr/bin/avb-endpointd --interface %i
+Restart=on-failure
+RestartSec=5
+RestartPreventExitStatus=2 65 68 69
+# The daemon says goodbye on the network, then ends its helpers itself.
+KillMode=mixed
+TimeoutStopSec=15
+
+[Install]
+WantedBy=graphical-session.target

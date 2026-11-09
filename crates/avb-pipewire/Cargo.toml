@@ -1,0 +1,20 @@
+[package]
+name = "avb-pipewire"
+description = "Virtual audio devices on PipeWire for AVB stream inputs and outputs"
+version = "0.1.0"
+categories = ["multimedia::audio"]
+keywords = ["avb", "pipewire", "audio"]
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+avb-stream = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pipewire = "0.10"
