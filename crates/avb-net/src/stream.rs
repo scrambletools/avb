@@ -29,6 +29,35 @@ impl FrameSender {
     pub fn send(&self, frame: &[u8]) -> io::Result<()> {
         self.inner.send(frame)
     }
+
+    /// Has frames sent with [`FrameSender::send_at`] leave at the times
+    /// they carry, on the monotonic clock, where the interface's queue
+    /// discipline holds frames until then (fq does, fq_codel sends them
+    /// at once), and puts them first among the queue's traffic. An error
+    /// leaves the sender as it was.
+    pub fn time_departures(&self) -> io::Result<()> {
+        self.inner.time_departures()
+    }
+
+    /// Sends `frame` to leave at `departure`, in monotonic nanoseconds,
+    /// once [`FrameSender::time_departures`] has taken. A queue with no
+    /// room for it says so as ENOBUFS.
+    pub fn send_at(&self, frame: &[u8], departure: u64) -> io::Result<()> {
+        self.inner.send_at(frame, departure)
+    }
+}
+
+/// How many frames the queue discipline `interface`'s stream frames go
+/// through may hold, where it holds frames until the departure times
+/// they carry: fq or etf at the root, or on the first transmit queue
+/// under mq or mqprio, where every CPU's frames go once the link is set
+/// up for streams. fq takes a packet socket's frames each as a flow of
+/// its own, as it does any unconnected socket's, so its limit for the
+/// whole queue is the one they meet; etf has none, `u32::MAX`. None
+/// where the discipline sends a stamped frame at once, as fq_codel does,
+/// or where it cannot tell.
+pub fn paced_frames(interface: &str) -> Option<u32> {
+    platform::paced_frames(interface)
 }
 
 /// Receives the whole frames of one AVTP stream: frames of an AVTP subtype
@@ -99,7 +128,7 @@ pub fn avtp_payload(frame: &[u8]) -> Option<&[u8]> {
 mod platform {
     use std::io;
     use std::mem::{size_of, zeroed};
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     use std::time::Duration;
 
     use super::{ETHERTYPE_AVTP, ETHERTYPE_VLAN};
@@ -112,6 +141,38 @@ mod platform {
     /// The priority a stream's frames are sent with: class A's in the usual
     /// mqprio maps. Any priority up to 6 needs no capability.
     const SEND_PRIORITY: libc::c_int = 3;
+    /// The priority of frames sent at a departure time: fq's first band in
+    /// its default map, ahead of the queue's other traffic, and the
+    /// highest a program may set without a capability.
+    const TIMED_PRIORITY: libc::c_int = 6;
+    /// SO_TXTIME and its control message, the same on every architecture
+    /// but alpha, mips, parisc and sparc.
+    const SO_TXTIME: libc::c_int = 61;
+    const SCM_TXTIME: libc::c_int = SO_TXTIME;
+
+    /// Sets an option of `fd` to `value`.
+    fn set_option<T>(
+        fd: &OwnedFd,
+        level: libc::c_int,
+        name: libc::c_int,
+        value: &T,
+    ) -> io::Result<()> {
+        // SAFETY: `value` is valid for its size through the call, and the
+        // length passed is that size.
+        let set = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                level,
+                name,
+                (value as *const T).cast(),
+                size_of::<T>() as libc::socklen_t,
+            )
+        };
+        if set < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 
     fn open_raw(interface: &str) -> io::Result<(OwnedFd, i32)> {
         let index = crate::interfaces::index_of(interface).ok_or_else(|| {
@@ -143,6 +204,186 @@ mod platform {
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// A queue discipline found: its handle, its parent's, its kind and,
+    /// for fq, how many frames it holds at most.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct Discipline {
+        pub handle: u32,
+        pub parent: u32,
+        pub kind: String,
+        pub limit: Option<u32>,
+    }
+
+    /// rtnetlink's message types and flags, and the kind's attribute.
+    const RTM_NEWQDISC: u16 = 36;
+    const RTM_GETQDISC: u16 = 38;
+    const NLM_F_REQUEST: u16 = 1;
+    const NLM_F_DUMP: u16 = 0x300;
+    const NLMSG_ERROR: u16 = 2;
+    const NLMSG_DONE: u16 = 3;
+    const TCA_KIND: u16 = 1;
+    const TCA_OPTIONS: u16 = 2;
+    const TCA_FQ_PLIMIT: u16 = 1;
+    /// fq's limit where it does not say.
+    const FQ_LIMIT: u32 = 10_000;
+    /// An attribute's type, less the nested and byte order flags.
+    const TYPE_MASK: u16 = 0x3fff;
+    /// A message's header and a tcmsg.
+    const HEADER_LEN: usize = 16;
+    const TCMSG_LEN: usize = 20;
+    /// The root's parent.
+    const ROOT: u32 = u32::MAX;
+
+    pub fn paced_frames(interface: &str) -> Option<u32> {
+        let index = crate::interfaces::index_of(interface)?;
+        paced(&disciplines(index).ok()?)
+    }
+
+    /// The frames a flow may queue where `found`, an interface's
+    /// disciplines, hold frames until their departure times on its first
+    /// transmit queue.
+    pub(super) fn paced(found: &[Discipline]) -> Option<u32> {
+        let frames = |discipline: &Discipline| match discipline.kind.as_str() {
+            "fq" => Some(discipline.limit.unwrap_or(FQ_LIMIT)),
+            "etf" => Some(u32::MAX),
+            _ => None,
+        };
+        let root = found.iter().find(|discipline| discipline.parent == ROOT)?;
+        match root.kind.as_str() {
+            "mq" | "mqprio" => {
+                // The first queue's class is 1 under the root's handle.
+                let first = (root.handle & 0xffff_0000) | 1;
+                found
+                    .iter()
+                    .find(|discipline| discipline.parent == first)
+                    .and_then(frames)
+            }
+            _ => frames(root),
+        }
+    }
+
+    /// Every queue discipline on interface `index`, asked of rtnetlink,
+    /// which needs no privilege.
+    fn disciplines(index: i32) -> io::Result<Vec<Discipline>> {
+        // SAFETY: socket has no pointer arguments; a descriptor it returns
+        // is ours alone.
+        let raw = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `raw` is an open descriptor no one else owns.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let mut request = [0u8; HEADER_LEN + TCMSG_LEN];
+        request[0..4].copy_from_slice(&((HEADER_LEN + TCMSG_LEN) as u32).to_ne_bytes());
+        request[4..6].copy_from_slice(&RTM_GETQDISC.to_ne_bytes());
+        request[6..8].copy_from_slice(&(NLM_F_REQUEST | NLM_F_DUMP).to_ne_bytes());
+        request[8..12].copy_from_slice(&1u32.to_ne_bytes());
+        // SAFETY: `request` is valid for its length through the call.
+        let sent = unsafe { libc::send(fd.as_raw_fd(), request.as_ptr().cast(), request.len(), 0) };
+        if sent < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let mut found = Vec::new();
+        let mut buffer = vec![0u8; 32 * 1024];
+        loop {
+            // SAFETY: `buffer` is valid for its length through the call.
+            let got =
+                unsafe { libc::recv(fd.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len(), 0) };
+            if got < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if got == 0 || read_disciplines(&buffer[..got as usize], index, &mut found)? {
+                return Ok(found);
+            }
+        }
+    }
+
+    /// The attributes in `bytes`, each its type and value.
+    fn attributes(mut bytes: &[u8]) -> impl Iterator<Item = (u16, &[u8])> {
+        std::iter::from_fn(move || {
+            let size = usize::from(u16::from_ne_bytes(bytes.get(0..2)?.try_into().ok()?));
+            let attribute = u16::from_ne_bytes(bytes.get(2..4)?.try_into().ok()?) & TYPE_MASK;
+            let value = bytes.get(4..size)?;
+            bytes = bytes.get(size.next_multiple_of(4)..).unwrap_or(&[]);
+            Some((attribute, value))
+        })
+    }
+
+    /// Reads one reply's messages into `found`, those of interface
+    /// `index`; true once the dump is done.
+    pub(super) fn read_disciplines(
+        mut bytes: &[u8],
+        index: i32,
+        found: &mut Vec<Discipline>,
+    ) -> io::Result<bool> {
+        let word = |bytes: &[u8], at: usize| {
+            bytes
+                .get(at..at + 4)
+                .map(|word| u32::from_ne_bytes(word.try_into().unwrap_or_default()))
+        };
+        let half = |bytes: &[u8], at: usize| {
+            bytes
+                .get(at..at + 2)
+                .map(|half| u16::from_ne_bytes(half.try_into().unwrap_or_default()))
+        };
+        while let (Some(length), Some(kind)) = (word(bytes, 0), half(bytes, 4)) {
+            let length = length as usize;
+            if length < HEADER_LEN || length > bytes.len() {
+                break;
+            }
+            let message = &bytes[..length];
+            match kind {
+                NLMSG_DONE => return Ok(true),
+                NLMSG_ERROR => {
+                    let code = word(message, HEADER_LEN).unwrap_or(0) as i32;
+                    return Err(io::Error::from_raw_os_error(-code));
+                }
+                RTM_NEWQDISC if message.len() >= HEADER_LEN + TCMSG_LEN => {
+                    let on = word(message, HEADER_LEN + 4).unwrap_or(0) as i32;
+                    let handle = word(message, HEADER_LEN + 8).unwrap_or(0);
+                    let parent = word(message, HEADER_LEN + 12).unwrap_or(0);
+                    if on != index {
+                        bytes = bytes.get(length.next_multiple_of(4)..).unwrap_or(&[]);
+                        continue;
+                    }
+                    let mut named = None;
+                    let mut limit = None;
+                    for (attribute, value) in attributes(&message[HEADER_LEN + TCMSG_LEN..]) {
+                        match attribute {
+                            TCA_KIND => {
+                                let name = value.split(|byte| *byte == 0).next().unwrap_or(value);
+                                named = Some(String::from_utf8_lossy(name).into_owned());
+                            }
+                            TCA_OPTIONS => {
+                                limit = attributes(value)
+                                    .find(|(option, _)| *option == TCA_FQ_PLIMIT)
+                                    .and_then(|(_, limit)| word(limit, 0));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if let Some(named) = named {
+                        found.push(Discipline {
+                            handle,
+                            parent,
+                            limit: limit.filter(|_| named == "fq"),
+                            kind: named,
+                        });
+                    }
+                }
+                _ => {}
+            }
+            bytes = bytes.get(length.next_multiple_of(4)..).unwrap_or(&[]);
+        }
+        Ok(false)
     }
 
     pub struct FrameSender {
@@ -179,6 +420,62 @@ mod platform {
             // SAFETY: `frame` is valid for its length through the call.
             let sent =
                 unsafe { libc::send(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len(), 0) };
+            if sent < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        }
+
+        pub fn time_departures(&self) -> io::Result<()> {
+            // The monotonic clock is the one departure times need no
+            // capability for, and the one fq keeps them on.
+            let timing = libc::sock_txtime {
+                clockid: libc::CLOCK_MONOTONIC,
+                flags: 0,
+            };
+            set_option(&self.fd, libc::SOL_SOCKET, SO_TXTIME, &timing)?;
+            // Without its own priority a timed frame still keeps its time,
+            // behind the queue's other traffic.
+            let _ = set_option(
+                &self.fd,
+                libc::SOL_SOCKET,
+                libc::SO_PRIORITY,
+                &TIMED_PRIORITY,
+            );
+            Ok(())
+        }
+
+        pub fn send_at(&self, frame: &[u8], departure: u64) -> io::Result<()> {
+            let mut part = libc::iovec {
+                iov_base: frame.as_ptr().cast_mut().cast(),
+                iov_len: frame.len(),
+            };
+            // Room for one control message of a u64, aligned as its header.
+            let mut control = [0u64; 4];
+            // SAFETY: CMSG_SPACE only computes a length.
+            let space = unsafe { libc::CMSG_SPACE(size_of::<u64>() as libc::c_uint) } as usize;
+            // SAFETY: msghdr is plain data, valid when zeroed.
+            let mut message: libc::msghdr = unsafe { zeroed() };
+            message.msg_iov = &raw mut part;
+            message.msg_iovlen = 1;
+            message.msg_control = control.as_mut_ptr().cast();
+            message.msg_controllen = space.min(size_of_val(&control)) as _;
+            // SAFETY: the control buffer holds a whole header and its u64,
+            // as CMSG_SPACE said, so the first header and its data lie in
+            // it; the data may sit unaligned for a u64, so it is written
+            // unaligned.
+            unsafe {
+                let header = libc::CMSG_FIRSTHDR(&raw const message);
+                (*header).cmsg_level = libc::SOL_SOCKET;
+                (*header).cmsg_type = SCM_TXTIME;
+                (*header).cmsg_len = libc::CMSG_LEN(size_of::<u64>() as libc::c_uint) as _;
+                libc::CMSG_DATA(header)
+                    .cast::<u64>()
+                    .write_unaligned(departure);
+            }
+            // SAFETY: `message` and what it points to, the frame and the
+            // control buffer, live through the call.
+            let sent = unsafe { libc::sendmsg(self.fd.as_raw_fd(), &raw const message, 0) };
             if sent < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -428,6 +725,10 @@ mod platform {
         )
     }
 
+    pub fn paced_frames(_interface: &str) -> Option<u32> {
+        None
+    }
+
     pub struct FrameSender;
 
     impl FrameSender {
@@ -436,6 +737,14 @@ mod platform {
         }
 
         pub fn send(&self, _frame: &[u8]) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub fn time_departures(&self) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub fn send_at(&self, _frame: &[u8], _departure: u64) -> io::Result<()> {
             Err(unsupported())
         }
     }
@@ -472,6 +781,120 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_paced_first_queue_has_fq_or_etf_under_mq_or_at_the_root() {
+        use platform::{Discipline, paced};
+        let discipline = |handle, parent, kind: &str, limit| Discipline {
+            handle,
+            parent,
+            kind: kind.into(),
+            limit,
+        };
+        let root = u32::MAX;
+        // The kernel's own mq 0:, its first queue's fq at :1.
+        assert_eq!(
+            paced(&[
+                discipline(0, root, "mq", None),
+                discipline(0x8001_0000, 1, "fq", Some(100)),
+            ]),
+            Some(100)
+        );
+        assert_eq!(
+            paced(&[
+                discipline(0, root, "mq", None),
+                discipline(0x8001_0000, 1, "fq_codel", None),
+                discipline(0x8002_0000, 2, "fq", Some(100)),
+            ]),
+            None
+        );
+        // As the link units make it: mq 1:, fq at 1:1.
+        assert_eq!(
+            paced(&[
+                discipline(0x0001_0000, root, "mq", None),
+                discipline(0x800e_0000, 0x0001_0001, "fq", Some(2000)),
+            ]),
+            Some(2000)
+        );
+        assert_eq!(
+            paced(&[discipline(0x8001_0000, root, "fq", None)]),
+            Some(10_000)
+        );
+        assert_eq!(
+            paced(&[discipline(0x8001_0000, root, "etf", None)]),
+            Some(u32::MAX)
+        );
+        assert_eq!(paced(&[discipline(0, root, "noqueue", None)]), None);
+        assert_eq!(paced(&[]), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rtnetlink_replies_give_the_interfaces_own_disciplines() {
+        use platform::{Discipline, read_disciplines};
+        fn attribute(kind: u16, value: &[u8]) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&((4 + value.len()) as u16).to_ne_bytes());
+            bytes.extend_from_slice(&kind.to_ne_bytes());
+            bytes.extend_from_slice(value);
+            bytes.resize(bytes.len().next_multiple_of(4), 0);
+            bytes
+        }
+        fn message(
+            index: i32,
+            handle: u32,
+            parent: u32,
+            name: &str,
+            limit: Option<u32>,
+        ) -> Vec<u8> {
+            let mut body = vec![0u8; 4];
+            body.extend_from_slice(&index.to_ne_bytes());
+            body.extend_from_slice(&handle.to_ne_bytes());
+            body.extend_from_slice(&parent.to_ne_bytes());
+            body.extend_from_slice(&0u32.to_ne_bytes());
+            body.extend(attribute(1, format!("{name}\0").as_bytes()));
+            if let Some(limit) = limit {
+                let mut options = attribute(1, &10_000u32.to_ne_bytes());
+                options.extend(attribute(2, &limit.to_ne_bytes()));
+                // Nested, as the kernel flags it.
+                body.extend(attribute(2 | 0x8000, &options));
+            }
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&((16 + body.len()) as u32).to_ne_bytes());
+            bytes.extend_from_slice(&36u16.to_ne_bytes());
+            bytes.extend_from_slice(&0u16.to_ne_bytes());
+            bytes.extend_from_slice(&[0u8; 8]);
+            bytes.extend_from_slice(&body);
+            bytes
+        }
+        let mut reply = message(2, 0, u32::MAX, "mq", None);
+        reply.extend(message(3, 0, u32::MAX, "noqueue", None));
+        reply.extend(message(2, 0x8001_0000, 1, "fq", Some(2000)));
+        let mut found = Vec::new();
+        assert!(!read_disciplines(&reply, 2, &mut found).expect("read"));
+        assert_eq!(
+            found,
+            [
+                Discipline {
+                    handle: 0,
+                    parent: u32::MAX,
+                    kind: "mq".into(),
+                    limit: None,
+                },
+                Discipline {
+                    handle: 0x8001_0000,
+                    parent: 1,
+                    kind: "fq".into(),
+                    limit: Some(10_000),
+                },
+            ]
+        );
+        let mut done = 20u32.to_ne_bytes().to_vec();
+        done.extend_from_slice(&3u16.to_ne_bytes());
+        done.extend_from_slice(&[0u8; 14]);
+        assert!(read_disciplines(&done, 2, &mut found).expect("read"));
+    }
 
     #[test]
     fn payloads_start_after_the_tag_if_there_is_one() {

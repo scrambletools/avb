@@ -7,6 +7,15 @@
 //! together, sample for sample. A media clock stream, CRF, is counted on
 //! the same clock, its timestamps the presentation times of the samples
 //! they fall on. A [`Talker`] is a group of one.
+//!
+//! Asked to, with [`TalkerGroup::start_ahead`], and where the interface's
+//! queue discipline keeps departure times, as fq does, the thread hands
+//! each frame over that far before it is due, stamped with the time it
+//! should leave, and the kernel sends it then. It is off by default: fq
+//! releases frames from a softirq, which a busy computer leaves to a
+//! thread of ordinary priority, and on the bench frames then left late,
+//! together and out of order. The card's own launch time, through ETF,
+//! is the way meant to replace it.
 
 use std::io;
 use std::sync::Arc;
@@ -35,6 +44,14 @@ const ETHERNET_LEN: usize = 18;
 /// nanoseconds: a frame sent later than this before its presentation time
 /// would be late.
 const CROSSING: i64 = 500_000;
+/// How far ahead of its time the thread hands a frame over, stamped with
+/// its departure time, where the socket takes departure times.
+pub const LAUNCH_AHEAD: Duration = Duration::from_millis(2);
+/// A frame handed over after its departure time is stamped this far
+/// past the moment it is handed over instead: fq sends a frame whose
+/// time has passed at once, as a flow of its own, ahead of earlier frames
+/// it is just then releasing, and the stamp keeps it behind them.
+const LATE_STAMP: Duration = Duration::from_micros(20);
 /// The longest the pacing thread sleeps at once, so that it follows a
 /// clock that moved.
 const LONGEST_SLEEP: Duration = Duration::from_millis(20);
@@ -164,13 +181,30 @@ pub struct TalkerGroup {
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
     rate: u32,
+    ahead: Option<Duration>,
 }
 
 impl TalkerGroup {
     /// Starts the group's thread, with room for `places` streams, none
-    /// sending yet.
+    /// sending yet, each frame sent when it is due.
     pub fn start(config: GroupConfig, places: usize, clock: Arc<MediaClock>) -> io::Result<Self> {
+        Self::start_ahead(config, places, clock, None)
+    }
+
+    /// As [`TalkerGroup::start`], handing frames over `ahead` early, or
+    /// each when it is due for none.
+    pub fn start_ahead(
+        config: GroupConfig,
+        places: usize,
+        clock: Arc<MediaClock>,
+        ahead: Option<Duration>,
+    ) -> io::Result<Self> {
         let sender = FrameSender::open(&config.interface)?;
+        // Only where the queue holds a frame until its time: elsewhere a
+        // frame handed over early would leave early.
+        let room = avb_net::stream::paced_frames(&config.interface);
+        let ahead = ahead.filter(|_| room.is_some() && sender.time_departures().is_ok());
+        let launch = ahead.map(|ahead| (ahead, room.unwrap_or(u32::MAX)));
         let stop = Arc::new(AtomicBool::new(false));
         let shared = Arc::new(Shared {
             streams: Lock::new(vec![None; places]),
@@ -186,19 +220,26 @@ impl TalkerGroup {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("talker".into())
-                .spawn(move || run(&config, &shared, &sender, &clock, &stop))?
+                .spawn(move || run(&config, &shared, &sender, &clock, launch, &stop))?
         };
         Ok(TalkerGroup {
             shared,
             stop,
             handle: Some(handle),
             rate,
+            ahead,
         })
     }
 
     /// The sampling rate its source runs at.
     pub fn rate(&self) -> u32 {
         self.rate
+    }
+
+    /// How far ahead of their time frames are handed over, stamped with
+    /// it; none where each is sent when due.
+    pub fn launch_ahead(&self) -> Option<Duration> {
+        self.ahead
     }
 
     /// Starts sending `stream` in `place`, in place of what went there,
@@ -364,15 +405,26 @@ pub struct Talker {
 }
 
 impl Talker {
-    /// Starts sending `config`'s stream on `clock`'s time.
+    /// Starts sending `config`'s stream on `clock`'s time, each frame sent
+    /// when it is due.
     pub fn start(config: TalkerConfig, clock: Arc<MediaClock>) -> io::Result<Self> {
+        Self::start_ahead(config, clock, None)
+    }
+
+    /// As [`Talker::start`], handing frames over `ahead` early, or each
+    /// when it is due for none.
+    pub fn start_ahead(
+        config: TalkerConfig,
+        clock: Arc<MediaClock>,
+        ahead: Option<Duration>,
+    ) -> io::Result<Self> {
         let media = Media::of(config.format).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "not an AAF, AM824 or CRF format this talker sends",
             )
         })?;
-        let group = TalkerGroup::start(
+        let group = TalkerGroup::start_ahead(
             GroupConfig {
                 interface: config.interface,
                 mac: config.mac,
@@ -380,6 +432,7 @@ impl Talker {
             },
             1,
             clock,
+            ahead,
         )?;
         group.set_stream(
             0,
@@ -405,6 +458,12 @@ impl Talker {
 
     pub fn stats(&self) -> TalkerStats {
         self.group.stats(0)
+    }
+
+    /// How far ahead of their time frames are handed over, stamped with
+    /// it; none where each is sent when due.
+    pub fn launch_ahead(&self) -> Option<Duration> {
+        self.group.launch_ahead()
     }
 }
 
@@ -678,6 +737,7 @@ fn run(
     shared: &Shared,
     sender: &FrameSender,
     clock: &MediaClock,
+    launch: Option<(Duration, u32)>,
     stop: &AtomicBool,
 ) {
     precise_sleeps();
@@ -697,6 +757,7 @@ fn run(
     let mut follow: Option<RecoveredClock> = None;
     let mut switched = false;
     let mut generation = clock.generation();
+    let mut ahead = launch.map(|(ahead, _)| ahead);
     while !stop.load(Ordering::Relaxed) {
         let changes = shared.changes.load(Ordering::Relaxed);
         if changes != seen {
@@ -710,6 +771,7 @@ fn run(
             }
             timeline.take(follow.as_ref().and_then(RecoveredClock::fit));
             take_changes(config, shared, &mut running, &mut timeline, clock);
+            ahead = fitting(launch, &running, timeline.rate);
         }
         // The media clock followed moves the samples with it; one that
         // comes, goes or starts again starts them again on it, or on gPTP
@@ -742,7 +804,9 @@ fn run(
             std::thread::sleep(LONGEST_SLEEP);
             continue;
         };
-        let wake = clock.monotonic_at(due);
+        // When the frame should leave, and when the thread hands it over.
+        let departure = clock.monotonic_at(due);
+        let wake = departure.saturating_sub(ahead.unwrap_or_default());
         let now = monotonic_now();
         if wake > now {
             let wait = wake - now;
@@ -796,9 +860,14 @@ fn run(
             counters.frames_late.fetch_add(1, Ordering::Relaxed);
             continue;
         }
+        let stamp = departure.max(monotonic_now() + LATE_STAMP).as_nanos() as u64;
         for destination in &stream.stream.destinations {
             stream.frame[..6].copy_from_slice(&destination.0);
-            match sender.send(&stream.frame) {
+            let sent = match ahead {
+                Some(_) => sender.send_at(&stream.frame, stamp),
+                None => sender.send(&stream.frame),
+            };
+            match sent {
                 Ok(()) => {
                     counters.frames_sent.fetch_add(1, Ordering::Relaxed);
                     stream.media_reset.sent();
@@ -831,6 +900,30 @@ fn run(
             shared.group.underruns.store(empty, Ordering::Relaxed);
         }
     }
+}
+
+/// The head start a group's frames get: as asked, but short enough that
+/// the frames held for their times, every stream's and each copy of one
+/// sent to several listeners, fill no more than half of what the queue
+/// lets one flow, the group's socket, hold.
+fn fitting(
+    launch: Option<(Duration, u32)>,
+    running: &[Option<Running>],
+    rate: u64,
+) -> Option<Duration> {
+    let (ahead, room) = launch?;
+    let per_second: f64 = running
+        .iter()
+        .flatten()
+        .map(|stream| {
+            stream.stream.destinations.len() as f64 * rate as f64
+                / stream.frame_samples().max(1) as f64
+        })
+        .sum();
+    if per_second <= 0.0 {
+        return Some(ahead);
+    }
+    Some(ahead.min(Duration::from_secs_f64(f64::from(room) / 2.0 / per_second)))
 }
 
 /// Starts every stream again on the clock as it is now, which the mr

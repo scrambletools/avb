@@ -1,7 +1,7 @@
 [package]
 name = "avb-net"
 description = "Raw Ethernet for AVB protocols: raw-ether's interfaces, sockets, hardware time stamps and clocks, and AVTP stream frames"
-version = "0.1.3"
+version = "0.1.4"
 categories = ["network-programming", "no-std"]
 keywords = ["avb", "tsn", "ethernet", "raw-socket"]
 edition.workspace = true
