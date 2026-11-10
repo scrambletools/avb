@@ -47,6 +47,8 @@ pub enum Source {
 
 /// A buffer another part of the program fills or drains as an audio
 /// device would, on its own clock: `channels` channels at `rate` hertz.
+/// A stream of other channels takes its first channels, as many as it
+/// has, and leaves silence in those past its own.
 #[derive(Clone)]
 pub struct SharedBuffer {
     pub buffer: Arc<FrameBuffer>,
@@ -641,6 +643,8 @@ enum InputKind {
     },
     Device {
         buffer: Arc<FrameBuffer>,
+        /// The buffer's channels, which the resampler works in.
+        width: usize,
         drift: Drift,
         /// Input frames on their way to the resampler, and its output.
         taken: Vec<f32>,
@@ -693,6 +697,7 @@ impl Input {
                 })?;
                 InputKind::Device {
                     buffer,
+                    width: usize::from(channels),
                     drift: Drift::new(
                         channels,
                         DeviceSide::Pushes,
@@ -704,19 +709,14 @@ impl Input {
                 }
             }
             Source::Shared(shared) => {
-                if shared.channels != channels {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "a shared buffer of other channels than the stream's",
-                    ));
-                }
                 // What it held from before goes, so the stream starts from
                 // now rather than behind.
                 shared.buffer.drop_oldest(shared.buffer.level());
                 InputKind::Device {
                     buffer: shared.buffer.clone(),
+                    width: usize::from(shared.channels).max(1),
                     drift: Drift::new(
-                        channels,
+                        shared.channels,
                         DeviceSide::Pushes,
                         f64::from(shared.rate) / f64::from(rate),
                     ),
@@ -766,6 +766,7 @@ impl Input {
             }
             InputKind::Device {
                 buffer,
+                width,
                 drift,
                 taken,
                 made,
@@ -773,13 +774,18 @@ impl Input {
             } => {
                 let frames = out.len() / self.channels.max(1);
                 drift.steer(buffer);
-                taken.resize(drift.wanted(frames) * self.channels, 0.0);
+                taken.resize(drift.wanted(frames) * *width, 0.0);
                 buffer.pull(taken);
                 drift.push(taken);
                 made.clear();
                 drift.make(made, frames);
                 out.fill(0.0);
-                out[..made.len()].copy_from_slice(made);
+                if *width == self.channels.max(1) {
+                    out[..made.len()].copy_from_slice(made);
+                } else {
+                    // A buffer of other channels than the stream's.
+                    respread(made, *width, out, self.channels);
+                }
             }
         }
     }
@@ -855,6 +861,8 @@ const MOST_AHEAD: i64 = 500_000_000;
 struct Playing {
     drift: Drift,
     made: Vec<f32>,
+    /// `made` spread to a shared buffer's channels, where they differ.
+    spread: Vec<f32>,
     /// The presentation time of the next input frame, and gPTP time less
     /// monotonic time, in nanoseconds.
     next_in: Option<i64>,
@@ -875,6 +883,8 @@ struct Playing {
 /// The stream's samples to their sink.
 pub struct Output {
     buffer: Option<Arc<FrameBuffer>>,
+    /// The buffer's channels: the stream's, or a shared buffer's own.
+    width: usize,
     _thread: Option<DeviceThread>,
     playing: Lock<Playing>,
     /// Input frames a second.
@@ -887,15 +897,12 @@ impl Output {
     /// Opens `sink` for `channels` channels at `rate` hertz.
     pub fn open(sink: &Sink, channels: u16, rate: u32) -> io::Result<Self> {
         match sink {
-            Sink::Discard => Ok(Output::new(None, None, channels, rate, rate)),
-            Sink::Shared(shared) if shared.channels != channels => Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "a shared buffer of other channels than the stream's",
-            )),
+            Sink::Discard => Ok(Output::new(None, None, channels, channels, rate, rate)),
             Sink::Shared(shared) => Ok(Output::new(
                 Some(shared.buffer.clone()),
                 None,
                 channels,
+                shared.channels,
                 rate,
                 shared.rate,
             )),
@@ -934,6 +941,7 @@ impl Output {
                     Some(buffer),
                     Some(thread),
                     channels,
+                    channels,
                     rate,
                     device_rate,
                 ))
@@ -941,20 +949,25 @@ impl Output {
         }
     }
 
+    /// An output of the stream's `channels` into `buffer` of `width`
+    /// channels.
     fn new(
         buffer: Option<Arc<FrameBuffer>>,
         thread: Option<DeviceThread>,
         channels: u16,
+        width: u16,
         rate: u32,
         device_rate: u32,
     ) -> Self {
         let nominal = f64::from(rate) / f64::from(device_rate.max(1));
         Output {
             buffer,
+            width: usize::from(width).max(1),
             _thread: thread,
             playing: Lock::new(Playing {
                 drift: Drift::new(channels, DeviceSide::Pulls, nominal),
                 made: Vec::new(),
+                spread: Vec::new(),
                 next_in: None,
                 offset: None,
                 anchor: None,
@@ -994,7 +1007,16 @@ impl Output {
         playing.drift.push(samples);
         playing.made.clear();
         playing.drift.make(&mut playing.made, usize::MAX);
-        buffer.push(&playing.made);
+        let channels = playing.drift.channels;
+        if self.width == channels {
+            buffer.push(&playing.made);
+        } else {
+            // A buffer of other channels than the stream's.
+            let frames = playing.made.len() / channels;
+            playing.spread.resize(frames * self.width, 0.0);
+            respread(&playing.made, channels, &mut playing.spread, self.width);
+            buffer.push(&playing.spread);
+        }
         let frames = samples.len() / playing.drift.channels;
         let frame = 1e9 / f64::from(self.rate);
         if let Some(next) = &mut playing.next_in {
@@ -1136,6 +1158,56 @@ mod tests {
         buffer.pull(&mut out);
         assert_eq!(out[104..], [0.0; 16]);
         assert_eq!(buffer.underruns.load(Ordering::Relaxed), 1);
+    }
+
+    /// Eight channels, each its number from 1, `frames` frames.
+    fn numbered(frames: usize) -> Vec<f32> {
+        (0..frames)
+            .flat_map(|_| (1..=8).map(|channel| channel as f32 / 10.0))
+            .collect()
+    }
+
+    /// A stream of two channels takes the first two of a shared buffer of
+    /// eight, as from a device as wide as the widest format a listener
+    /// takes, while it runs at two.
+    #[test]
+    fn a_stream_takes_the_first_channels_of_a_wider_shared_buffer() {
+        let shared = SharedBuffer {
+            buffer: Arc::new(FrameBuffer::new(8, 480)),
+            channels: 8,
+            rate: 48_000,
+        };
+        let mut input = Input::open(&Source::Shared(shared.clone()), 2, 48_000).expect("opened");
+        shared.buffer.device_push(&numbered(4800));
+        let mut out = vec![9.0; 480 * 2];
+        for _ in 0..4 {
+            input.read(&mut out);
+        }
+        for frame in out.as_chunks::<2>().0 {
+            assert!((frame[0] - 0.1).abs() < 1e-3, "{frame:?}");
+            assert!((frame[1] - 0.2).abs() < 1e-3, "{frame:?}");
+        }
+    }
+
+    /// A stream of two channels fills the first two of a shared buffer of
+    /// eight, leaving silence in the others.
+    #[test]
+    fn a_stream_fills_the_first_channels_of_a_wider_shared_buffer() {
+        let shared = SharedBuffer {
+            buffer: Arc::new(FrameBuffer::new(8, 480)),
+            channels: 8,
+            rate: 48_000,
+        };
+        let output = Output::open(&Sink::Shared(shared.clone()), 2, 48_000).expect("opened");
+        let stereo: Vec<f32> = (0..4800).flat_map(|_| [0.5, -0.5]).collect();
+        output.write(&stereo, None);
+        let mut out = vec![9.0; 480 * 8];
+        shared.buffer.device_pull(&mut out, None);
+        for frame in out.as_chunks::<8>().0 {
+            assert!((frame[0] - 0.5).abs() < 1e-3, "{frame:?}");
+            assert!((frame[1] + 0.5).abs() < 1e-3, "{frame:?}");
+            assert_eq!(frame[2..], [0.0; 6]);
+        }
     }
 
     /// A sine at `hertz` sampled at `rate`, from sample `start` on.
@@ -1327,7 +1399,7 @@ mod tests {
         let rate = 48_000.0;
         let device_rate = rate * (1.0 - 50e-6);
         let buffer = Arc::new(FrameBuffer::new(1, 480));
-        let output = Output::new(Some(buffer.clone()), None, 1, 48_000, 48_000);
+        let output = Output::new(Some(buffer.clone()), None, 1, 1, 48_000, 48_000);
         let tone = |seconds: f64| (TAU as f64 * 100.0 * seconds).sin() as f32 * 0.5;
         let mut played = vec![0.0; chunk];
         let mut chunks = 0;
