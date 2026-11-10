@@ -9,6 +9,12 @@
 //! the audio device, on its own clock, is kept in step by resampling
 //! between the two, the ratio steered by the fill of a buffer between
 //! them.
+//!
+//! With `AVB_STREAM_TIMING` naming a file, each talker's thread writes
+//! there a line a second: how late it woke for its frames, how often it
+//! was already behind, and how long building and sending them took,
+//! counted by the thread itself and written by one of ordinary
+//! priority. Without it, the thread keeps no time of its own.
 
 pub mod aaf;
 pub mod am824;
@@ -23,6 +29,7 @@ mod meter;
 pub mod realtime;
 pub mod recovered;
 pub mod talker;
+mod timing;
 
 pub use clock::MediaClock;
 pub use listener::{GroupListener, Listener, ListenerConfig, ListenerGroup, ListenerStats};

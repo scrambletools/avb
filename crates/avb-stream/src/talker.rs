@@ -34,6 +34,7 @@ use crate::lock::{Guard, Lock};
 use crate::media::{Media, Packetizer};
 use crate::meter::Peaks;
 use crate::recovered::{Fit, RecoveredClock, div_ceil};
+use crate::timing::Timing;
 
 /// The VLAN tag's ethertype, and AVTP's.
 const ETHERTYPE_VLAN: u16 = 0x8100;
@@ -758,6 +759,7 @@ fn run(
     let mut switched = false;
     let mut generation = clock.generation();
     let mut ahead = launch.map(|(ahead, _)| ahead);
+    let mut timing = Timing::start(monotonic_now());
     while !stop.load(Ordering::Relaxed) {
         let changes = shared.changes.load(Ordering::Relaxed);
         if changes != seen {
@@ -808,6 +810,9 @@ fn run(
         let departure = clock.monotonic_at(due);
         let wake = departure.saturating_sub(ahead.unwrap_or_default());
         let now = monotonic_now();
+        // How late the thread woke from its sleep, where timing is kept;
+        // none where it was behind already.
+        let mut woke = None;
         if wake > now {
             let wait = wake - now;
             std::thread::sleep(wait.min(LONGEST_SLEEP));
@@ -821,7 +826,11 @@ fn run(
                 }
                 continue;
             }
+            if timing.on() {
+                woke = Some(monotonic_now().saturating_sub(wake));
+            }
         }
+        let handover = timing.on().then(monotonic_now);
         let Some(stream) = running[place].as_mut() else {
             continue;
         };
@@ -861,6 +870,7 @@ fn run(
             continue;
         }
         let stamp = departure.max(monotonic_now() + LATE_STAMP).as_nanos() as u64;
+        let built = timing.on().then(monotonic_now);
         for destination in &stream.stream.destinations {
             stream.frame[..6].copy_from_slice(&destination.0);
             let sent = match ahead {
@@ -876,6 +886,10 @@ fn run(
                     counters.send_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+        if let (Some(handover), Some(built)) = (handover, built) {
+            let sent = monotonic_now();
+            timing.frame(sent, woke, built - handover, sent - built);
         }
         stream.next += stream.frame_samples();
         frames += 1;
