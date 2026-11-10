@@ -312,11 +312,18 @@ impl Port {
         }
     }
 
-    /// Whether it still waits at `now`, having just come up, for the
-    /// neighbor's Domain declarations or for asCapable.
-    fn settling(&self, now: Duration) -> bool {
-        (self.domains.is_empty() || !self.status.as_capable)
-            && self.settling_until.is_some_and(|until| now < until)
+    /// Whether, having just come up, it still holds back at `now` a
+    /// talker of SR class `class_id`, waiting for asCapable and for the
+    /// neighbor's Domain declaration of that class, which may come in a
+    /// later MRPDU than another class's. A talker of no class the bridge
+    /// supports waits for any Domain.
+    fn holds_talker(&self, now: Duration, class_id: Option<u8>) -> bool {
+        let waiting = !self.status.as_capable
+            || match class_id {
+                Some(class_id) => !self.domains.contains_key(&class_id),
+                None => self.domains.is_empty(),
+            };
+        waiting && self.settling_until.is_some_and(|until| now < until)
     }
 
     /// Forgets all registrations and declarations, as the port's
@@ -601,15 +608,18 @@ impl Bridge {
             let plan = streams::plan(&self.config, &self.ports, &self.forwarded);
             let mut vlan_plan = vlans::plan(&self.config, &self.ports);
             let mut stream_plan = plan.declarations;
+            let classes = &self.config.classes;
             for (port_id, port) in self.ports.iter_mut() {
-                let settling = port.settling(now);
-                if let Some(participant) = port.msrp.as_mut() {
+                if port.msrp.is_some() {
                     let mut wanted = stream_plan.remove(port_id).unwrap_or_default();
-                    if settling {
-                        wanted
-                            .retain(|(attribute_type, _), _| msrp::twin(*attribute_type).is_none());
+                    wanted.retain(|(attribute_type, _), (value, _)| {
+                        msrp::twin(*attribute_type).is_none()
+                            || !port
+                                .holds_talker(now, talker_class(classes, *attribute_type, value))
+                    });
+                    if let Some(participant) = port.msrp.as_mut() {
+                        declare(participant, &mut port.declared_msrp, wanted, now);
                     }
-                    declare(participant, &mut port.declared_msrp, wanted, now);
                 }
                 if let Some(participant) = port.mvrp.as_mut() {
                     let wanted = vlan_plan.remove(port_id).unwrap_or_default();
@@ -731,6 +741,16 @@ impl Bridge {
         }
         self.boundaries = boundaries;
     }
+}
+
+/// The SR class of the talker in a Talker Advertise or Failed value, by
+/// its priority: `None` where no class the bridge supports has it.
+fn talker_class(classes: &[SrClass], attribute_type: u8, value: &[u8]) -> Option<u8> {
+    let talker = msrp::decode_talker(attribute_type, value, Event::JoinIn)?;
+    classes
+        .iter()
+        .find(|class| class.domain.priority == talker.priority)
+        .map(|class| class.domain.class_id)
 }
 
 /// Makes `participant` declare `wanted`, withdrawing what it declared

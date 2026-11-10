@@ -532,6 +532,66 @@ fn a_port_coming_up_fails_no_talker_before_its_neighbors_domains() {
     assert_eq!(heard.last(), Some(&Some(false)));
 }
 
+/// A neighbor whose class B Domain comes in a later MRPDU than its class
+/// A one has no class B talker declared to it as failed meanwhile, and a
+/// class A talker goes out without waiting for class B's Domain.
+#[test]
+fn a_port_coming_up_holds_each_class_until_its_own_domain() {
+    let mut bridge = bridge_with(&[(1, gigabit())]);
+    let mut talker = Station::new(1, 27);
+    let class_a = advertise(STREAM, 224);
+    let class_b = TalkerDeclaration {
+        priority: Domain::CLASS_B.priority,
+        ..advertise(STREAM + 1, 224)
+    };
+    talker.talk(0, &class_a);
+    talker.talk(0, &class_b);
+    run(&mut bridge, &mut [&mut talker], 0, 1000);
+    bridge.set_port(ms(1000), PortId(2), gigabit());
+    let mut listener = Station::new(2, 28);
+    listener
+        .msrp
+        .withdraw(ms(1000), msrp::attribute::DOMAIN, &[CLASS_B]);
+    let mut heard_a = Vec::new();
+    let mut heard_b = Vec::new();
+    for at in (1000..3000).step_by(10) {
+        if at == 1500 {
+            listener.msrp.declare(
+                ms(at),
+                msrp::attribute::DOMAIN,
+                Domain::CLASS_B.value(),
+                None,
+            );
+        }
+        run(&mut bridge, &mut [&mut talker, &mut listener], at, at);
+        for (heard, stream_id) in [
+            (&mut heard_a, class_a.stream_id),
+            (&mut heard_b, class_b.stream_id),
+        ] {
+            heard.push(
+                listener
+                    .talker(stream_id)
+                    .map(|talker| talker.failure.is_some()),
+            );
+        }
+    }
+    assert!(
+        !heard_b.contains(&Some(true)),
+        "a class B Talker Failed came first"
+    );
+    assert!(
+        !heard_a.contains(&Some(true)),
+        "a class A Talker Failed came first"
+    );
+    assert_eq!(heard_b[..50], [None; 50], "class B waits for its Domain");
+    assert!(
+        heard_a[..50].contains(&Some(false)),
+        "class A waits for no other class's Domain"
+    );
+    assert_eq!(heard_a.last(), Some(&Some(false)));
+    assert_eq!(heard_b.last(), Some(&Some(false)));
+}
+
 /// A neighbor that declares no Domain at all is a boundary once the wait
 /// for it is over, as it was without the wait.
 #[test]
