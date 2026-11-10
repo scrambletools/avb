@@ -16,9 +16,10 @@ daemon, a GUI, or firmware on a microcontroller.
 | `avb-mrp` | IEEE 802.1Q MRP (applicant, registrar, LeaveAll, periodic timers), MSRP and MVRP, and a port's participant shared between programs on one computer; with the `bridge` feature, a bridge's MSRP and MVRP: attribute propagation between ports, stream admission, and the forwarding and idle slope changes that follow |
 | `avb-net` | Raw Ethernet for AVB: `raw-ether`'s interfaces, frames, multicast membership, hardware time stamps, the PTP hardware clock, link settings and captures, under the paths AVB crates use, and whole frames for AVTP streams |
 | `avb-stream` | AVTP audio: AAF and AM824 talkers and listeners paced on gPTP time, CRF media clock streams, and audio to and from the computer's devices through cpal |
-| `avb-pipewire` | Virtual audio devices on PipeWire for stream outputs and inputs, which apps play into or record from |
-| `avb-endpointd` | This computer's entities for any app: the configuration, status and meters files apps share with the daemon, and with the `daemon` feature the daemon, one per interface, as the person's `avb-endpointd@<interface>` unit (see `docs/endpointd.md`) |
-| `avb-netraw` | The one program granted `CAP_NET_RAW`, which opens raw sockets for the daemon and the apps |
+
+`avb-endpointd`, the daemon that runs this computer's entities for any
+app, with `avb-pipewire` and `avb-netraw`, began here and is now in
+[Linux-AVB-Endpoint](https://github.com/scrambletools/Linux-AVB-Endpoint).
 
 ## Rules for the protocol crates
 
@@ -47,8 +48,6 @@ daemon, a GUI, or firmware on a microcontroller.
    ESP32-C6).
 
 `avb-stream` is for computers: it needs std, threads and an audio device.
-`avb-pipewire` and the daemon are for Linux with PipeWire. The units the
-daemon runs with are in `packaging/linux/units`.
 
 ## Using them
 

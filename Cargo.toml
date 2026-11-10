@@ -16,7 +16,6 @@ atdecc = { path = "crates/atdecc", version = "0.2.0", default-features = false }
 avb-mrp = { path = "crates/avb-mrp", version = "0.1.4", default-features = false }
 avb-net = { path = "crates/avb-net", version = "0.1.4", default-features = false }
 avb-stream = { path = "crates/avb-stream", version = "0.3.4" }
-avb-pipewire = { path = "crates/avb-pipewire", version = "0.1.0" }
 # In its own repository, scrambletools/gptp.
 gptp = { version = "0.1.0", default-features = false }
 
