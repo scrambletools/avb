@@ -47,6 +47,7 @@ app, with `avb-pipewire` and `avb-netraw`, began here and is now in
    `--no-default-features` for `riscv32imac-unknown-none-elf` (the
    ESP32-C6).
 
+`avb-lite` keeps to them too, with no `std` feature of its own.
 `avb-stream` is for computers: it needs std, threads and an audio device.
 
 ## Using them
@@ -95,6 +96,7 @@ cargo test --workspace
 cargo test -p avb-mrp --features bridge
 cargo build -p avb-net -p atdecc -p avb-mrp --no-default-features --target riscv32imac-unknown-none-elf
 cargo build -p avb-mrp --no-default-features --features bridge --target riscv32imac-unknown-none-elf
+cargo build -p avb-lite --target riscv32imac-unknown-none-elf
 ```
 
 On Linux, `avb-stream` builds against ALSA's headers (`libasound2-dev`,
