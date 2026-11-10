@@ -359,6 +359,8 @@ pub struct Bridge {
     forwarded: BTreeMap<(PortId, u64), Forwarded>,
     idle_slopes: BTreeMap<(PortId, u8), u64>,
     boundaries: BTreeSet<(PortId, u8)>,
+    /// The LeaveTime of each port that has one of its own.
+    leave_times: BTreeMap<PortId, Duration>,
     /// Registrations or ports changed since attributes last propagated.
     stale: bool,
     outgoing: VecDeque<Transmit>,
@@ -376,6 +378,7 @@ impl Bridge {
             forwarded: BTreeMap::new(),
             idle_slopes: BTreeMap::new(),
             boundaries: BTreeSet::new(),
+            leave_times: BTreeMap::new(),
             stale: false,
             outgoing: VecDeque::new(),
             changes: VecDeque::new(),
@@ -392,6 +395,11 @@ impl Bridge {
     pub fn set_port(&mut self, now: Duration, port: PortId, status: PortStatus) {
         let seed = self.seed;
         let mvrp = self.config.mvrp;
+        let leave_time = self
+            .leave_times
+            .get(&port)
+            .copied()
+            .unwrap_or(crate::participant::LEAVE_TIME);
         let entry = self
             .ports
             .entry(port)
@@ -409,10 +417,13 @@ impl Bridge {
             entry.clear();
             if status.enabled {
                 let port_seed = seed ^ u64::from(port.0).wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                let mut msrp =
-                    Participant::new(msrp::FORMAT, now, port_seed).with_twins(msrp::twin);
-                let mut mvrp =
-                    mvrp.then(|| Participant::new(mvrp::FORMAT, now, port_seed.rotate_left(17)));
+                let mut msrp = Participant::new(msrp::FORMAT, now, port_seed)
+                    .with_twins(msrp::twin)
+                    .with_leave_time(leave_time);
+                let mut mvrp = mvrp.then(|| {
+                    Participant::new(mvrp::FORMAT, now, port_seed.rotate_left(17))
+                        .with_leave_time(leave_time)
+                });
                 // A LeaveAll at once has the neighbor declare all again
                 // within its JoinTime: one that kept registering what an
                 // earlier participant declared, as across the daemon's
@@ -433,6 +444,23 @@ impl Bridge {
         }
         self.stale = true;
         self.propagate(now);
+    }
+
+    /// Gives `port` a LeaveTime of its own, for its MSRP and MVRP
+    /// participants now and whenever it comes up again: longer than the
+    /// usual 800 ms on a link that loses frames now and then, such as a
+    /// Wi-Fi station's, so a registration a missed LeaveAll started
+    /// leaving lasts until the station's next periodic declaration.
+    pub fn set_leave_time(&mut self, port: PortId, leave_time: Duration) {
+        self.leave_times.insert(port, leave_time);
+        if let Some(entry) = self.ports.get_mut(&port) {
+            for participant in [entry.msrp.as_mut(), entry.mvrp.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                participant.set_leave_time(leave_time);
+            }
+        }
     }
 
     /// Takes `port` off the bridge, with all it registered.

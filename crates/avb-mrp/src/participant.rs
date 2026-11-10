@@ -15,8 +15,9 @@ use crate::mrpdu::{self, Event, Format, Message};
 /// JoinTime (10.7.11).
 const JOIN_TIME: Duration = Duration::from_millis(200);
 /// LeaveTime: between 600 ms and 1 s, the registrar keeps a withdrawn
-/// attribute before taking it off (10.7.11).
-const LEAVE_TIME: Duration = Duration::from_millis(800);
+/// attribute before taking it off (10.7.11), unless a port sets its own
+/// with [`Participant::with_leave_time`].
+pub const LEAVE_TIME: Duration = Duration::from_millis(800);
 /// LeaveAllTime, and the spread added to it at random (10.7.11).
 const LEAVE_ALL_TIME: Duration = Duration::from_secs(10);
 const LEAVE_ALL_SPREAD: Duration = Duration::from_secs(5);
@@ -219,6 +220,8 @@ pub struct Participant {
     /// Whether the port's link joins it to one peer only
     /// (operPointToPointMAC), as full-duplex Ethernet does.
     point_to_point: bool,
+    /// How long the registrar keeps a withdrawn attribute.
+    leave_time: Duration,
 }
 
 impl Participant {
@@ -237,6 +240,7 @@ impl Participant {
             events: VecDeque::new(),
             twin: |_| None,
             point_to_point: true,
+            leave_time: LEAVE_TIME,
         };
         participant.leave_all_at = now + participant.leave_all_period();
         participant
@@ -266,6 +270,26 @@ impl Participant {
     pub fn with_twins(mut self, twin: fn(u8) -> Option<u8>) -> Self {
         self.twin = twin;
         self
+    }
+
+    /// Has the registrar keep a withdrawn attribute `leave_time`, rather
+    /// than [`LEAVE_TIME`], before taking it off: longer on a link that
+    /// loses frames now and then, as a Wi-Fi station's does, where a peer
+    /// that missed a LeaveAll declares again only at its next periodic
+    /// transmission, after the usual LeaveTime has run out.
+    pub fn with_leave_time(mut self, leave_time: Duration) -> Self {
+        self.leave_time = leave_time;
+        self
+    }
+
+    /// Sets the registrar's LeaveTime, as [`Self::with_leave_time`] does,
+    /// for attributes that start leaving from now on.
+    pub fn set_leave_time(&mut self, leave_time: Duration) {
+        self.leave_time = leave_time;
+    }
+
+    pub fn leave_time(&self) -> Duration {
+        self.leave_time
     }
 
     fn next_random(&mut self) -> u64 {
@@ -390,7 +414,7 @@ impl Participant {
                 Event::Lv => {
                     if before != Registrar::Mt {
                         attribute.registrar = Registrar::Lv;
-                        attribute.leave_at = Some(now + LEAVE_TIME);
+                        attribute.leave_at = Some(now + self.leave_time);
                     }
                 }
                 // The sender does not declare it: In and Mt only say
@@ -437,7 +461,7 @@ impl Participant {
                 .0;
             if attribute.registrar == Registrar::In {
                 attribute.registrar = Registrar::Lv;
-                attribute.leave_at = Some(now + LEAVE_TIME);
+                attribute.leave_at = Some(now + self.leave_time);
             }
             anxious |= attribute.applicant.anxious();
         }
@@ -1050,5 +1074,43 @@ mod tests {
             left.extend(core::iter::from_fn(|| listener.poll_event()));
         }
         assert!(matches!(left[..], [Registration::Left { .. }]), "{left:?}");
+    }
+
+    /// A registrar given a longer LeaveTime keeps an attribute a LeaveAll
+    /// started leaving past the usual 800 ms, for a peer that missed the
+    /// LeaveAll and declares again only at its next periodic; with no
+    /// declaration it still takes it off once its own LeaveTime is out.
+    #[test]
+    fn a_longer_leave_time_keeps_a_registration_through_a_missed_leave_all() {
+        let mut usual = Participant::new(msrp::FORMAT, ms(0), 8);
+        let mut longer = Participant::new(msrp::FORMAT, ms(0), 8).with_leave_time(ms(3000));
+        assert_eq!(
+            (usual.leave_time(), longer.leave_time()),
+            (LEAVE_TIME, ms(3000))
+        );
+        let mut lefts = Vec::new();
+        for registrar in [&mut usual, &mut longer] {
+            let mut talker = Participant::new(msrp::FORMAT, ms(0), 7);
+            talker.declare(ms(0), msrp::attribute::TALKER_ADVERTISE, advertise(), None);
+            run(&mut talker, registrar, 0, 500);
+            // The registrar's LeaveAll at 600 ms, which the peer misses;
+            // nothing of the peer's arrives after it.
+            registrar.leave_all_at(ms(600));
+            let mut left_at = None;
+            for now in (510..=5000).step_by(10).map(ms) {
+                registrar.handle_timeout(now);
+                while registrar.poll_transmit().is_some() {}
+                while let Some(event) = registrar.poll_event() {
+                    if matches!(event, Registration::Left { .. }) {
+                        left_at.get_or_insert(now);
+                    }
+                }
+            }
+            lefts.push(left_at.expect("taken off in the end"));
+        }
+        // The usual one is off within a second of the LeaveAll; the longer
+        // keeps it past then, and is off by 3 s after it.
+        assert!(lefts[0] <= ms(1500), "{lefts:?}");
+        assert!(lefts[1] > ms(1500) && lefts[1] <= ms(3700), "{lefts:?}");
     }
 }

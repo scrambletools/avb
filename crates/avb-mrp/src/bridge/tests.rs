@@ -592,6 +592,33 @@ fn a_port_coming_up_holds_each_class_until_its_own_domain() {
     assert_eq!(heard_b.last(), Some(&Some(false)));
 }
 
+/// A port given its own LeaveTime has it for its participants now, and
+/// again when it comes up after going down; the others keep the usual.
+#[test]
+fn a_ports_own_leave_time_outlasts_its_participants() {
+    let mut bridge = bridge_with(&[(1, gigabit()), (2, gigabit())]);
+    bridge.set_leave_time(PortId(2), ms(3000));
+    let leave_times = |bridge: &Bridge, port: u32| {
+        let entry = &bridge.ports[&PortId(port)];
+        [entry.msrp.as_ref(), entry.mvrp.as_ref()]
+            .into_iter()
+            .flatten()
+            .map(Participant::leave_time)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(leave_times(&bridge, 2), [ms(3000), ms(3000)]);
+    assert_eq!(
+        leave_times(&bridge, 1),
+        [
+            crate::participant::LEAVE_TIME,
+            crate::participant::LEAVE_TIME
+        ]
+    );
+    bridge.set_port(ms(1000), PortId(2), PortStatus::down());
+    bridge.set_port(ms(2000), PortId(2), gigabit());
+    assert_eq!(leave_times(&bridge, 2), [ms(3000), ms(3000)]);
+}
+
 /// A neighbor that declares no Domain at all is a boundary once the wait
 /// for it is over, as it was without the wait.
 #[test]
