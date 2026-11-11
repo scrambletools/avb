@@ -830,7 +830,12 @@ fn run(
                 woke = Some(monotonic_now().saturating_sub(wake));
             }
         }
+        // Every frame's lateness, slept to or behind, and those left out
+        // below as well, where timing is kept.
         let handover = timing.on().then(monotonic_now);
+        if let Some(handover) = handover {
+            timing.handed(handover, departure, woke);
+        }
         let Some(stream) = running[place].as_mut() else {
             continue;
         };
@@ -849,6 +854,7 @@ fn run(
             let from = timeline.sample_at(now - allowed / 2).max(stream.next + 1);
             let skipped = stream.skip_to(from);
             counters.frames_late.fetch_add(skipped, Ordering::Relaxed);
+            timing.skipped(skipped);
             continue;
         }
         if let Some(input) = &mut stream.input {
@@ -867,6 +873,7 @@ fn run(
         if clock.now() - due > allowed {
             stream.next += stream.frame_samples();
             counters.frames_late.fetch_add(1, Ordering::Relaxed);
+            timing.skipped(1);
             continue;
         }
         let stamp = departure.max(monotonic_now() + LATE_STAMP).as_nanos() as u64;
@@ -889,7 +896,7 @@ fn run(
         }
         if let (Some(handover), Some(built)) = (handover, built) {
             let sent = monotonic_now();
-            timing.frame(sent, woke, built - handover, sent - built);
+            timing.sent(built - handover, sent - built);
         }
         stream.next += stream.frame_samples();
         frames += 1;

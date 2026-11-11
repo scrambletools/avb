@@ -12,9 +12,10 @@
 //!
 //! With `AVB_STREAM_TIMING` naming a file, each talker's thread writes
 //! there a line a second: how late it woke for its frames, how often it
-//! was already behind, and how long building and sending them took,
-//! counted by the thread itself and written by one of ordinary
-//! priority. Without it, the thread keeps no time of its own.
+//! was already behind, how long building and sending them took, how late
+//! each was handed over against its departure, and how many it left out
+//! as too late, counted by the thread itself and written by one of
+//! ordinary priority. Without it, the thread keeps no time of its own.
 
 pub mod aaf;
 pub mod am824;
