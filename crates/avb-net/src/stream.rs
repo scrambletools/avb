@@ -388,6 +388,8 @@ mod platform {
 
     pub struct FrameSender {
         fd: OwnedFd,
+        /// Where each frame goes: the interface, the frame named as AVTP.
+        to: libc::sockaddr_ll,
     }
 
     impl FrameSender {
@@ -395,12 +397,24 @@ mod platform {
             let (fd, index) = open_raw(interface)?;
             // Bound for no protocol: it sends, and hears nothing.
             bind(&fd, index, 0)?;
-            // Under the default mq and fq_codel, a frame's priority files it
-            // before its hash does, and the hash takes in the AVTP header:
-            // with no priority, each frame of a stream can land in a flow of
-            // its own and leave out of order when the queue backs up. With
-            // one, they share one flow and keep their order. A refusal
-            // leaves them as they were.
+            // Each frame is sent named as AVTP, whatever its VLAN tag, so
+            // that the kernel's hash of it, by which fq_codel files it in a
+            // flow and a transmit queue is chosen, is the same for every
+            // frame: a stream keeps to one flow and one queue, and its
+            // frames keep their order when the queue backs up. Named by
+            // their first ethertype, the VLAN tag's, the hash took in the
+            // AVTP header and put nearly every frame in a flow of its own.
+            // The priority does not help there: fq_codel files by it only
+            // where it names fq_codel's own handle, which a link unit's
+            // fq_codel does not have. Only an nftables egress rule matching
+            // `meta protocol` sees the name rather than the tag.
+            // SAFETY: sockaddr_ll is plain data, valid when zeroed.
+            let mut to: libc::sockaddr_ll = unsafe { zeroed() };
+            to.sll_family = libc::AF_PACKET as u16;
+            to.sll_protocol = ETHERTYPE_AVTP.to_be();
+            to.sll_ifindex = index;
+            // Priority 3, class A's in the usual mqprio maps. A refusal
+            // leaves it as it was.
             let priority = SEND_PRIORITY;
             // SAFETY: `priority` is a c_int that lives through the call, and
             // the length passed is its size.
@@ -413,13 +427,22 @@ mod platform {
                     size_of::<libc::c_int>() as libc::socklen_t,
                 );
             }
-            Ok(Self { fd })
+            Ok(Self { fd, to })
         }
 
         pub fn send(&self, frame: &[u8]) -> io::Result<()> {
-            // SAFETY: `frame` is valid for its length through the call.
-            let sent =
-                unsafe { libc::send(self.fd.as_raw_fd(), frame.as_ptr().cast(), frame.len(), 0) };
+            // SAFETY: `frame` and `to` are valid for their lengths through
+            // the call.
+            let sent = unsafe {
+                libc::sendto(
+                    self.fd.as_raw_fd(),
+                    frame.as_ptr().cast(),
+                    frame.len(),
+                    0,
+                    (&raw const self.to).cast(),
+                    size_of::<libc::sockaddr_ll>() as libc::socklen_t,
+                )
+            };
             if sent < 0 {
                 return Err(io::Error::last_os_error());
             }
@@ -456,6 +479,9 @@ mod platform {
             let space = unsafe { libc::CMSG_SPACE(size_of::<u64>() as libc::c_uint) } as usize;
             // SAFETY: msghdr is plain data, valid when zeroed.
             let mut message: libc::msghdr = unsafe { zeroed() };
+            // Named as AVTP, as `send` names it; the kernel only reads it.
+            message.msg_name = (&raw const self.to).cast_mut().cast();
+            message.msg_namelen = size_of::<libc::sockaddr_ll>() as libc::socklen_t;
             message.msg_iov = &raw mut part;
             message.msg_iovlen = 1;
             message.msg_control = control.as_mut_ptr().cast();
