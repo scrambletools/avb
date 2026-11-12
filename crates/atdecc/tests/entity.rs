@@ -1679,3 +1679,235 @@ fn the_interface_tells_its_grandmaster_capability() {
     );
     assert_eq!((listener.priority1, listener.clock_class), (255, 255));
 }
+
+/// Two controllers, each with its address, for the lock's tests.
+const FIRST: (EntityId, MacAddress) = (EntityId(0x0200_00ff_fe00_0001), CONTROLLER_MAC);
+const SECOND: (EntityId, MacAddress) = (
+    EntityId(0x0200_00ff_fe00_0002),
+    MacAddress([0x02, 0, 0, 0, 0, 2]),
+);
+
+/// An AEM response an entity sent, and to whom.
+#[derive(Debug)]
+struct Answer {
+    destination: MacAddress,
+    controller: EntityId,
+    unsolicited: bool,
+    command_type: atdecc::AemCommandType,
+    status: AemStatus,
+    payload: Vec<u8>,
+}
+
+/// The AEM responses `entity` has sent since asked last.
+fn aem_answers(entity: &mut Entity) -> Vec<Answer> {
+    std::iter::from_fn(|| entity.poll_transmit())
+        .filter_map(|(destination, bytes)| {
+            let pdu = atdecc::AemPdu::decode(&bytes).ok()?;
+            Some(Answer {
+                destination,
+                controller: pdu.header.controller_entity_id,
+                unsolicited: pdu.unsolicited,
+                command_type: pdu.command_type,
+                status: pdu.status(),
+                payload: pdu.payload.to_vec(),
+            })
+        })
+        .collect()
+}
+
+/// Sends `entity` an AEM command from `controller`: its answer.
+fn aem(
+    entity: &mut Entity,
+    now: Instant,
+    (controller, mac): (EntityId, MacAddress),
+    command_type: atdecc::AemCommandType,
+    payload: &[u8],
+) -> Answer {
+    let command = atdecc::AemPdu {
+        header: AecpHeader {
+            message_type: AecpMessageType::AEM_COMMAND,
+            status: 0,
+            target_entity_id: entity.model().entity_id,
+            controller_entity_id: controller,
+            sequence_id: 9,
+        },
+        unsolicited: false,
+        controller_request: false,
+        command_type,
+        payload,
+    };
+    let mut out = [0; 1500];
+    let length = command.encode(&mut out).unwrap();
+    entity.handle_frame(now, mac, &out[..length]);
+    let mut answers = aem_answers(entity);
+    let at = answers
+        .iter()
+        .position(|answer| !answer.unsolicited && answer.destination == mac)
+        .expect("an answer");
+    answers.swap_remove(at)
+}
+
+/// LOCK_ENTITY's payload, locking `descriptor` 0, or unlocking it.
+fn lock_entity(descriptor: DescriptorType, unlock: bool) -> [u8; 16] {
+    let mut payload = [0; 16];
+    payload[3] = u8::from(unlock);
+    payload[12..14].copy_from_slice(&descriptor.0.to_be_bytes());
+    payload
+}
+
+/// The controller an answer to LOCK_ENTITY says holds the lock.
+fn locked_id(answer: &Answer) -> EntityId {
+    EntityId(u64::from_be_bytes(
+        answer.payload[4..12].try_into().unwrap(),
+    ))
+}
+
+/// A Milan entity locks only as a whole, and is never acquired: LOCK_ENTITY
+/// does what acquiring would (Milan 1.3, 5.4.2.1 and 5.4.2.2).
+#[test]
+fn an_entity_locks_as_a_whole_and_is_never_acquired() {
+    use atdecc::AemCommandType as Aem;
+
+    let mut listener = Entity::new(model(LISTENER, "Listener", false), &[]);
+    listener.start(Instant::ZERO);
+    let now = Instant::ZERO;
+    let acquire = aem(&mut listener, now, FIRST, Aem::ACQUIRE_ENTITY, &[0; 16]);
+    assert_eq!(acquire.status, AemStatus::NOT_SUPPORTED);
+    let input = lock_entity(DescriptorType::STREAM_INPUT, false);
+    let lock = aem(&mut listener, now, FIRST, Aem::LOCK_ENTITY, &input);
+    assert_eq!(lock.status, AemStatus::NOT_SUPPORTED);
+    // Nothing locked: another controller's query finds it free.
+    let query = lock_entity(DescriptorType::ENTITY, true);
+    let free = aem(&mut listener, now, SECOND, Aem::LOCK_ENTITY, &query);
+    assert_eq!(free.status, AemStatus::SUCCESS);
+    assert_eq!(locked_id(&free), EntityId(0));
+
+    let entity = lock_entity(DescriptorType::ENTITY, false);
+    let lock = aem(&mut listener, now, FIRST, Aem::LOCK_ENTITY, &entity);
+    assert_eq!(lock.status, AemStatus::SUCCESS);
+    assert_eq!(locked_id(&lock), FIRST.0);
+    let held = aem(&mut listener, now, SECOND, Aem::LOCK_ENTITY, &query);
+    assert_eq!(held.status, AemStatus::ENTITY_LOCKED);
+    assert_eq!(locked_id(&held), FIRST.0);
+}
+
+/// Sends `entity` an ACMP command for its input 0 from `controller`: the
+/// status of its answer.
+fn bind_command(
+    entity: &mut Entity,
+    now: Instant,
+    message_type: AcmpMessageType,
+    (controller, mac): (EntityId, MacAddress),
+) -> AcmpStatus {
+    let command = Acmpdu::command(message_type, controller, (TALKER, 0), (LISTENER, 0), 4);
+    let mut out = [0; 128];
+    let length = command.encode(&mut out).unwrap();
+    entity.handle_frame(now, mac, &out[..length]);
+    std::iter::from_fn(|| entity.poll_transmit())
+        .find_map(|(_, bytes)| {
+            Acmpdu::decode(&bytes)
+                .ok()
+                .filter(|response| command.is_answered_by(response))
+        })
+        .expect("an answer")
+        .status
+}
+
+/// A locked listener binds and unbinds its inputs for the controller
+/// holding the lock alone (Milan 1.3, 5.5.2.4 and 5.5.2.5).
+#[test]
+fn a_locked_listener_binds_for_its_holder_alone() {
+    use atdecc::AemCommandType as Aem;
+
+    let mut listener = Entity::new(model(LISTENER, "Listener", false), &[]);
+    listener.start(Instant::ZERO);
+    let now = Instant::ZERO;
+    let bound = |listener: &mut Entity| {
+        std::iter::from_fn(|| listener.poll_event())
+            .filter_map(|event| match event {
+                EntityEvent::InputBound { index: 0, binding } => Some(Some(binding.controller)),
+                EntityEvent::InputUnbound { index: 0 } => Some(None),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let entity = lock_entity(DescriptorType::ENTITY, false);
+    let lock = aem(&mut listener, now, FIRST, Aem::LOCK_ENTITY, &entity);
+    assert_eq!(lock.status, AemStatus::SUCCESS);
+
+    let bind = AcmpMessageType::BIND_RX_COMMAND;
+    let unbind = AcmpMessageType::UNBIND_RX_COMMAND;
+    let refused = AcmpStatus::CONTROLLER_NOT_AUTHORIZED;
+    assert_eq!(bind_command(&mut listener, now, bind, SECOND), refused);
+    assert!(bound(&mut listener).is_empty());
+    assert_eq!(
+        bind_command(&mut listener, now, bind, FIRST),
+        AcmpStatus::SUCCESS
+    );
+    assert_eq!(bound(&mut listener), [Some(FIRST.0)]);
+    assert_eq!(bind_command(&mut listener, now, unbind, SECOND), refused);
+    assert!(bound(&mut listener).is_empty());
+    // Its state is anyone's to read, answered to whoever asks.
+    assert_eq!(
+        bind_command(
+            &mut listener,
+            now,
+            AcmpMessageType::GET_RX_STATE_COMMAND,
+            SECOND
+        ),
+        AcmpStatus::SUCCESS
+    );
+
+    let unlock = lock_entity(DescriptorType::ENTITY, true);
+    let unlocked = aem(&mut listener, now, FIRST, Aem::LOCK_ENTITY, &unlock);
+    assert_eq!(unlocked.status, AemStatus::SUCCESS);
+    assert_eq!(
+        bind_command(&mut listener, now, unbind, SECOND),
+        AcmpStatus::SUCCESS
+    );
+    assert_eq!(bound(&mut listener), [None]);
+}
+
+/// A lock not renewed for a minute lets go, and the entity tells the
+/// controllers registered for notifications, and only them (Milan 1.3,
+/// 5.4.2.2 and Table 5.21).
+#[test]
+fn an_entity_unlocking_itself_tells_its_registered_controllers() {
+    use atdecc::AemCommandType as Aem;
+
+    let mut listener = Entity::new(model(LISTENER, "Listener", false), &[]);
+    listener.start(Instant::ZERO);
+    let start = Instant::ZERO;
+    let register = Aem::REGISTER_UNSOLICITED_NOTIFICATION;
+    let registered = aem(&mut listener, start, SECOND, register, &[0; 4]);
+    assert_eq!(registered.status, AemStatus::SUCCESS);
+    let entity = lock_entity(DescriptorType::ENTITY, false);
+    let lock = aem(&mut listener, start, FIRST, Aem::LOCK_ENTITY, &entity);
+    assert_eq!(lock.status, AemStatus::SUCCESS);
+    // Renewed half a minute in, it holds a minute from then.
+    let renewed = start + Duration::from_secs(30);
+    let lock = aem(&mut listener, renewed, FIRST, Aem::LOCK_ENTITY, &entity);
+    assert_eq!(lock.status, AemStatus::SUCCESS);
+    listener.handle_timeout(start + Duration::from_secs(60));
+    assert!(aem_answers(&mut listener).is_empty());
+    let unlocking = renewed + Duration::from_secs(60);
+    listener.handle_timeout(unlocking);
+
+    let notified: Vec<Answer> = aem_answers(&mut listener)
+        .into_iter()
+        .filter(|answer| answer.command_type == Aem::LOCK_ENTITY)
+        .collect();
+    assert_eq!(notified.len(), 1, "{notified:?}");
+    let notice = &notified[0];
+    assert!(notice.unsolicited);
+    assert_eq!(
+        (notice.destination, notice.controller),
+        (SECOND.1, SECOND.0)
+    );
+    assert_eq!(notice.status, AemStatus::SUCCESS);
+    assert_eq!(notice.payload, lock_entity(DescriptorType::ENTITY, true));
+    // It is free.
+    let query = lock_entity(DescriptorType::ENTITY, true);
+    let free = aem(&mut listener, unlocking, SECOND, Aem::LOCK_ENTITY, &query);
+    assert_eq!(locked_id(&free), EntityId(0));
+}

@@ -54,6 +54,8 @@ pub const UNADDRESSED: MacAddress = MacAddress([0; 6]);
 const PROBE_RETRY: Duration = Duration::from_secs(4);
 /// How long a lock lasts without being renewed (Milan 1.3, 5.4.2.2).
 const LOCK_TIME: Duration = Duration::from_secs(60);
+/// LOCK_ENTITY's UNLOCK flag, in the low octet of its flags.
+const LOCK_UNLOCK: u8 = 1;
 /// The default max transit time of a class A stream.
 const MAX_TRANSIT_TIME: u32 = 2_000_000;
 /// A class B stream output's max transit time when none is set, in
@@ -1082,6 +1084,17 @@ impl Entity {
             self.send_acmp(&response);
             return;
         }
+        // Milan 1.3, 5.5.2.4 and 5.5.2.5: a locked entity binds and
+        // unbinds its inputs for the controller holding the lock alone.
+        let binds = matches!(
+            command.message_type,
+            AcmpMessageType::BIND_RX_COMMAND | AcmpMessageType::UNBIND_RX_COMMAND
+        );
+        if binds && !self.may_change(command.controller_entity_id) {
+            response.status = AcmpStatus::CONTROLLER_NOT_AUTHORIZED;
+            self.send_acmp(&response);
+            return;
+        }
         match command.message_type {
             AcmpMessageType::BIND_RX_COMMAND => {
                 let binding = InputBinding {
@@ -1142,14 +1155,15 @@ impl Entity {
         }
     }
 
-    /// The binding and stream of an input, in an ACMP response.
+    /// The binding and stream of an input, in an ACMP response. The
+    /// response keeps the asking controller's ID, not the binding's, so
+    /// any controller may read it (Milan 1.3, Tables 5.37 and 5.42).
     fn fill_rx_state(&self, index: u16, response: &mut Acmpdu) {
         let input = &self.inputs[usize::from(index)];
         match input.binding {
             Some(binding) => {
                 response.talker_entity_id = binding.talker;
                 response.talker_unique_id = binding.talker_unique_id;
-                response.controller_entity_id = binding.controller;
                 response.connection_count = 1;
                 response.flags = binding.flags;
             }
@@ -1244,6 +1258,12 @@ impl Entity {
         }
         if self.lock.is_some_and(|(_, until)| until <= now) {
             self.lock = None;
+            // Milan 1.3, 5.4.2.2 and Table 5.21: the registered
+            // controllers hear that the entity unlocked itself, as an
+            // UNLOCK answered, held by no one.
+            let mut unlocked = [0; 16];
+            unlocked[3] = LOCK_UNLOCK;
+            self.notify(AemCommandType::LOCK_ENTITY, &unlocked, None);
         }
         let expired: Vec<EntityId> = self
             .known
@@ -1429,7 +1449,11 @@ impl Entity {
                 if short(16) {
                     return (AemStatus::BAD_ARGUMENTS, echo(), false);
                 }
-                let unlock = read_u32(payload, 0) & 1 != 0;
+                // Milan 1.3, 5.4.2.2: the entity locks as a whole alone.
+                if DescriptorType(read_u16(payload, 12)) != DescriptorType::ENTITY {
+                    return (AemStatus::NOT_SUPPORTED, echo(), false);
+                }
+                let unlock = read_u32(payload, 0) & u32::from(LOCK_UNLOCK) != 0;
                 let mut answer = echo();
                 let status = match (unlock, self.lock) {
                     (_, Some((holder, _))) if holder != controller => {
@@ -1638,6 +1662,8 @@ impl Entity {
             AemCommandType::ADD_AUDIO_MAPPINGS | AemCommandType::REMOVE_AUDIO_MAPPINGS => {
                 self.change_mappings(command.command_type, payload)
             }
+            // Milan 1.3, 5.4.2.1: LOCK_ENTITY does what acquiring would.
+            AemCommandType::ACQUIRE_ENTITY => (AemStatus::NOT_SUPPORTED, echo(), false),
             _ => (AemStatus::NOT_IMPLEMENTED, echo(), false),
         }
     }
