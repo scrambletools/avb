@@ -9,7 +9,7 @@
 
 pub mod model;
 
-use alloc::collections::{BTreeMap, VecDeque};
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
 use alloc::vec::Vec;
 use core::time::Duration;
 
@@ -262,6 +262,9 @@ pub struct Entity {
     /// Each stream port input's dynamic mappings, by port.
     input_mappings: Vec<Vec<AudioMapping>>,
     known: BTreeMap<EntityId, Known>,
+    /// Talkers the program running it knows to be Milan, which an input
+    /// lets go of without DISCONNECT_TX.
+    milan_talkers: BTreeSet<EntityId>,
     random: Random,
     outgoing: VecDeque<(MacAddress, Vec<u8>)>,
     events: VecDeque<EntityEvent>,
@@ -320,6 +323,7 @@ impl Entity {
             clock_counters: [0; 32],
             interface_counters: [0; 32],
             known: BTreeMap::new(),
+            milan_talkers: BTreeSet::new(),
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -576,6 +580,7 @@ impl Entity {
         self.registered.clone_from(&earlier.registered);
         self.lock = earlier.lock;
         self.known.clone_from(&earlier.known);
+        self.milan_talkers.clone_from(&earlier.milan_talkers);
         self.advertise_at = Some(now);
     }
 
@@ -595,11 +600,31 @@ impl Entity {
         }
     }
 
+    /// Says whether `talker` is a Milan entity, as a controller learns from
+    /// its GET_MILAN_INFO. An input bound to a Milan talker lets go of it
+    /// without DISCONNECT_TX: a Milan talker counts its listeners by their
+    /// MSRP declarations, its probe and disconnect responses counting none
+    /// (Milan 1.3, Tables 5.48 and 5.50), and one that takes the command
+    /// as IEEE 1722.1-2013 has it can drop a listener the network still
+    /// has, and stop streaming to it. A talker not said to be Milan, as
+    /// the Mac's, is told as before.
+    pub fn set_milan_talker(&mut self, talker: EntityId, milan: bool) {
+        if milan {
+            self.milan_talkers.insert(talker);
+        } else {
+            self.milan_talkers.remove(&talker);
+        }
+    }
+
     /// Tells the talker an input was bound to that the input no longer
     /// takes its stream (DISCONNECT_TX): a talker outside Milan, as the
     /// Mac's, keeps the connection a listener's probe made, and streams
-    /// on, until told so.
+    /// on, until told so. A talker known to be Milan is not told
+    /// ([`Entity::set_milan_talker`]).
     fn let_go(&mut self, index: u16, binding: InputBinding) {
+        if self.milan_talkers.contains(&binding.talker) {
+            return;
+        }
         self.acmp_sequence = self.acmp_sequence.wrapping_add(1);
         let command = Acmpdu::command(
             AcmpMessageType::DISCONNECT_TX_COMMAND,

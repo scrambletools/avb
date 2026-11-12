@@ -390,6 +390,42 @@ fn a_listener_leaving_lets_go_of_its_talker() {
     assert_eq!(network.disconnects(), [(TALKER, 0, LISTENER, 0)]);
 }
 
+/// An input lets go of a talker its program knows to be Milan without
+/// DISCONNECT_TX, unbound by a controller or leaving: a Milan talker
+/// counts its listeners by MSRP, and one taking the command could drop a
+/// listener the network still has. Not known as Milan, it is told.
+#[test]
+fn a_listener_tells_no_milan_talker_it_lets_go() {
+    let mut network = Network::new();
+    network.controller.discover(None);
+    network.run(3000);
+    let now = network.now;
+    network.controller.connect(now, (TALKER, 0), (LISTENER, 0));
+    network.run(1000);
+    network.listener.set_milan_talker(TALKER, true);
+
+    network.sent.clear();
+    network.listener.release_inputs(&[]);
+    network.run(100);
+    assert!(network.disconnects().is_empty(), "leaving");
+
+    let now = network.now;
+    network.controller.disconnect(now, (LISTENER, 0));
+    network.run(1000);
+    assert_eq!(network.listener.input_binding(0), None);
+    assert!(network.disconnects().is_empty(), "unbound by a controller");
+
+    // No longer said to be Milan: bound and left again, it is told.
+    network.listener.set_milan_talker(TALKER, false);
+    let now = network.now;
+    network.controller.connect(now, (TALKER, 0), (LISTENER, 0));
+    network.run(1000);
+    network.sent.clear();
+    network.listener.depart();
+    network.run(100);
+    assert_eq!(network.disconnects(), [(TALKER, 0, LISTENER, 0)]);
+}
+
 impl Network {
     /// The DISCONNECT_TX commands the entities sent: talker and output,
     /// listener and input.
