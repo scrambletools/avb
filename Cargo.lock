@@ -210,9 +210,9 @@ dependencies = [
 
 [[package]]
 name = "gptp"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4ae8e6faa2a5ca271c590ab1694dcbc1eda97e49dc5e91a9fb85707fffd59138"
+checksum = "54a135d78e91887574b20b2bab724f024709a75505ec54f0f59bf4eab5504bad"
 
 [[package]]
 name = "hashbrown"
@@ -531,9 +531,9 @@ dependencies = [
 
 [[package]]
 name = "raw-ether"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97ba549cb32f376dba4e784ec16c6e094c5d4bdf59c00da80cba43ceea5ad67c"
+checksum = "0d66ef1a3463d64480a3365492192b67212ac859bb16dde19e727eeb0b1c64be"
 dependencies = [
  "libc",
  "windows-sys",

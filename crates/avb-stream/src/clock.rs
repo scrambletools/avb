@@ -8,6 +8,12 @@
 //! whatever gptpd numbers it. The line is read only while something asks
 //! for the time; one nothing read for a while has drifted, and the next
 //! record replaces it at once, as the first does.
+//!
+//! Where gptpd keeps the port's hardware clock near CLOCK_TAI, its record
+//! says so, and a second line gives the card's clock at a gPTP time: the
+//! launch time of a frame due then, for a card that sends frames at their
+//! times. Without it, or while a new line waits to be confirmed, there is
+//! none, and frames are sent when due.
 
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering, fence};
 use std::sync::{Mutex, PoisonError};
@@ -148,6 +154,12 @@ pub struct MediaClock {
     generation: AtomicU32,
     /// How far the last discontinuity moved gPTP time, in nanoseconds.
     last_step: AtomicI64,
+    /// gPTP time against the card's clock, as a line on that clock:
+    /// at card time `at` gPTP time was `base`.
+    card: Line,
+    /// The card's line holds: gptpd keeps the card's clock near CLOCK_TAI
+    /// and the gPTP line is the record's.
+    launching: AtomicBool,
 }
 
 impl MediaClock {
@@ -183,6 +195,8 @@ impl MediaClock {
             locked: AtomicBool::new(false),
             generation: AtomicU32::new(0),
             last_step: AtomicI64::new(0),
+            card: Line::new(),
+            launching: AtomicBool::new(false),
         }
     }
 
@@ -238,6 +252,7 @@ impl MediaClock {
         let Some(mapping) = mapping.filter(|mapping| mapping.state != State::None) else {
             *candidate = None;
             self.locked.store(false, Ordering::Relaxed);
+            self.launching.store(false, Ordering::Relaxed);
             return;
         };
         let base = mapping
@@ -261,12 +276,24 @@ impl MediaClock {
                     seen,
                 });
                 self.locked.store(true, Ordering::Relaxed);
+                // Frames are due on the old line, the card's on the new.
+                self.launching.store(false, Ordering::Relaxed);
                 return;
             }
         }
         *candidate = None;
         self.line
             .store(mapping.monotonic, base, mapping.monotonic_rate);
+        if mapping.tai.is_some() {
+            let clamp = |time: i128| time.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+            self.card.store(
+                clamp(mapping.local),
+                clamp(mapping.at_local),
+                mapping.local_rate,
+            );
+        }
+        self.launching
+            .store(mapping.tai.is_some(), Ordering::Relaxed);
         if !carried {
             self.last_step.store(step, Ordering::Relaxed);
             self.generation.fetch_add(1, Ordering::Relaxed);
@@ -313,6 +340,18 @@ impl MediaClock {
     pub fn monotonic_at(&self, gptp: i64) -> Duration {
         Duration::from_nanos(self.line.monotonic_at(gptp).max(0) as u64)
     }
+
+    /// The card's clock, in nanoseconds on CLOCK_TAI's scale, when gPTP
+    /// time reaches `gptp`: the launch time of a frame due then. None
+    /// where gptpd does not keep the card's clock near CLOCK_TAI, or a new
+    /// line waits to be confirmed.
+    pub fn card_at(&self, gptp: i64) -> Option<u64> {
+        self.refresh(false);
+        if !self.launching.load(Ordering::Relaxed) {
+            return None;
+        }
+        Some(self.card.monotonic_at(gptp).max(0) as u64)
+    }
 }
 
 #[cfg(test)]
@@ -336,6 +375,7 @@ mod tests {
             local_rate: rate,
             asymmetry_included: false,
             residual: Some(12),
+            tai: None,
         }
     }
 
@@ -586,5 +626,59 @@ mod tests {
         for reader in readers {
             reader.join().unwrap();
         }
+    }
+
+    /// The card's line comes only with records saying gptpd keeps the
+    /// card's clock near CLOCK_TAI, and goes while a new gPTP line waits
+    /// to be confirmed.
+    #[test]
+    fn launch_times_only_where_the_card_follows_tai() {
+        let clock = MediaClock::monotonic();
+        let base = 1_000 * i128::from(SECOND);
+        clock.apply(Some(mapping(1, 0, base, 1.0)));
+        assert_eq!(clock.card_at(1_000 * SECOND), None);
+        // The card's clock 1.7e18 ns at gPTP time 1000 s, its rate 1 ppm
+        // over gPTP's.
+        let card = 1_700_000_000 * i128::from(SECOND);
+        let following = |at: i64, gptp: i128| Mapping {
+            local: card + i128::from(at),
+            at_local: gptp,
+            local_rate: 1.0 / (1.0 + 1e-6),
+            tai: Some(-3),
+            ..mapping(1, at, gptp, 1.0)
+        };
+        clock.apply(Some(following(SECOND, base + i128::from(SECOND))));
+        let launch = clock.card_at(1_002 * SECOND).unwrap();
+        let expected = card + i128::from(SECOND) + 1_000_001_000;
+        assert!(
+            (i128::from(launch) - expected).abs() <= 1,
+            "{launch} {expected}"
+        );
+        // A line 20 us off waits for confirmation: no launch times meanwhile.
+        clock.apply(Some(following(
+            2 * SECOND,
+            base + 2 * i128::from(SECOND) + 20_000,
+        )));
+        assert_eq!(clock.card_at(1_002 * SECOND), None);
+        clock.apply(Some(following(
+            3 * SECOND,
+            base + 3 * i128::from(SECOND) + 20_000,
+        )));
+        clock.apply(Some(following(
+            4 * SECOND,
+            base + 4 * i128::from(SECOND) + 20_000,
+        )));
+        assert_eq!(clock.generation(), 2);
+        assert!(clock.card_at(1_005 * SECOND).is_some());
+        // No grandmaster, or a record without tai: none.
+        clock.apply(None);
+        assert_eq!(clock.card_at(1_005 * SECOND), None);
+        clock.apply(Some(mapping(
+            2,
+            5 * SECOND,
+            base + 5 * i128::from(SECOND) + 20_000,
+            1.0,
+        )));
+        assert_eq!(clock.card_at(1_006 * SECOND), None);
     }
 }

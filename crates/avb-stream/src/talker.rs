@@ -14,8 +14,16 @@
 //! should leave, and the kernel sends it then. It is off by default: fq
 //! releases frames from a softirq, which a busy computer leaves to a
 //! thread of ordinary priority, and on the bench frames then left late,
-//! together and out of order. The card's own launch time, through ETF,
-//! is the way meant to replace it.
+//! together and out of order.
+//!
+//! Started on the card instead, with [`TalkerGroup::start_on_card`], the
+//! thread hands each frame over [`CARD_AHEAD`] early, stamped with its
+//! launch time on the card's clock, and the card itself sends it then,
+//! through the ETF queue discipline with offload, however busy the
+//! computer. That takes a socket on CLOCK_TAI, which only a helper
+//! granted CAP_NET_ADMIN gives, and gptpd keeping the card's clock near
+//! CLOCK_TAI; whenever it does not, the frames are sent when due, as
+//! without it.
 
 use std::io;
 use std::sync::Arc;
@@ -53,6 +61,15 @@ pub const LAUNCH_AHEAD: Duration = Duration::from_millis(2);
 /// time has passed at once, as a flow of its own, ahead of earlier frames
 /// it is just then releasing, and the stamp keeps it behind them.
 const LATE_STAMP: Duration = Duration::from_micros(20);
+/// How far ahead of its launch time the thread hands a frame to the
+/// card's queue: past ETF's own lead (its delta, 500 us as the links set
+/// it up), and enough to cover the waits for a CPU seen on a busy
+/// desktop. Frames keep their presentation times.
+pub const CARD_AHEAD: Duration = Duration::from_millis(1);
+/// A frame handed to the card's queue too late for its launch time is
+/// launched this far past the moment instead, in nanoseconds, time for it
+/// to reach the card: ETF drops a frame whose time has passed.
+const CARD_LATE: u64 = 200_000;
 /// The longest the pacing thread sleeps at once, so that it follows a
 /// clock that moved.
 const LONGEST_SLEEP: Duration = Duration::from_millis(20);
@@ -133,6 +150,12 @@ pub struct TalkerStats {
     /// How far the audio device's clock runs from gPTP's, in parts per
     /// million.
     pub drift_ppm: i32,
+    /// Frames go out at their launch times on the card, rather than each
+    /// sent when due.
+    pub launching: bool,
+    /// The group's frames the card's queue dropped, their launch times
+    /// passed or not valid: refused as handed over, or dropped later.
+    pub launches_missed: u64,
 }
 
 /// A stream's own counters, and its audio's peaks.
@@ -153,6 +176,8 @@ struct GroupCounters {
     underruns: AtomicU64,
     realtime: AtomicBool,
     drift_ppm: AtomicI32,
+    launching: AtomicBool,
+    launches_missed: AtomicU64,
 }
 
 /// What the group's owner and its thread share.
@@ -183,6 +208,7 @@ pub struct TalkerGroup {
     handle: Option<JoinHandle<()>>,
     rate: u32,
     ahead: Option<Duration>,
+    card: bool,
 }
 
 impl TalkerGroup {
@@ -201,9 +227,36 @@ impl TalkerGroup {
         ahead: Option<Duration>,
     ) -> io::Result<Self> {
         let sender = FrameSender::open(&config.interface)?;
+        Self::start_with(config, places, clock, sender, ahead, false)
+    }
+
+    /// As [`TalkerGroup::start`], each frame launched by the card at its
+    /// time where it can be, through a socket on CLOCK_TAI and the ETF
+    /// queue discipline, and sent when due where it cannot: without the
+    /// socket, which takes a helper granted CAP_NET_ADMIN, or while gptpd
+    /// does not keep the card's clock near CLOCK_TAI.
+    pub fn start_on_card(
+        config: GroupConfig,
+        places: usize,
+        clock: Arc<MediaClock>,
+    ) -> io::Result<Self> {
+        match FrameSender::open_for_card(&config.interface) {
+            Ok(sender) => Self::start_with(config, places, clock, sender, None, true),
+            Err(_) => Self::start(config, places, clock),
+        }
+    }
+
+    fn start_with(
+        config: GroupConfig,
+        places: usize,
+        clock: Arc<MediaClock>,
+        sender: FrameSender,
+        ahead: Option<Duration>,
+        card: bool,
+    ) -> io::Result<Self> {
         // Only where the queue holds a frame until its time: elsewhere a
         // frame handed over early would leave early.
-        let room = avb_net::stream::paced_frames(&config.interface);
+        let room = ahead.and_then(|_| avb_net::stream::paced_frames(&config.interface));
         let ahead = ahead.filter(|_| room.is_some() && sender.time_departures().is_ok());
         let launch = ahead.map(|ahead| (ahead, room.unwrap_or(u32::MAX)));
         let stop = Arc::new(AtomicBool::new(false));
@@ -221,7 +274,7 @@ impl TalkerGroup {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("talker".into())
-                .spawn(move || run(&config, &shared, &sender, &clock, launch, &stop))?
+                .spawn(move || run(&config, &shared, &sender, &clock, launch, card, &stop))?
         };
         Ok(TalkerGroup {
             shared,
@@ -229,6 +282,7 @@ impl TalkerGroup {
             handle: Some(handle),
             rate,
             ahead,
+            card,
         })
     }
 
@@ -241,6 +295,13 @@ impl TalkerGroup {
     /// it; none where each is sent when due.
     pub fn launch_ahead(&self) -> Option<Duration> {
         self.ahead
+    }
+
+    /// Whether its socket takes launch times on the card's clock, so
+    /// that its frames are launched by the card whenever gptpd keeps that
+    /// clock near CLOCK_TAI.
+    pub fn on_card(&self) -> bool {
+        self.card
     }
 
     /// Starts sending `stream` in `place`, in place of what went there,
@@ -337,6 +398,8 @@ impl TalkerGroup {
             send_errors,
             realtime: group.realtime.load(Ordering::Relaxed),
             drift_ppm: group.drift_ppm.load(Ordering::Relaxed),
+            launching: group.launching.load(Ordering::Relaxed),
+            launches_missed: read(&group.launches_missed),
         }
     }
 
@@ -419,22 +482,35 @@ impl Talker {
         clock: Arc<MediaClock>,
         ahead: Option<Duration>,
     ) -> io::Result<Self> {
+        Self::start_as(config, clock, Departures::Ahead(ahead))
+    }
+
+    /// As [`Talker::start`], each frame launched by the card at its time
+    /// where it can be (see [`TalkerGroup::start_on_card`]).
+    pub fn start_on_card(config: TalkerConfig, clock: Arc<MediaClock>) -> io::Result<Self> {
+        Self::start_as(config, clock, Departures::Card)
+    }
+
+    fn start_as(
+        config: TalkerConfig,
+        clock: Arc<MediaClock>,
+        departures: Departures,
+    ) -> io::Result<Self> {
         let media = Media::of(config.format).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 "not an AAF, AM824 or CRF format this talker sends",
             )
         })?;
-        let group = TalkerGroup::start_ahead(
-            GroupConfig {
-                interface: config.interface,
-                mac: config.mac,
-                rate: media.sample_rate(),
-            },
-            1,
-            clock,
-            ahead,
-        )?;
+        let group_config = GroupConfig {
+            interface: config.interface,
+            mac: config.mac,
+            rate: media.sample_rate(),
+        };
+        let group = match departures {
+            Departures::Ahead(ahead) => TalkerGroup::start_ahead(group_config, 1, clock, ahead)?,
+            Departures::Card => TalkerGroup::start_on_card(group_config, 1, clock)?,
+        };
         group.set_stream(
             0,
             Some(GroupStream {
@@ -466,6 +542,19 @@ impl Talker {
     pub fn launch_ahead(&self) -> Option<Duration> {
         self.group.launch_ahead()
     }
+
+    /// Whether its frames can be launched by the card (see
+    /// [`TalkerGroup::on_card`]).
+    pub fn on_card(&self) -> bool {
+        self.group.on_card()
+    }
+}
+
+/// How a [`Talker`]'s frames leave: handed over ahead to a queue keeping
+/// departure times, or each when due, or launched by the card.
+enum Departures {
+    Ahead(Option<Duration>),
+    Card,
 }
 
 /// The frame's Ethernet header: destination, source, VLAN tag, ethertype.
@@ -798,6 +887,7 @@ fn run(
     sender: &FrameSender,
     clock: &MediaClock,
     launch: Option<(Duration, u32)>,
+    card: bool,
     stop: &AtomicBool,
 ) {
     precise_sleeps();
@@ -819,6 +909,10 @@ fn run(
     let mut generation = clock.generation();
     let mut ahead = launch.map(|(ahead, _)| ahead);
     let mut timing = Timing::start(monotonic_now());
+    // Frames go to the card's queue, at its priority, and the launch time
+    // last handed to it: ETF drops a frame timed before one it has sent.
+    let mut launching = false;
+    let mut last_launch = 0u64;
     while !stop.load(Ordering::Relaxed) {
         let changes = shared.changes.load(Ordering::Relaxed);
         if changes != seen {
@@ -865,9 +959,24 @@ fn run(
             std::thread::sleep(LONGEST_SLEEP);
             continue;
         };
-        // When the frame should leave, and when the thread hands it over.
+        // When the frame should leave, and when the thread hands it over:
+        // on the card, its launch time on the card's clock, where gptpd
+        // keeps that clock near CLOCK_TAI, handed over well ahead; else
+        // sent when due, or handed over `ahead` to a queue keeping times.
         let departure = clock.monotonic_at(due);
-        let wake = departure.saturating_sub(ahead.unwrap_or_default());
+        let mut launch_at = if card { clock.card_at(due) } else { None };
+        if launch_at.is_some() != launching && sender.launch_on_card(launch_at.is_some()).is_ok() {
+            launching = launch_at.is_some();
+            shared.group.launching.store(launching, Ordering::Relaxed);
+        }
+        if !launching {
+            launch_at = None;
+        }
+        let lead = match launch_at {
+            Some(_) => CARD_AHEAD,
+            None => ahead.unwrap_or_default(),
+        };
+        let wake = departure.saturating_sub(lead);
         let now = monotonic_now();
         // How late the thread woke from its sleep, where timing is kept;
         // none where it was behind already.
@@ -929,14 +1038,34 @@ fn run(
             timing.skipped(1);
             continue;
         }
-        let stamp = departure.max(monotonic_now() + LATE_STAMP).as_nanos() as u64;
+        let stamp = match launch_at {
+            // On the card's clock: one handed over too late for its time
+            // is launched a little past the moment, as fq's stamp is, and
+            // never before one already handed over.
+            Some(at) => {
+                let soonest = clock.card_at(clock.now()).map_or(at, |now| now + CARD_LATE);
+                at.max(soonest).max(last_launch)
+            }
+            None => departure.max(monotonic_now() + LATE_STAMP).as_nanos() as u64,
+        };
+        if let Some(at) = launch_at {
+            // Launched past the allowance, it would arrive late: left
+            // out, as above.
+            if stamp.saturating_sub(at) > allowed as u64 {
+                stream.next += stream.frame_samples();
+                counters.frames_late.fetch_add(1, Ordering::Relaxed);
+                timing.skipped(1);
+                continue;
+            }
+            last_launch = stamp;
+        }
         let built = timing.on().then(monotonic_now);
         let mut went_out = false;
         for destination in &stream.stream.destinations {
             stream.frame[..6].copy_from_slice(&destination.0);
-            let sent = match ahead {
-                Some(_) => sender.send_at(&stream.frame, stamp),
-                None => sender.send(&stream.frame),
+            let sent = match (launch_at, ahead) {
+                (Some(_), _) | (None, Some(_)) => sender.send_at(&stream.frame, stamp),
+                (None, None) => sender.send(&stream.frame),
             };
             match sent {
                 Ok(()) => {
@@ -944,6 +1073,12 @@ fn run(
                     stream.media_reset.sent();
                     went_out = true;
                 }
+                // The card's queue refuses a frame whose launch time it
+                // cannot keep, and says so on the error queue as well,
+                // where it is counted as missed.
+                #[cfg(target_os = "linux")]
+                Err(error)
+                    if launch_at.is_some() && error.raw_os_error() == Some(libc::ENOBUFS) => {}
                 Err(_) => {
                     counters.send_errors.fetch_add(1, Ordering::Relaxed);
                 }
@@ -977,6 +1112,18 @@ fn run(
             shared.group.adjustments.store(made, Ordering::Relaxed);
             shared.group.drift_ppm.store(drift, Ordering::Relaxed);
             shared.group.underruns.store(empty, Ordering::Relaxed);
+            // And the frames the card's queue dropped, from the socket's
+            // error queue, which only a socket on the card has.
+            if card {
+                let missed = sender.missed_launches();
+                if missed > 0 {
+                    shared
+                        .group
+                        .launches_missed
+                        .fetch_add(missed, Ordering::Relaxed);
+                    timing.skipped(missed);
+                }
+            }
         }
     }
 }

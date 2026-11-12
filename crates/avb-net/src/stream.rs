@@ -39,11 +39,47 @@ impl FrameSender {
         self.inner.time_departures()
     }
 
-    /// Sends `frame` to leave at `departure`, in monotonic nanoseconds,
-    /// once [`FrameSender::time_departures`] has taken. A queue with no
-    /// room for it says so as ENOBUFS.
+    /// Sends `frame` to leave at `departure`, in nanoseconds of the
+    /// socket's clock: the monotonic clock once
+    /// [`FrameSender::time_departures`] has taken, the card's (CLOCK_TAI)
+    /// for a sender opened with [`FrameSender::open_for_card`]. A queue
+    /// with no room for it says so as ENOBUFS.
     pub fn send_at(&self, frame: &[u8], departure: u64) -> io::Result<()> {
         self.inner.send_at(frame, departure)
+    }
+
+    /// Opens `interface` to send frames at launch times the card keeps:
+    /// departure times on CLOCK_TAI, which the ETF queue discipline with
+    /// offload hands to a card such as the Intel I210, to send each frame
+    /// when its PTP clock reaches the frame's time, however busy the
+    /// computer, and reports each frame it drops. A socket takes CLOCK_TAI
+    /// times only from a program holding CAP_NET_ADMIN, the helper or
+    /// this one: without it, or with a helper older than the kind
+    /// (raw-ether's `broker::Kind::Launch`), it fails, and a talker opens a
+    /// plain sender.
+    /// Frames go to the card's queue only after
+    /// [`FrameSender::launch_on_card`].
+    pub fn open_for_card(interface: &str) -> io::Result<Self> {
+        Ok(Self {
+            inner: platform::FrameSender::open_for_card(interface)?,
+        })
+    }
+
+    /// Has frames go to the queue the card launches from, at priority 5,
+    /// each sent with [`FrameSender::send_at`] at its launch time; or back
+    /// to the streams' usual priority, 3, sent when due. ETF drops a
+    /// frame without a time, so only a sender launching on the card sends
+    /// at 5, and the link maps 5 alone to that queue. The VLAN tag's
+    /// priority code point is written in the frame and does not change.
+    pub fn launch_on_card(&self, on: bool) -> io::Result<()> {
+        self.inner.launch_on_card(on)
+    }
+
+    /// The frames the queue discipline dropped since last asked, their
+    /// launch times passed or not valid, as the socket's error queue says.
+    /// Zero for a sender not opened for the card.
+    pub fn missed_launches(&self) -> u64 {
+        self.inner.missed_launches()
     }
 }
 
@@ -145,10 +181,19 @@ mod platform {
     /// its default map, ahead of the queue's other traffic, and the
     /// highest a program may set without a capability.
     const TIMED_PRIORITY: libc::c_int = 6;
+    /// The priority of frames the card launches at their times: one no
+    /// other sender uses, so that the link can map it alone to the queue
+    /// with ETF, which drops frames without a time.
+    const LAUNCH_PRIORITY: libc::c_int = 5;
     /// SO_TXTIME and its control message, the same on every architecture
     /// but alpha, mips, parisc and sparc.
     const SO_TXTIME: libc::c_int = 61;
     const SCM_TXTIME: libc::c_int = SO_TXTIME;
+    /// An error queue message from a queue discipline keeping departure
+    /// times: a frame dropped for its time.
+    const SO_EE_ORIGIN_TXTIME: u8 = 6;
+    /// The control message a packet socket's error queue carries it in.
+    const PACKET_TX_TIMESTAMP: libc::c_int = 16;
 
     /// Sets an option of `fd` to `value`.
     fn set_option<T>(
@@ -174,14 +219,14 @@ mod platform {
         Ok(())
     }
 
-    fn open_raw(interface: &str) -> io::Result<(OwnedFd, i32)> {
+    fn open_raw(interface: &str, kind: crate::broker::Kind) -> io::Result<(OwnedFd, i32)> {
         let index = crate::interfaces::index_of(interface).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no interface named {interface}"),
             )
         })?;
-        let fd = crate::broker::open(crate::broker::Kind::Raw)?;
+        let fd = crate::broker::open(kind)?;
         Ok((fd, index))
     }
 
@@ -394,7 +439,11 @@ mod platform {
 
     impl FrameSender {
         pub fn open(interface: &str) -> io::Result<Self> {
-            let (fd, index) = open_raw(interface)?;
+            Self::open_kind(interface, crate::broker::Kind::Raw)
+        }
+
+        fn open_kind(interface: &str, kind: crate::broker::Kind) -> io::Result<Self> {
+            let (fd, index) = open_raw(interface, kind)?;
             // Bound for no protocol: it sends, and hears nothing.
             bind(&fd, index, 0)?;
             // Each frame is sent named as AVTP, whatever its VLAN tag, so
@@ -507,6 +556,71 @@ mod platform {
             }
             Ok(())
         }
+
+        pub fn open_for_card(interface: &str) -> io::Result<Self> {
+            // Its departure times on CLOCK_TAI, set by whoever opens it,
+            // the helper or this program, holding CAP_NET_ADMIN.
+            Self::open_kind(interface, crate::broker::Kind::Launch)
+        }
+
+        pub fn launch_on_card(&self, on: bool) -> io::Result<()> {
+            let priority = if on { LAUNCH_PRIORITY } else { SEND_PRIORITY };
+            set_option(&self.fd, libc::SOL_SOCKET, libc::SO_PRIORITY, &priority)
+        }
+
+        pub fn missed_launches(&self) -> u64 {
+            let mut missed = 0;
+            loop {
+                // The frame comes back too; its first octets are enough.
+                let mut data = [0u8; 64];
+                let mut part = libc::iovec {
+                    iov_base: data.as_mut_ptr().cast(),
+                    iov_len: data.len(),
+                };
+                // Room for a few control messages, aligned as their headers.
+                let mut control = [0u64; 32];
+                // SAFETY: msghdr is plain data, valid when zeroed.
+                let mut message: libc::msghdr = unsafe { zeroed() };
+                message.msg_iov = &raw mut part;
+                message.msg_iovlen = 1;
+                message.msg_control = control.as_mut_ptr().cast();
+                message.msg_controllen = size_of_val(&control) as _;
+                // SAFETY: `message` and the buffers it points to live
+                // through the call, and their lengths are theirs.
+                let read = unsafe {
+                    libc::recvmsg(
+                        self.fd.as_raw_fd(),
+                        &raw mut message,
+                        libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT,
+                    )
+                };
+                if read < 0 {
+                    return missed;
+                }
+                // SAFETY: the kernel filled the control buffer up to
+                // msg_controllen, and the CMSG macros keep within it.
+                unsafe {
+                    let mut header = libc::CMSG_FIRSTHDR(&raw const message);
+                    while !header.is_null() {
+                        let length = (*header).cmsg_len as usize;
+                        let room =
+                            libc::CMSG_LEN(size_of::<libc::sock_extended_err>() as _) as usize;
+                        if (*header).cmsg_level == libc::SOL_PACKET
+                            && (*header).cmsg_type == PACKET_TX_TIMESTAMP
+                            && length >= room
+                        {
+                            let error = libc::CMSG_DATA(header)
+                                .cast::<libc::sock_extended_err>()
+                                .read_unaligned();
+                            if error.ee_origin == SO_EE_ORIGIN_TXTIME {
+                                missed += 1;
+                            }
+                        }
+                        header = libc::CMSG_NXTHDR(&raw const message, header);
+                    }
+                }
+            }
+        }
     }
 
     pub struct FrameReceiver {
@@ -515,7 +629,7 @@ mod platform {
 
     impl FrameReceiver {
         pub fn open(interface: &str, subtype: u8, destinations: &[MacAddress]) -> io::Result<Self> {
-            let (fd, index) = open_raw(interface)?;
+            let (fd, index) = open_raw(interface, crate::broker::Kind::Raw)?;
             // The filter goes on before the socket hears anything: the
             // destination, either of two, then the AVTP subtype, after a
             // VLAN tag or not.
@@ -772,6 +886,18 @@ mod platform {
 
         pub fn send_at(&self, _frame: &[u8], _departure: u64) -> io::Result<()> {
             Err(unsupported())
+        }
+
+        pub fn open_for_card(_interface: &str) -> io::Result<Self> {
+            Err(unsupported())
+        }
+
+        pub fn launch_on_card(&self, _on: bool) -> io::Result<()> {
+            Err(unsupported())
+        }
+
+        pub fn missed_launches(&self) -> u64 {
+            0
         }
     }
 
