@@ -186,6 +186,26 @@ pub fn read_samples(data: &[u8], out: &mut Vec<f32>) {
     }));
 }
 
+/// Writes `words`, interleaved samples as 32-bit words, as labeled 24-bit
+/// quadlets into `out`, from their high bits.
+pub fn write_words(words: &[i32], out: &mut [u8]) {
+    for (word, quadlet) in words.iter().zip(out.as_chunks_mut::<4>().0) {
+        quadlet[0] = MBLA_24;
+        quadlet[1..].copy_from_slice(&word.to_be_bytes()[..3]);
+    }
+}
+
+/// Reads the samples of `data`'s quadlets into `out` as 32-bit words, in
+/// their high bits; quadlets of another kind read as silence.
+pub fn read_words(data: &[u8], out: &mut Vec<i32>) {
+    out.extend(data.as_chunks::<4>().0.iter().map(|quadlet| {
+        if quadlet[0] & 0xfc != MBLA_24 {
+            return 0;
+        }
+        i32::from_be_bytes([quadlet[1], quadlet[2], quadlet[3], 0])
+    }));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

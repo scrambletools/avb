@@ -197,6 +197,43 @@ pub fn read_samples(data: &[u8], layout: &Layout, out: &mut Vec<f32>) {
     );
 }
 
+/// Writes `words`, interleaved samples as 32-bit words, as `layout`'s
+/// sample format into `out`: a 32-bit integer format's exactly, a
+/// narrower one's from their high bits, a float's scaled from the full
+/// range.
+pub fn write_words(words: &[i32], layout: &Layout, out: &mut [u8]) {
+    let octets = layout.sample_octets();
+    for (word, slot) in words.iter().zip(out.chunks_exact_mut(octets)) {
+        match layout.sample_format {
+            sample_format::FLOAT_32 => {
+                let value = (f64::from(*word) / 2_147_483_648.0) as f32;
+                slot.copy_from_slice(&value.to_be_bytes());
+            }
+            _ => slot.copy_from_slice(&word.to_be_bytes()[..octets]),
+        }
+    }
+}
+
+/// Reads `layout`'s samples from `data` into `out` as 32-bit words, as
+/// [`write_words`] writes them.
+pub fn read_words(data: &[u8], layout: &Layout, out: &mut Vec<i32>) {
+    let octets = layout.sample_octets();
+    out.extend(
+        data.chunks_exact(octets)
+            .map(|slot| match layout.sample_format {
+                sample_format::FLOAT_32 => {
+                    let value = f32::from_be_bytes([slot[0], slot[1], slot[2], slot[3]]);
+                    (f64::from(value.clamp(-1.0, 1.0)) * 2_147_483_647.0) as i32
+                }
+                _ => {
+                    let mut word = [0; 4];
+                    word[..octets].copy_from_slice(slot);
+                    i32::from_be_bytes(word)
+                }
+            }),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +278,44 @@ mod tests {
         for (sent, received) in samples.iter().zip(&back) {
             assert!((sent - received).abs() < 1e-6, "{sent} {received}");
         }
+    }
+
+    /// Words pass a 32-bit format exactly, every bit, and a 24 or 16-bit
+    /// one in their high bits.
+    #[test]
+    fn words_pass_as_they_are() {
+        let words = [
+            i32::MIN,
+            -1,
+            0,
+            1,
+            0x1234_5678,
+            i32::MAX,
+            0x0000_00ff,
+            -0x0100,
+        ];
+        let mut layout = Layout::of(AAF_48K_8CH_32).unwrap();
+        let mut data = vec![0; 32];
+        write_words(&words, &layout, &mut data);
+        let mut back = Vec::new();
+        read_words(&data, &layout, &mut back);
+        assert_eq!(back, words);
+
+        layout.sample_format = sample_format::INT_24;
+        let mut data = vec![0; 24];
+        write_words(&words, &layout, &mut data);
+        back.clear();
+        read_words(&data, &layout, &mut back);
+        let high: Vec<i32> = words.iter().map(|word| word & !0xff).collect();
+        assert_eq!(back, high);
+
+        layout.sample_format = sample_format::INT_16;
+        let mut data = vec![0; 16];
+        write_words(&words, &layout, &mut data);
+        back.clear();
+        read_words(&data, &layout, &mut back);
+        let high: Vec<i32> = words.iter().map(|word| word & !0xffff).collect();
+        assert_eq!(back, high);
     }
 
     #[test]

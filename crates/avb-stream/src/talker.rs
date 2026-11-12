@@ -29,7 +29,7 @@ use avb_net::clock::{monotonic_now, precise_sleeps};
 use avb_net::stream::FrameSender;
 
 use crate::MediaClock;
-use crate::audio::{Input, Source};
+use crate::audio::{Block, BlockSource, Input, Source};
 use crate::lock::{Guard, Lock};
 use crate::media::{Media, Packetizer};
 use crate::meter::Peaks;
@@ -485,6 +485,10 @@ struct Running {
     stream: GroupStream,
     /// Where its samples come from; none for a media clock.
     input: Option<Input>,
+    /// A program's blocks, which take the input's place, and a block of
+    /// them.
+    blocks: Option<Arc<dyn BlockSource>>,
+    words: Vec<i32>,
     packetizer: Packetizer,
     frame: Vec<u8>,
     samples: Vec<f32>,
@@ -536,10 +540,16 @@ impl Running {
         frame[..ETHERNET_LEN].copy_from_slice(&ethernet_header(mac, &stream));
         let samples =
             vec![0.0f32; usize::from(media.channels()) * usize::from(media.samples_per_frame())];
+        let blocks = match (&stream.source, &input) {
+            (Source::Blocks(blocks), Some(_)) => Some(blocks.0.clone()),
+            _ => None,
+        };
         Running {
             packetizer: Packetizer::new(media, stream.stream_id),
+            words: vec![0; samples.len()],
             stream,
             input,
+            blocks,
             frame,
             samples,
             channels: usize::from(media.channels()),
@@ -564,12 +574,61 @@ impl Running {
     /// lock again.
     fn skip_to(&mut self, from: u64) -> u64 {
         let frames = self.first_from(from).saturating_sub(self.next) / self.frame_samples();
+        let samples = frames as usize * self.block_samples();
         if let Some(input) = &mut self.input {
-            input.skip(frames as usize * self.samples.len() / self.channels.max(1));
+            input.skip(samples);
+        }
+        if let Some(blocks) = &self.blocks
+            && frames > 0
+        {
+            blocks.left_out(samples as u64);
         }
         self.packetizer.skip(frames);
         self.next += frames * self.frame_samples();
         frames
+    }
+
+    /// The format's samples on each channel in each of its frames.
+    fn block_samples(&self) -> usize {
+        self.samples.len() / self.channels.max(1)
+    }
+
+    /// Its next frame's samples, from its input or a program's blocks,
+    /// into its frame, the first presented at `presented`; the block, for
+    /// a program's.
+    fn build(&mut self, presented: i64, peaks: &Peaks) -> Option<Block> {
+        let (samples, channels) = (self.block_samples(), self.channels);
+        let media_reset = self.media_reset.bit;
+        let block = self.blocks.as_ref().map(|blocks| {
+            let block = Block {
+                presented,
+                samples,
+                channels,
+                media_reset,
+            };
+            blocks.fill(&block, &mut self.words);
+            for (level, word) in self.samples.iter_mut().zip(&self.words) {
+                *level = (f64::from(*word) / 2_147_483_648.0) as f32;
+            }
+            block
+        });
+        if block.is_none()
+            && let Some(input) = &mut self.input
+        {
+            input.read_as(&mut self.samples, self.channels);
+        }
+        peaks.raise(&self.samples, self.channels);
+        let frame = &mut self.frame[ETHERNET_LEN..];
+        match block {
+            Some(_) => {
+                self.packetizer
+                    .write_words(presented, self.media_reset.bit, &self.words, frame)
+            }
+            None => self
+                .packetizer
+                .write(presented, self.media_reset.bit, &self.samples, frame),
+        }
+        block
     }
 }
 
@@ -857,27 +916,22 @@ fn run(
             timing.skipped(skipped);
             continue;
         }
-        if let Some(input) = &mut stream.input {
-            input.read_as(&mut stream.samples, stream.channels);
-        }
-        counters.peaks.raise(&stream.samples, stream.channels);
-        stream.packetizer.write(
-            due + transit,
-            stream.media_reset.bit,
-            &stream.samples,
-            &mut stream.frame[ETHERNET_LEN..],
-        );
+        let block = stream.build(due + transit, &counters.peaks);
         // The thread can be held up after the check as well, reading the
         // source or preempted: a frame that would now arrive late is left
         // out, the packetizer having counted past it already.
         if clock.now() - due > allowed {
             stream.next += stream.frame_samples();
+            if let Some(blocks) = &stream.blocks {
+                blocks.left_out(stream.block_samples() as u64);
+            }
             counters.frames_late.fetch_add(1, Ordering::Relaxed);
             timing.skipped(1);
             continue;
         }
         let stamp = departure.max(monotonic_now() + LATE_STAMP).as_nanos() as u64;
         let built = timing.on().then(monotonic_now);
+        let mut went_out = false;
         for destination in &stream.stream.destinations {
             stream.frame[..6].copy_from_slice(&destination.0);
             let sent = match ahead {
@@ -888,11 +942,15 @@ fn run(
                 Ok(()) => {
                     counters.frames_sent.fetch_add(1, Ordering::Relaxed);
                     stream.media_reset.sent();
+                    went_out = true;
                 }
                 Err(_) => {
                     counters.send_errors.fetch_add(1, Ordering::Relaxed);
                 }
             }
+        }
+        if let (Some(blocks), Some(block)) = (&stream.blocks, &block) {
+            blocks.sent(block, went_out);
         }
         if let (Some(handover), Some(built)) = (handover, built) {
             let sent = monotonic_now();
@@ -1102,6 +1160,88 @@ mod tests {
         );
         // A sample the stream is past leaves nothing out.
         assert_eq!(late.skip_to(late.next), 0);
+    }
+
+    /// A program's blocks: what it fills goes out word for word, presented
+    /// when the block says, and frames left out as late are told to it
+    /// in samples, not frames.
+    #[test]
+    fn a_programs_blocks_go_out_as_filled() {
+        use crate::audio::{Block, BlockSource, Blocks};
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Counting {
+            filled: Mutex<Vec<Block>>,
+            sent: Mutex<Vec<(i64, bool)>>,
+            left_out: Mutex<Vec<u64>>,
+        }
+        impl BlockSource for Counting {
+            fn fill(&self, block: &Block, words: &mut [i32]) {
+                let mut filled = self.filled.lock().unwrap();
+                let first = filled.len() as i32 * 1000;
+                for (place, word) in words.iter_mut().enumerate() {
+                    *word = (first + place as i32).wrapping_mul(0x0101_0101);
+                }
+                filled.push(*block);
+            }
+            fn sent(&self, block: &Block, sent: bool) {
+                self.sent.lock().unwrap().push((block.presented, sent));
+            }
+            fn left_out(&self, samples: u64) {
+                self.left_out.lock().unwrap().push(samples);
+            }
+        }
+
+        // AAF, 48 kHz, 2 channels of 32 bits, 6 samples a frame.
+        let format = StreamFormat(0x0205_0220_0080_6000);
+        let media = Media::of(format).unwrap();
+        assert_eq!((media.channels(), media.samples_per_frame()), (2, 6));
+        let counting = Arc::new(Counting::default());
+        let source = Source::Blocks(Blocks(counting.clone()));
+        let stream = GroupStream {
+            stream_id: 1,
+            destinations: Vec::new(),
+            vlan_id: 2,
+            priority: 3,
+            format,
+            max_transit_time: Duration::from_millis(2),
+            source: source.clone(),
+            channels: 2,
+        };
+        let input = Input::open(&source, 2, 48_000).unwrap();
+        let mut running = Running::new(MacAddress([0; 6]), stream, media, Some(input), 6);
+        let peaks = Peaks::default();
+        let block = running.build(5_000_000, &peaks).unwrap();
+        assert_eq!(
+            block,
+            Block {
+                presented: 5_000_000,
+                samples: 6,
+                channels: 2,
+                media_reset: false,
+            }
+        );
+        let mut words = Vec::new();
+        assert!(crate::media::read_words(
+            &running.frame[ETHERNET_LEN..],
+            &media,
+            &mut words
+        ));
+        let wanted: Vec<i32> = (0..12)
+            .map(|place: i32| place.wrapping_mul(0x0101_0101))
+            .collect();
+        assert_eq!(words, wanted, "every bit of every word");
+        let mut levels = Vec::new();
+        let received =
+            crate::media::read(&running.frame[ETHERNET_LEN..], &media, &mut levels).unwrap();
+        assert_eq!(received.timestamp, Some(5_000_000));
+
+        // Three frames left out: 18 samples.
+        running.next = 6;
+        assert_eq!(running.skip_to(20), 3);
+        assert_eq!(*counting.left_out.lock().unwrap(), [18]);
+        assert!(counting.sent.lock().unwrap().is_empty());
     }
 
     /// The mr bit changes for a start of the media clock once a frame sent

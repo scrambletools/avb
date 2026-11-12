@@ -16,7 +16,7 @@ use atdecc::stream_format::StreamFormat;
 use avb_net::MacAddress;
 use avb_net::stream::{FrameReceiver, avtp_payload};
 
-use crate::audio::{Output, Presented, Sink};
+use crate::audio::{Arrived, BlockSink, Output, Presented, Sink};
 use crate::lock::Lock;
 use crate::media::{self, Media};
 use crate::meter::Peaks;
@@ -132,6 +132,8 @@ struct Opened {
     media: Media,
     receiver: FrameReceiver,
     output: Option<Output>,
+    /// A program's sink, which takes each frame's block as it comes.
+    blocks: Option<Arc<dyn BlockSink>>,
 }
 
 /// What the group's owner and its thread share.
@@ -201,11 +203,16 @@ impl ListenerGroup {
                 } else {
                     Some(Output::open(&config.sink, channels, media.sample_rate())?)
                 };
+                let blocks = match &config.sink {
+                    Sink::Blocks(blocks) if !media.is_clock() => Some(blocks.0.clone()),
+                    _ => None,
+                };
                 Some(Opened {
                     config,
                     media,
                     receiver,
                     output,
+                    blocks,
                 })
             }
             None => None,
@@ -355,6 +362,8 @@ struct Running {
     last: Instant,
     /// Its samples in the order its channel map plays them.
     mapped: Vec<f32>,
+    /// A frame's samples as words, for a program's sink.
+    words: Vec<i32>,
 }
 
 impl Drop for Running {
@@ -464,6 +473,7 @@ fn take_changes(shared: &Shared, running: &mut [Option<Running>]) {
                     expected: None,
                     last: Instant::now(),
                     mapped: Vec::new(),
+                    words: Vec::new(),
                 }
             });
         }
@@ -487,6 +497,7 @@ fn take_frame(stream: &mut Running, frame: &[u8], samples: &mut Vec<f32>, clock:
         expected,
         last,
         mapped,
+        words,
     } = stream;
     samples.clear();
     let Some(pdu) = avtp_payload(frame) else {
@@ -547,7 +558,8 @@ fn take_frame(stream: &mut Running, frame: &[u8], samples: &mut Vec<f32>, clock:
     }
     *last = Instant::now();
     counters.frames_received.fetch_add(1, Ordering::Relaxed);
-    if expected.is_some_and(|wanted| wanted != header.sequence) {
+    let missed = expected.map_or(0, |wanted| header.sequence.wrapping_sub(wanted));
+    if missed != 0 {
         counters.sequence_mismatches.fetch_add(1, Ordering::Relaxed);
     }
     *expected = Some(header.sequence.wrapping_add(1));
@@ -581,6 +593,21 @@ fn take_frame(stream: &mut Running, frame: &[u8], samples: &mut Vec<f32>, clock:
             first: now + ahead(first),
             offset: clock.offset(),
         });
+    if let Some(sink) = &opened.blocks {
+        words.clear();
+        if media::read_words(pdu, &opened.media, words) {
+            let channels = usize::from(opened.media.channels());
+            let arrived = Arrived {
+                presented: presented.map(|presented| presented.first),
+                margin: presented.map(|presented| presented.first - now),
+                samples: words.len() / channels.max(1),
+                channels,
+                missed,
+                media_reset: header.media_reset,
+            };
+            sink.take(&arrived, words);
+        }
+    }
     let Some(output) = &opened.output else {
         return;
     };

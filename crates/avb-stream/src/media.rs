@@ -6,6 +6,13 @@ use atdecc::stream_format::StreamFormat;
 
 use crate::{aaf, am824, crf};
 
+/// A PDU's samples: levels from -1 to 1, or 32-bit words.
+#[derive(Clone, Copy)]
+enum Samples<'a> {
+    Levels(&'a [f32]),
+    Words(&'a [i32]),
+}
+
 /// How a stream format packs its samples, or its clock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Media {
@@ -122,6 +129,28 @@ impl Packetizer {
     /// nanoseconds); for a media clock, its timestamps from
     /// `presentation` on, without samples.
     pub fn write(&mut self, presentation: i64, media_reset: bool, samples: &[f32], out: &mut [u8]) {
+        self.write_pdu(presentation, media_reset, Samples::Levels(samples), out);
+    }
+
+    /// Writes the next PDU into `out` as [`Packetizer::write`] does, its
+    /// samples given as 32-bit words, as [`aaf::write_words`] takes them.
+    pub fn write_words(
+        &mut self,
+        presentation: i64,
+        media_reset: bool,
+        words: &[i32],
+        out: &mut [u8],
+    ) {
+        self.write_pdu(presentation, media_reset, Samples::Words(words), out);
+    }
+
+    fn write_pdu(
+        &mut self,
+        presentation: i64,
+        media_reset: bool,
+        samples: Samples,
+        out: &mut [u8],
+    ) {
         match self.media {
             Media::Aaf(layout) => {
                 let header = aaf::Header {
@@ -138,7 +167,11 @@ impl Packetizer {
                 let mut encoded = [0; aaf::HEADER_LEN];
                 header.encode(&mut encoded);
                 out[..aaf::HEADER_LEN].copy_from_slice(&encoded);
-                aaf::write_samples(samples, &layout, &mut out[aaf::HEADER_LEN..]);
+                let data = &mut out[aaf::HEADER_LEN..];
+                match samples {
+                    Samples::Levels(levels) => aaf::write_samples(levels, &layout, data),
+                    Samples::Words(words) => aaf::write_words(words, &layout, data),
+                }
             }
             Media::Am824(layout) => {
                 // The timestamp is for the block at an SYT_INTERVAL
@@ -161,7 +194,10 @@ impl Packetizer {
                 let mut encoded = [0; am824::HEADER_LEN + am824::CIP_LEN];
                 header.encode(&mut encoded);
                 out[..start].copy_from_slice(&encoded);
-                am824::write_samples(samples, &mut out[start..]);
+                match samples {
+                    Samples::Levels(levels) => am824::write_samples(levels, &mut out[start..]),
+                    Samples::Words(words) => am824::write_words(words, &mut out[start..]),
+                }
                 self.dbc = self.dbc.wrapping_add(layout.samples_per_frame as u8);
             }
             Media::Crf(layout) => {
@@ -258,6 +294,29 @@ pub fn read(pdu: &[u8], media: &Media, out: &mut Vec<f32>) -> Option<Received> {
                 matches: header.matches(layout),
             })
         }
+    }
+}
+
+/// Reads the samples of a PDU of `media`'s kind into `out` as 32-bit
+/// words, as [`aaf::read_words`] gives them, when it carries what `media`
+/// describes; false, and nothing read, otherwise.
+pub fn read_words(pdu: &[u8], media: &Media, out: &mut Vec<i32>) -> bool {
+    match media {
+        Media::Aaf(layout) => match aaf::Header::decode(pdu) {
+            Some((header, data)) if header.matches(layout) => {
+                aaf::read_words(data, layout, out);
+                true
+            }
+            _ => false,
+        },
+        Media::Am824(layout) => match am824::Header::decode(pdu) {
+            Some((header, data)) if header.matches(layout) => {
+                am824::read_words(data, out);
+                true
+            }
+            _ => false,
+        },
+        Media::Crf(_) => false,
     }
 }
 

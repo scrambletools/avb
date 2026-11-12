@@ -27,6 +27,7 @@ use crate::lock::{Guard, Lock};
 
 /// Where a talker's samples come from.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Source {
     Silence,
     /// A sine on every channel, its level from 0 to 1.
@@ -43,6 +44,93 @@ pub enum Source {
     /// A buffer another part of the program fills as a device would, such
     /// as a virtual audio device apps play into.
     Shared(SharedBuffer),
+    /// Another part of the program, block by block on the talker's
+    /// thread, in the stream's own format and on its timeline: nothing
+    /// buffered or resampled between.
+    Blocks(Blocks<dyn BlockSource>),
+}
+
+/// One frame's block of a talker's samples, as a [`BlockSource`] fills
+/// it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Block {
+    /// When its first sample is presented, in gPTP nanoseconds.
+    pub presented: i64,
+    /// Its samples on each channel.
+    pub samples: usize,
+    /// The format's channels, which its frames have.
+    pub channels: usize,
+    /// The mr bit it goes out with, which changes as the stream starts
+    /// again on a new timeline.
+    pub media_reset: bool,
+}
+
+/// A talker's samples from another part of the program, one frame's block
+/// at a time, as 32-bit words ([`crate::aaf::write_words`]). Its calls
+/// come on the talker's thread as each frame is due, so they must not
+/// block or wait on a lock held long.
+pub trait BlockSource: Send + Sync {
+    /// Fills `words`, `block.samples` frames of `block.channels`
+    /// interleaved, for the next block.
+    fn fill(&self, block: &Block, words: &mut [i32]);
+    /// The block last filled went out; `sent` is false where every send
+    /// of it failed.
+    fn sent(&self, block: &Block, sent: bool);
+    /// The next `samples` sample frames are left out as too late to send,
+    /// the block last filled among them where it did not go out: the
+    /// stream goes on past them on its timeline.
+    fn left_out(&self, samples: u64);
+}
+
+/// A block a listener received, as a [`BlockSink`] takes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Arrived {
+    /// When its first sample is presented, in gPTP nanoseconds; none
+    /// while gPTP time is not a grandmaster's.
+    pub presented: Option<i64>,
+    /// How long before that it was taken, in nanoseconds: negative when
+    /// late.
+    pub margin: Option<i64>,
+    /// Its samples on each channel.
+    pub samples: usize,
+    /// The format's channels, which its frames have.
+    pub channels: usize,
+    /// Frames the sequence numbers say went missing just before it.
+    pub missed: u8,
+    /// Its mr bit, which the talker changes as it starts again.
+    pub media_reset: bool,
+}
+
+/// A listener's samples to another part of the program, one received
+/// frame's block at a time, as 32-bit words ([`crate::aaf::read_words`]),
+/// on the listener's thread: it must not block or wait on a lock held
+/// long.
+pub trait BlockSink: Send + Sync {
+    /// Takes `words`, `arrived.samples` frames of `arrived.channels`
+    /// interleaved.
+    fn take(&self, arrived: &Arrived, words: &[i32]);
+}
+
+/// A [`BlockSource`] or [`BlockSink`] of the program's; two are equal
+/// when they are the same one.
+pub struct Blocks<T: ?Sized>(pub Arc<T>);
+
+impl<T: ?Sized> Clone for Blocks<T> {
+    fn clone(&self) -> Self {
+        Blocks(self.0.clone())
+    }
+}
+
+impl<T: ?Sized> PartialEq for Blocks<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl<T: ?Sized> std::fmt::Debug for Blocks<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Blocks")
+    }
 }
 
 /// A buffer another part of the program fills or drains as an audio
@@ -74,6 +162,7 @@ impl std::fmt::Debug for SharedBuffer {
 
 /// Where a listener's samples go.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Sink {
     /// Nowhere, though their level is still measured.
     Discard,
@@ -86,6 +175,11 @@ pub enum Sink {
     /// A buffer another part of the program drains as a device would, such
     /// as a virtual audio device apps record from.
     Shared(SharedBuffer),
+    /// Another part of the program, each received frame's block as it
+    /// comes, on the listener's thread, with its presentation time:
+    /// nothing buffered, resampled or channel-mapped between. Their level
+    /// is still measured.
+    Blocks(Blocks<dyn BlockSink>),
 }
 
 /// Interleaved sample frames passed between an audio device's callback
@@ -657,7 +751,8 @@ impl Input {
     /// Opens `source` for `channels` channels at `rate` hertz.
     pub fn open(source: &Source, channels: u16, rate: u32) -> io::Result<Self> {
         let kind = match source {
-            Source::Silence => InputKind::Silence,
+            // The talker takes a program's blocks itself.
+            Source::Silence | Source::Blocks(_) => InputKind::Silence,
             Source::Tone { hertz, level } => InputKind::Tone {
                 phase: 0.0,
                 step: TAU * hertz / rate as f32,
@@ -897,7 +992,10 @@ impl Output {
     /// Opens `sink` for `channels` channels at `rate` hertz.
     pub fn open(sink: &Sink, channels: u16, rate: u32) -> io::Result<Self> {
         match sink {
-            Sink::Discard => Ok(Output::new(None, None, channels, channels, rate, rate)),
+            // The listener gives a program its blocks itself.
+            Sink::Discard | Sink::Blocks(_) => {
+                Ok(Output::new(None, None, channels, channels, rate, rate))
+            }
             Sink::Shared(shared) => Ok(Output::new(
                 Some(shared.buffer.clone()),
                 None,
