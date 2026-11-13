@@ -1053,6 +1053,9 @@ fn run(
             // out, as above.
             if stamp.saturating_sub(at) > allowed as u64 {
                 stream.next += stream.frame_samples();
+                if let Some(blocks) = &stream.blocks {
+                    blocks.left_out(stream.block_samples() as u64);
+                }
                 counters.frames_late.fetch_add(1, Ordering::Relaxed);
                 timing.skipped(1);
                 continue;
