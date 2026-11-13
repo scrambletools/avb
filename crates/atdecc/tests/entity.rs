@@ -1911,3 +1911,33 @@ fn an_entity_unlocking_itself_tells_its_registered_controllers() {
     let free = aem(&mut listener, unlocking, SECOND, Aem::LOCK_ENTITY, &query);
     assert_eq!(locked_id(&free), EntityId(0));
 }
+
+/// A talker's output reads as connected while it advertises and a listener
+/// is ready for it, and only then (Milan 1.3, Table 5.9).
+#[test]
+fn an_output_is_connected_while_a_listener_is_ready() {
+    use atdecc::AemCommandType as Aem;
+    use atdecc::aem::{StreamInfo, StreamInfoFlags};
+
+    let mut talker = Entity::new(model(TALKER, "Talker", true), &[(STREAM, DESTINATION)]);
+    talker.start(Instant::ZERO);
+    let connected = |talker: &mut Entity, ready_listeners: u16, registering: bool| {
+        let reservation = OutputReservation {
+            ready_listeners,
+            registering,
+        };
+        talker.set_output_reservation(0, reservation);
+        let mut output = [0; 4];
+        output[..2].copy_from_slice(&DescriptorType::STREAM_OUTPUT.0.to_be_bytes());
+        let answer = aem(talker, Instant::ZERO, FIRST, Aem::GET_STREAM_INFO, &output);
+        assert_eq!(answer.status, AemStatus::SUCCESS);
+        let info = StreamInfo::decode(&answer.payload).unwrap();
+        info.flags.contains(StreamInfoFlags::CONNECTED)
+    };
+    assert!(!connected(&mut talker, 0, false));
+    assert!(!connected(&mut talker, 0, true));
+    assert!(!connected(&mut talker, 1, false));
+    assert!(connected(&mut talker, 1, true));
+    assert!(connected(&mut talker, 2, true));
+    assert!(!connected(&mut talker, 0, true));
+}

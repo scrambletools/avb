@@ -2024,6 +2024,11 @@ impl Entity {
                 if output.reservation.registering {
                     flags_ex |= 1;
                 }
+                // Milan 1.3, Table 5.9: advertised, with a listener ready,
+                // or ready failed, registered for it.
+                if output.streaming() {
+                    flags |= StreamInfoFlags::CONNECTED;
+                }
             }
             DescriptorType::STREAM_INPUT => {
                 let input = self.inputs.get(usize::from(index))?;
