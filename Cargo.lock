@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "avb-net"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "libc",
  "raw-ether",
@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "avb-stream"
-version = "0.3.6"
+version = "0.4.0"
 dependencies = [
  "atdecc",
  "avb-net",
