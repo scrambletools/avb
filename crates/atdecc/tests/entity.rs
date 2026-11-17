@@ -2177,3 +2177,117 @@ fn a_controller_reads_and_erases_a_crash_dump() {
         .length;
     assert_eq!(crash, 0);
 }
+
+#[test]
+fn a_controller_uploads_firmware_as_annex_d_has_it() {
+    use atdecc::descriptor::MemoryObjectOperation;
+    use atdecc::entity::{FIRMWARE_ADDRESS, StoredFirmware};
+    let image: Vec<u8> = (0..1300).map(|at| (at * 7 % 251) as u8).collect();
+    let mut network = Network::new();
+    network.talker = Entity::new(model(TALKER, "Talker", true), &[(STREAM, DESTINATION)]);
+    network.talker.keep_firmware(4096);
+    network.talker.set_streams_running(true);
+    network.talker.start(Instant::ZERO);
+    network.controller.discover(None);
+    network.run(3000);
+    network.controller_events.clear();
+    let object = network
+        .controller
+        .model(TALKER)
+        .unwrap()
+        .memory_objects()
+        .find(|object| object.memory_object_type == MemoryObjectType::FIRMWARE_IMAGE)
+        .expect("its FIRMWARE_IMAGE");
+    assert_eq!(
+        (object.start_address, object.maximum_length, object.length),
+        (FIRMWARE_ADDRESS, 4096, 0)
+    );
+    let index = object.index;
+    let operation = |network: &mut Network, operation: MemoryObjectOperation, values: &[u8]| {
+        let command = network.controller.start_operation(
+            network.now,
+            TALKER,
+            DescriptorType::MEMORY_OBJECT,
+            index,
+            operation.0,
+            values,
+        );
+        let outcome = finish(network, command);
+        (outcome, network.controller.take_operation_id(command))
+    };
+    let length = (image.len() as u64).to_be_bytes();
+
+    // Its streams run: refused, until the controller locks it.
+    assert_eq!(
+        operation(&mut network, MemoryObjectOperation::UPLOAD, &length).0,
+        Outcome::Refused(Refusal::Aem(AemStatus::STREAM_IS_RUNNING))
+    );
+    let lock = network.controller.lock_entity(network.now, TALKER, false);
+    assert_eq!(finish(&mut network, lock), Outcome::Done);
+    let (outcome, upload) = operation(&mut network, MemoryObjectOperation::UPLOAD, &length);
+    assert_eq!(outcome, Outcome::Done);
+    let upload = upload.unwrap();
+    assert!(network.talker.uploading());
+
+    // The octets in order, the second part twice, as after a lost answer.
+    let write = |network: &mut Network, offset: usize, length: usize| {
+        let command = network.controller.write_memory(
+            network.now,
+            TALKER,
+            FIRMWARE_ADDRESS + offset as u64,
+            &image[offset..offset + length],
+        );
+        assert_eq!(finish(network, command), Outcome::Done);
+        network.controller.take_memory_read(command).unwrap().status
+    };
+    assert_eq!(write(&mut network, 0, 502), AaStatus::SUCCESS);
+    assert_eq!(write(&mut network, 502, 502), AaStatus::SUCCESS);
+    assert_eq!(write(&mut network, 502, 502), AaStatus::SUCCESS);
+    assert_eq!(write(&mut network, 1100, 200), AaStatus::ADDRESS_INVALID);
+    assert_eq!(write(&mut network, 1004, 296), AaStatus::SUCCESS);
+
+    let (outcome, store) = operation(&mut network, MemoryObjectOperation::STORE_AND_REBOOT, &[]);
+    assert_eq!(outcome, Outcome::Done);
+    let store = store.unwrap();
+    assert_eq!(
+        network.talker.take_stored_firmware(),
+        Some(StoredFirmware {
+            image: image.clone(),
+            reboot: true
+        })
+    );
+    network.talker.finish_firmware(true);
+    network.run(50);
+    let statuses: Vec<(u16, u16)> =
+        std::iter::from_fn(|| network.controller.poll_operation_status())
+            .map(|status| (status.operation_id, status.percent_complete))
+            .collect();
+    assert_eq!(statuses, [(store, 1000), (upload, 1000)]);
+
+    // An upload aborted goes; a store that fails its check says 0.
+    let (_, upload) = operation(&mut network, MemoryObjectOperation::UPLOAD, &length);
+    assert_eq!(write(&mut network, 0, 502), AaStatus::SUCCESS);
+    let abort = network.controller.abort_operation(
+        network.now,
+        TALKER,
+        DescriptorType::MEMORY_OBJECT,
+        index,
+        upload.unwrap(),
+    );
+    assert_eq!(finish(&mut network, abort), Outcome::Done);
+    assert!(!network.talker.uploading());
+    assert_eq!(write(&mut network, 502, 502), AaStatus::ADDRESS_INVALID);
+    let (_, upload) = operation(&mut network, MemoryObjectOperation::UPLOAD, &length);
+    for (offset, length) in [(0, 502), (502, 502), (1004, 296)] {
+        assert_eq!(write(&mut network, offset, length), AaStatus::SUCCESS);
+    }
+    let (_, store) = operation(&mut network, MemoryObjectOperation::STORE, &[]);
+    assert!(!network.talker.take_stored_firmware().unwrap().reboot);
+    network.talker.finish_firmware(false);
+    network.run(50);
+    let statuses: Vec<(u16, u16)> =
+        std::iter::from_fn(|| network.controller.poll_operation_status())
+            .map(|status| (status.operation_id, status.percent_complete))
+            .collect();
+    assert_eq!(statuses, [(store.unwrap(), 0), (upload.unwrap(), 0)]);
+}

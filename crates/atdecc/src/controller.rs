@@ -272,8 +272,25 @@ pub enum Refusal {
     Aem(AemStatus),
 }
 
-/// An entity's answer to [`Controller::read_memory`]: its Address Access
-/// status, and each TLV's address and octets, as it answered them.
+/// An OPERATION_STATUS report: how far the operation `operation_id` on a
+/// CONTROL or MEMORY_OBJECT has got, `percent_complete` in tenths of a
+/// percent, 1000 when done. 0xFFFF is unknown but going on; 0, as IEEE
+/// 1722.1-2013 and Hive have it, and other values over 1000 are a failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OperationStatus {
+    pub entity_id: EntityId,
+    pub descriptor_type: DescriptorType,
+    pub index: u16,
+    pub operation_id: u16,
+    pub percent_complete: u16,
+}
+
+/// OPERATION_STATUS reports kept until taken.
+const MAX_OPERATION_STATUSES: usize = 64;
+
+/// An entity's answer to [`Controller::read_memory`] or
+/// [`Controller::write_memory`]: its Address Access status, and each
+/// TLV's address and octets, as it answered them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemoryRead {
     pub status: AaStatus,
@@ -465,6 +482,19 @@ enum Request {
     StartOperation {
         command: CommandId,
     },
+    /// The caller's Address Access WRITE, in `memory_writes`.
+    WriteMemoryForCaller {
+        command: CommandId,
+    },
+    /// The caller's ABORT_OPERATION, in `aborts`.
+    AbortOperation {
+        command: CommandId,
+    },
+    /// The caller's LOCK_ENTITY, or with `unlock` its UNLOCK.
+    LockEntity {
+        command: CommandId,
+        unlock: bool,
+    },
 }
 
 /// The protocols whose commands are numbered apart.
@@ -492,9 +522,9 @@ impl Request {
             | Request::GetTxState { .. }
             | Request::GetTxConnection { .. }
             | Request::DisconnectTx { .. } => Channel::Acmp,
-            Request::ReadMemory { .. } | Request::ReadMemoryForCaller { .. } => {
-                Channel::AddressAccess
-            }
+            Request::ReadMemory { .. }
+            | Request::ReadMemoryForCaller { .. }
+            | Request::WriteMemoryForCaller { .. } => Channel::AddressAccess,
             _ => Channel::Aem,
         }
     }
@@ -531,6 +561,9 @@ impl Request {
             | Request::SetWirelessConfig { command, .. }
             | Request::ReadMemoryForCaller { command }
             | Request::StartOperation { command }
+            | Request::WriteMemoryForCaller { command }
+            | Request::AbortOperation { command }
+            | Request::LockEntity { command, .. }
             | Request::ChangeMappings { command, .. } => Some(command),
             Request::Identify { command, .. }
             | Request::GetTxState { command, .. }
@@ -640,6 +673,12 @@ pub struct Controller {
     operation_asks: BTreeMap<CommandId, (DescriptorType, u16, u16, Vec<u8>)>,
     /// The operation_id each started operation was given, until taken.
     operation_ids: BTreeMap<CommandId, u16>,
+    /// The address and octets of each caller's Address Access WRITE.
+    memory_writes: BTreeMap<CommandId, (u64, Vec<u8>)>,
+    /// The operation each caller's ABORT_OPERATION stops.
+    aborts: BTreeMap<CommandId, (DescriptorType, u16, u16)>,
+    /// OPERATION_STATUS reports entities sent, oldest first, until taken.
+    operation_statuses: VecDeque<OperationStatus>,
     advertiser: Option<Advertiser>,
     random: Random,
     outgoing: VecDeque<(MacAddress, Vec<u8>)>,
@@ -671,6 +710,9 @@ impl Controller {
             memory_answers: BTreeMap::new(),
             operation_asks: BTreeMap::new(),
             operation_ids: BTreeMap::new(),
+            memory_writes: BTreeMap::new(),
+            aborts: BTreeMap::new(),
+            operation_statuses: VecDeque::new(),
             advertiser: config.advertise.map(|advertise| Advertiser {
                 config: advertise,
                 available_index: 0,
@@ -1302,9 +1344,12 @@ impl Controller {
         if inflight.entity_id != header.target_entity_id {
             return;
         }
-        if let Request::ReadMemoryForCaller { command } = inflight.request {
+        if let Request::ReadMemoryForCaller { command }
+        | Request::WriteMemoryForCaller { command } = inflight.request
+        {
             self.complete(key, inflight);
             self.memory_asks.remove(&command);
+            self.memory_writes.remove(&command);
             let tlvs = response
                 .tlvs()
                 .map_while(Result::ok)
@@ -1481,6 +1526,15 @@ impl Controller {
                 self.events
                     .push_back(Event::CommandFinished(command, aem_outcome(aem)));
             }
+            Request::AbortOperation { command } => {
+                self.aborts.remove(&command);
+                self.events
+                    .push_back(Event::CommandFinished(command, aem_outcome(aem)));
+            }
+            Request::LockEntity { command, .. } => {
+                self.events
+                    .push_back(Event::CommandFinished(command, aem_outcome(aem)));
+            }
             Request::StartOperation { command } => {
                 self.operation_asks.remove(&command);
                 if aem.status().is_success() && aem.payload.len() >= 6 {
@@ -1617,7 +1671,8 @@ impl Controller {
             | Request::GetTxConnection { .. }
             | Request::DisconnectTx { .. }
             | Request::ReadMemory { .. }
-            | Request::ReadMemoryForCaller { .. } => {}
+            | Request::ReadMemoryForCaller { .. }
+            | Request::WriteMemoryForCaller { .. } => {}
         }
         self.check_complete(entity_id);
     }
@@ -2561,6 +2616,21 @@ impl Controller {
     }
 
     fn handle_notification(&mut self, entity_id: EntityId, aem: &AemPdu<'_>) {
+        if aem.command_type == AemCommandType::OPERATION_STATUS {
+            if aem.payload.len() >= 8 && self.entities.contains_key(&entity_id) {
+                if self.operation_statuses.len() >= MAX_OPERATION_STATUSES {
+                    self.operation_statuses.pop_front();
+                }
+                self.operation_statuses.push_back(OperationStatus {
+                    entity_id,
+                    descriptor_type: DescriptorType(crate::avtp::read_u16(aem.payload, 0)),
+                    index: crate::avtp::read_u16(aem.payload, 2),
+                    operation_id: crate::avtp::read_u16(aem.payload, 4),
+                    percent_complete: crate::avtp::read_u16(aem.payload, 6),
+                });
+            }
+            return;
+        }
         let Some(model) = self.models.get_mut(&entity_id) else {
             return;
         };
@@ -2883,6 +2953,49 @@ impl Controller {
                     .map_or(&[][..], Vec::as_slice),
                 &mut out,
             ),
+            Request::WriteMemoryForCaller { command } => {
+                let Some((address, data)) = self.memory_writes.get(&command) else {
+                    return false;
+                };
+                let mut tlv = [0; AddressAccessPdu::MAX_TLVS_LEN];
+                AaTlv {
+                    mode: AaMode::WRITE,
+                    length: data.len() as u16,
+                    address: *address,
+                    data,
+                }
+                .encode(&mut tlv)
+                .and_then(|written| {
+                    AddressAccessPdu {
+                        header: AecpHeader {
+                            message_type: AecpMessageType::ADDRESS_ACCESS_COMMAND,
+                            status: 0,
+                            target_entity_id: addressing.target,
+                            controller_entity_id: addressing.controller,
+                            sequence_id,
+                        },
+                        tlv_count: 1,
+                        tlvs: &tlv[..written],
+                    }
+                    .encode(&mut out)
+                })
+            }
+            Request::LockEntity { unlock, .. } => {
+                aem::encode_lock_entity(addressing, unlock, &mut out)
+            }
+            Request::AbortOperation { command } => {
+                let Some(&(descriptor_type, index, operation_id)) = self.aborts.get(&command)
+                else {
+                    return false;
+                };
+                aem::encode_abort_operation(
+                    addressing,
+                    descriptor_type,
+                    index,
+                    operation_id,
+                    &mut out,
+                )
+            }
             Request::StartOperation { command } => {
                 let Some((descriptor_type, index, operation_type, values)) =
                     self.operation_asks.get(&command)
@@ -3531,8 +3644,9 @@ impl Controller {
         command
     }
 
-    /// The answer to a [`read_memory`](Self::read_memory) command that
-    /// finished [`Done`](Outcome::Done), taken once.
+    /// The answer to a [`read_memory`](Self::read_memory) or
+    /// [`write_memory`](Self::write_memory) command that finished
+    /// [`Done`](Outcome::Done), taken once.
     pub fn take_memory_read(&mut self, command: CommandId) -> Option<MemoryRead> {
         self.memory_answers.remove(&command)
     }
@@ -3574,6 +3688,79 @@ impl Controller {
     /// command that finished [`Done`](Outcome::Done), taken once.
     pub fn take_operation_id(&mut self, command: CommandId) -> Option<u16> {
         self.operation_ids.remove(&command)
+    }
+
+    /// Locks an entity whole against other controllers' changes
+    /// (LOCK_ENTITY, 7.4.2), or with `unlock` lets it go. An entity lets a
+    /// lock go by itself after a time, 60 s in Milan, unless locked again.
+    pub fn lock_entity(&mut self, now: Instant, entity_id: EntityId, unlock: bool) -> CommandId {
+        let command = self.next_command();
+        self.queue_command(
+            now,
+            entity_id,
+            command,
+            Request::LockEntity { command, unlock },
+        );
+        command
+    }
+
+    /// Stops an operation START_OPERATION started (ABORT_OPERATION,
+    /// 7.4.54), by the operation_id it was given.
+    pub fn abort_operation(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        descriptor_type: DescriptorType,
+        index: u16,
+        operation_id: u16,
+    ) -> CommandId {
+        let command = self.next_command();
+        self.aborts
+            .insert(command, (descriptor_type, index, operation_id));
+        self.queue_command(now, entity_id, command, Request::AbortOperation { command });
+        if !self.entities.contains_key(&entity_id) {
+            self.aborts.remove(&command);
+        }
+        command
+    }
+
+    /// Writes `data` to an entity's memory through Address Access: one
+    /// command with one WRITE TLV, as a memory object upload sends
+    /// (Annex D), of [`AddressAccessPdu::MAX_TLVS_LEN`] less a TLV header,
+    /// 502 octets, at most. The command finishes [`Done`](Outcome::Done)
+    /// once the entity answers, whatever its status;
+    /// [`take_memory_read`](Self::take_memory_read) gives the answer.
+    pub fn write_memory(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        address: u64,
+        data: &[u8],
+    ) -> CommandId {
+        let command = self.next_command();
+        if data.is_empty() || data.len() > AddressAccessPdu::MAX_TLVS_LEN - AaTlv::HEADER_LEN {
+            self.events
+                .push_back(Event::CommandFinished(command, Outcome::NotPossible));
+            return command;
+        }
+        self.memory_writes.insert(command, (address, data.to_vec()));
+        self.queue_command(
+            now,
+            entity_id,
+            command,
+            Request::WriteMemoryForCaller { command },
+        );
+        if !self.entities.contains_key(&entity_id) {
+            self.memory_writes.remove(&command);
+        }
+        command
+    }
+
+    /// The next OPERATION_STATUS report an entity sent (7.4.55), oldest
+    /// first: they come to a controller registered for its unsolicited
+    /// notifications. The last 64 are kept.
+    pub fn poll_operation_status(&mut self) -> Option<OperationStatus> {
+        self.operation_statuses.pop_front()
     }
 
     /// Takes the max transit time a response or notification carries for
@@ -3625,6 +3812,8 @@ impl Controller {
         self.control_values.remove(&command);
         self.memory_asks.remove(&command);
         self.operation_asks.remove(&command);
+        self.memory_writes.remove(&command);
+        self.aborts.remove(&command);
     }
 
     /// Takes a control's current values into its entity's model.
@@ -4169,6 +4358,8 @@ fn command_type_of(request: Request) -> AemCommandType {
         Request::SetConfiguration { .. } => AemCommandType::SET_CONFIGURATION,
         Request::SetControl { .. } => AemCommandType::SET_CONTROL,
         Request::StartOperation { .. } => AemCommandType::START_OPERATION,
+        Request::AbortOperation { .. } => AemCommandType::ABORT_OPERATION,
+        Request::LockEntity { .. } => AemCommandType::LOCK_ENTITY,
         Request::GetMaxTransitTime { .. } => AemCommandType::GET_MAX_TRANSIT_TIME,
         Request::SetMaxTransitTime { .. } => AemCommandType::SET_MAX_TRANSIT_TIME,
         Request::ReadForCaller { .. } | Request::ReadOther { .. } => {
@@ -4191,7 +4382,8 @@ fn command_type_of(request: Request) -> AemCommandType {
         | Request::GetTxConnection { .. }
         | Request::DisconnectTx { .. }
         | Request::ReadMemory { .. }
-        | Request::ReadMemoryForCaller { .. } => AemCommandType(0xffff),
+        | Request::ReadMemoryForCaller { .. }
+        | Request::WriteMemoryForCaller { .. } => AemCommandType(0xffff),
     }
 }
 

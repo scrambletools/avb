@@ -37,8 +37,8 @@ use crate::stream_format::StreamFormat;
 use crate::time::Instant;
 
 pub use model::{
-    CRASH_DUMP_ADDRESS, ClockQuality, EndpointModel, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel,
-    VENDOR_LOGO_ADDRESS,
+    CRASH_DUMP_ADDRESS, ClockQuality, EndpointModel, FIRMWARE_ADDRESS, LOGO_ADDRESS,
+    MEMORY_SEGMENT, StreamModel, VENDOR_LOGO_ADDRESS,
 };
 use model::{EntityState, ExtraMemory, name_field};
 
@@ -278,6 +278,11 @@ pub struct Entity {
     crash_dump: Option<(Vec<u8>, u64)>,
     /// The last operation_id START_OPERATION gave.
     operation_id: u16,
+    /// The OPERATION_STATUS of an operation START_OPERATION finished at
+    /// once, to send once it is answered.
+    operation_done: Option<Vec<u8>>,
+    /// Its firmware image, uploaded as Annex D has it, if it takes one.
+    firmware: Option<Firmware>,
     outgoing: VecDeque<(MacAddress, Vec<u8>)>,
     events: VecDeque<EntityEvent>,
 }
@@ -339,6 +344,8 @@ impl Entity {
             log: None,
             crash_dump: None,
             operation_id: 0,
+            operation_done: None,
+            firmware: None,
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -399,12 +406,23 @@ impl Entity {
             length: dump.len() as u64,
             maximum_length: *maximum,
         });
-        log.into_iter().chain(crash).collect()
+        let firmware = self.firmware.as_ref().map(|firmware| ExtraMemory {
+            memory_object_type: MemoryObjectType::FIRMWARE_IMAGE,
+            name: "Firmware",
+            address: FIRMWARE_ADDRESS,
+            length: firmware.staged,
+            maximum_length: firmware.maximum,
+        });
+        log.into_iter().chain(crash).chain(firmware).collect()
     }
 
     /// START_OPERATION: an ERASE of its crash dump, done at once, is the
     /// one operation it has.
-    fn start_operation(&mut self, payload: &[u8]) -> (AemStatus, Vec<u8>, bool) {
+    fn start_operation(
+        &mut self,
+        controller: EntityId,
+        payload: &[u8],
+    ) -> (AemStatus, Vec<u8>, bool) {
         let mut answer = Vec::from(payload);
         if payload.len() < 8 {
             return (AemStatus::BAD_ARGUMENTS, answer, false);
@@ -412,8 +430,11 @@ impl Entity {
         let descriptor_type = DescriptorType(read_u16(payload, 0));
         let index = read_u16(payload, 2);
         let operation_type = MemoryObjectOperation(read_u16(payload, 6));
-        let crash_dump = descriptor_type == DescriptorType::MEMORY_OBJECT
-            && Some(index) == self.crash_dump_index();
+        let memory_object = descriptor_type == DescriptorType::MEMORY_OBJECT;
+        if memory_object && Some(index) == self.firmware_index() {
+            return self.firmware_operation(controller, operation_type, answer);
+        }
+        let crash_dump = memory_object && Some(index) == self.crash_dump_index();
         if !crash_dump {
             return (AemStatus::NO_SUCH_DESCRIPTOR, answer, false);
         }
@@ -423,9 +444,210 @@ impl Entity {
         if let Some((dump, _)) = &mut self.crash_dump {
             dump.clear();
         }
-        self.operation_id = self.operation_id.wrapping_add(1).max(1);
-        answer[4..6].copy_from_slice(&self.operation_id.to_be_bytes());
+        let operation_id = self.next_operation_id();
+        answer[4..6].copy_from_slice(&operation_id.to_be_bytes());
+        // Done at once: 1000 to the registered controllers once answered.
+        let mut done = Vec::from(&answer[..6]);
+        done.extend_from_slice(&1000u16.to_be_bytes());
+        self.operation_done = Some(done);
         (AemStatus::SUCCESS, answer, false)
+    }
+
+    fn next_operation_id(&mut self) -> u16 {
+        self.operation_id = self.operation_id.wrapping_add(1).max(1);
+        self.operation_id
+    }
+
+    /// Takes firmware images of up to `maximum_length` octets, uploaded
+    /// as IEEE 1722.1-2021 Annex D has it: a FIRMWARE_IMAGE memory object
+    /// at [`FIRMWARE_ADDRESS`], after its crash dump. START_OPERATION's
+    /// UPLOAD gives its length, Address Access WRITEs its octets in
+    /// order, and STORE or STORE_AND_REBOOT hands it over:
+    /// [`take_stored_firmware`](Self::take_stored_firmware) gives it to
+    /// the program running the entity, which checks it, keeps it and says
+    /// how that went with [`finish_firmware`](Self::finish_firmware).
+    /// Called before [`start`](Self::start), as it adds a descriptor.
+    pub fn keep_firmware(&mut self, maximum_length: u64) {
+        self.firmware = Some(Firmware {
+            maximum: maximum_length,
+            streams_running: false,
+            upload: None,
+            stored: None,
+            storing: None,
+            staged: 0,
+        });
+    }
+
+    /// Says whether its streams run: while they do, an UPLOAD is refused
+    /// with STREAM_IS_RUNNING, unless the controller asking holds its
+    /// lock, which lets it stop them.
+    pub fn set_streams_running(&mut self, running: bool) {
+        if let Some(firmware) = &mut self.firmware {
+            firmware.streams_running = running;
+        }
+    }
+
+    /// Whether an upload goes on: from UPLOAD to its STORE or abort.
+    pub fn uploading(&self) -> bool {
+        self.firmware
+            .as_ref()
+            .is_some_and(|firmware| firmware.upload.is_some())
+    }
+
+    /// The image a STORE or STORE_AND_REBOOT handed over, once.
+    pub fn take_stored_firmware(&mut self) -> Option<StoredFirmware> {
+        self.firmware.as_mut()?.stored.take()
+    }
+
+    /// Says whether the image handed over was checked and kept: sends
+    /// OPERATION_STATUS of 1000, or 0 for a failure, for the store and
+    /// the upload to the registered controllers.
+    pub fn finish_firmware(&mut self, kept: bool) {
+        let Some(index) = self.firmware_index() else {
+            return;
+        };
+        let Some(firmware) = &mut self.firmware else {
+            return;
+        };
+        let Some((store, upload, length)) = firmware.storing.take() else {
+            return;
+        };
+        firmware.staged = if kept { length } else { 0 };
+        let percent: u16 = if kept { 1000 } else { 0 };
+        for operation_id in [store, upload] {
+            let mut status = Vec::new();
+            status.extend_from_slice(&DescriptorType::MEMORY_OBJECT.0.to_be_bytes());
+            status.extend_from_slice(&index.to_be_bytes());
+            status.extend_from_slice(&operation_id.to_be_bytes());
+            status.extend_from_slice(&percent.to_be_bytes());
+            self.notify(AemCommandType::OPERATION_STATUS, &status, None);
+        }
+    }
+
+    /// The MEMORY_OBJECT index of its firmware image, if it takes one.
+    fn firmware_index(&self) -> Option<u16> {
+        self.firmware.as_ref()?;
+        Some(
+            self.model.memory_count()
+                + u16::from(self.log.is_some())
+                + u16::from(self.crash_dump.is_some()),
+        )
+    }
+
+    /// START_OPERATION on its firmware image: UPLOAD, STORE or
+    /// STORE_AND_REBOOT.
+    fn firmware_operation(
+        &mut self,
+        controller: EntityId,
+        operation_type: MemoryObjectOperation,
+        mut answer: Vec<u8>,
+    ) -> (AemStatus, Vec<u8>, bool) {
+        let locked = matches!(self.lock, Some((holder, _)) if holder == controller);
+        let operation_id = self.operation_id.wrapping_add(1).max(1);
+        let Some(firmware) = &mut self.firmware else {
+            return (AemStatus::NO_SUCH_DESCRIPTOR, answer, false);
+        };
+        match operation_type {
+            MemoryObjectOperation::UPLOAD => {
+                if answer.len() < 16 {
+                    return (AemStatus::BAD_ARGUMENTS, answer, false);
+                }
+                let length = read_u64(&answer, 8);
+                if length == 0 || length > firmware.maximum {
+                    return (AemStatus::BAD_ARGUMENTS, answer, false);
+                }
+                if firmware.streams_running && !locked {
+                    return (AemStatus::STREAM_IS_RUNNING, answer, false);
+                }
+                firmware.upload = Some(Upload {
+                    length,
+                    data: Vec::new(),
+                    operation_id,
+                    last: None,
+                });
+                firmware.staged = 0;
+            }
+            MemoryObjectOperation::STORE | MemoryObjectOperation::STORE_AND_REBOOT => {
+                let whole = firmware
+                    .upload
+                    .as_ref()
+                    .is_some_and(|upload| upload.data.len() as u64 == upload.length);
+                if !whole {
+                    return (AemStatus::BAD_ARGUMENTS, answer, false);
+                }
+                let Some(upload) = firmware.upload.take() else {
+                    return (AemStatus::BAD_ARGUMENTS, answer, false);
+                };
+                firmware.storing = Some((operation_id, upload.operation_id, upload.length));
+                firmware.stored = Some(StoredFirmware {
+                    image: upload.data,
+                    reboot: operation_type == MemoryObjectOperation::STORE_AND_REBOOT,
+                });
+            }
+            _ => return (AemStatus::BAD_ARGUMENTS, answer, false),
+        }
+        self.operation_id = operation_id;
+        answer[4..6].copy_from_slice(&operation_id.to_be_bytes());
+        (AemStatus::SUCCESS, answer, false)
+    }
+
+    /// ABORT_OPERATION: an upload of its firmware stops, its octets
+    /// dropped.
+    fn abort_operation(&mut self, payload: &[u8]) -> (AemStatus, Vec<u8>, bool) {
+        let answer = Vec::from(payload);
+        if payload.len() < 6 {
+            return (AemStatus::BAD_ARGUMENTS, answer, false);
+        }
+        let descriptor_type = DescriptorType(read_u16(payload, 0));
+        let index = read_u16(payload, 2);
+        let operation_id = read_u16(payload, 4);
+        if descriptor_type != DescriptorType::MEMORY_OBJECT || Some(index) != self.firmware_index()
+        {
+            return (AemStatus::NO_SUCH_DESCRIPTOR, answer, false);
+        }
+        let Some(firmware) = &mut self.firmware else {
+            return (AemStatus::NO_SUCH_DESCRIPTOR, answer, false);
+        };
+        match &firmware.upload {
+            Some(upload) if upload.operation_id == operation_id => {
+                firmware.upload = None;
+                (AemStatus::SUCCESS, answer, false)
+            }
+            _ => (AemStatus::BAD_ARGUMENTS, answer, false),
+        }
+    }
+
+    /// An Address Access WRITE of its firmware image's next octets, or a
+    /// repeat of the last, answered in place without writing it again.
+    fn write_firmware(&mut self, command: &AddressAccessPdu<'_>) -> Result<Vec<u8>, AaStatus> {
+        let mut tlvs = command.tlvs();
+        let tlv = tlvs
+            .next()
+            .ok_or(AaStatus::TLV_INVALID)?
+            .map_err(|_| AaStatus::TLV_INVALID)?;
+        if tlvs.next().is_some() {
+            return Err(AaStatus::TLV_INVALID);
+        }
+        let upload = self
+            .firmware
+            .as_mut()
+            .and_then(|firmware| firmware.upload.as_mut())
+            .ok_or(AaStatus::ADDRESS_INVALID)?;
+        let offset = tlv.address - FIRMWARE_ADDRESS;
+        let length = tlv.data.len();
+        if upload.last == Some((offset, length)) {
+            // A retry of the last, after its answer went missing.
+        } else if offset != upload.data.len() as u64 {
+            return Err(AaStatus::ADDRESS_INVALID);
+        } else if offset + length as u64 > upload.length {
+            return Err(AaStatus::ADDRESS_TOO_HIGH);
+        } else {
+            upload.data.extend_from_slice(tlv.data);
+            upload.last = Some((offset, length));
+        }
+        let mut answer = alloc::vec![0; AaTlv::HEADER_LEN + length];
+        tlv.encode(&mut answer).map_err(|_| AaStatus::TLV_INVALID)?;
+        Ok(answer)
     }
 
     /// The MEMORY_OBJECT index of its crash dump, if it keeps one.
@@ -883,7 +1105,15 @@ impl Entity {
             | EntityCapabilities::AEM_IDENTIFY_CONTROL_INDEX_VALID
             | EntityCapabilities::AEM_INTERFACE_INDEX_VALID;
         // Its logos and log are read through Address Access.
-        if self.model.has_memory() || self.log.is_some() || self.crash_dump.is_some() {
+        // Firmware Upgrade mode, from an UPLOAD to its STORE or abort.
+        if self.uploading() {
+            capabilities |= EntityCapabilities::EFU_MODE;
+        }
+        if self.model.has_memory()
+            || self.log.is_some()
+            || self.crash_dump.is_some()
+            || self.firmware.is_some()
+        {
             capabilities |= EntityCapabilities::ADDRESS_ACCESS_SUPPORTED;
         }
         let model = &self.model;
@@ -1013,7 +1243,17 @@ impl Entity {
         source: MacAddress,
         command: &AddressAccessPdu<'_>,
     ) {
-        let (status, tlv_count, tlvs) = match self.read_memory(now, command) {
+        let writes_firmware = command
+            .tlvs()
+            .next()
+            .and_then(Result::ok)
+            .is_some_and(|tlv| tlv.mode == AaMode::WRITE && tlv.address >= FIRMWARE_ADDRESS);
+        let answered = if writes_firmware {
+            self.write_firmware(command)
+        } else {
+            self.read_memory(now, command)
+        };
+        let (status, tlv_count, tlvs) = match answered {
             Ok(answer) => (AaStatus::SUCCESS, command.tlv_count, answer),
             Err(refusal) => {
                 let (count, tlvs) = refused(command);
@@ -1529,6 +1769,7 @@ impl Entity {
                 | AemCommandType::ADD_AUDIO_MAPPINGS
                 | AemCommandType::REMOVE_AUDIO_MAPPINGS
                 | AemCommandType::START_OPERATION
+                | AemCommandType::ABORT_OPERATION
         );
         if changes && !self.may_change(controller) {
             let payload = Vec::from(command.payload);
@@ -1554,11 +1795,11 @@ impl Entity {
         if status.is_success() && notify {
             self.notify(command.command_type, &payload, Some(controller));
         }
-        // An operation done at once: its OPERATION_STATUS of 1000 to every
+        // An operation done at once: its OPERATION_STATUS to every
         // registered controller (7.4.55).
-        if status.is_success() && command.command_type == AemCommandType::START_OPERATION {
-            let mut done = Vec::from(&payload[..6]);
-            done.extend_from_slice(&1000u16.to_be_bytes());
+        if let Some(done) = self.operation_done.take()
+            && status.is_success()
+        {
             self.notify(AemCommandType::OPERATION_STATUS, &done, None);
         }
     }
@@ -1819,7 +2060,8 @@ impl Entity {
                     _ => (AemStatus::NO_SUCH_DESCRIPTOR, echo(), false),
                 }
             }
-            AemCommandType::START_OPERATION => self.start_operation(payload),
+            AemCommandType::START_OPERATION => self.start_operation(controller, payload),
+            AemCommandType::ABORT_OPERATION => self.abort_operation(payload),
             AemCommandType::GET_AUDIO_MAP => self.audio_map(payload),
             AemCommandType::ADD_AUDIO_MAPPINGS | AemCommandType::REMOVE_AUDIO_MAPPINGS => {
                 self.change_mappings(command.command_type, payload)
@@ -2403,4 +2645,37 @@ fn one_to_one(stream: u16, channels: u16) -> Vec<AudioMapping> {
             cluster_channel: 0,
         })
         .collect()
+}
+
+/// A firmware target's state: an upload going on, an image handed over and
+/// not yet taken, one being checked, and the length of one kept.
+#[derive(Debug, Clone)]
+struct Firmware {
+    maximum: u64,
+    streams_running: bool,
+    upload: Option<Upload>,
+    stored: Option<StoredFirmware>,
+    /// The store's and the upload's operation IDs and the image's length,
+    /// until the program says how the check went.
+    storing: Option<(u16, u16, u64)>,
+    /// The length of the image kept, which its descriptor shows.
+    staged: u64,
+}
+
+/// An upload going on: its length, the octets so far, its operation_id
+/// and the last WRITE's offset and length.
+#[derive(Debug, Clone)]
+struct Upload {
+    length: u64,
+    data: Vec<u8>,
+    operation_id: u16,
+    last: Option<(u64, usize)>,
+}
+
+/// A firmware image a STORE or STORE_AND_REBOOT handed over, and whether
+/// the entity restarts once it is kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFirmware {
+    pub image: Vec<u8>,
+    pub reboot: bool,
 }

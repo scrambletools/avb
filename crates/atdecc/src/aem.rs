@@ -196,6 +196,35 @@ pub fn encode_start_operation(
     command(addressing, AemCommandType::START_OPERATION, body).encode(out)
 }
 
+/// Encodes LOCK_ENTITY (7.4.2) for the whole entity, or with `unlock`
+/// its UNLOCK flag, which lets it go.
+pub fn encode_lock_entity(
+    addressing: Addressing,
+    unlock: bool,
+    out: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let mut payload = [0; 16];
+    payload[3] = u8::from(unlock);
+    payload[12..14].copy_from_slice(&DescriptorType::ENTITY.0.to_be_bytes());
+    command(addressing, AemCommandType::LOCK_ENTITY, &payload).encode(out)
+}
+
+/// Encodes ABORT_OPERATION (7.4.54): stops the operation `operation_id`
+/// that START_OPERATION started on a CONTROL or MEMORY_OBJECT.
+pub fn encode_abort_operation(
+    addressing: Addressing,
+    descriptor_type: DescriptorType,
+    index: u16,
+    operation_id: u16,
+    out: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let mut payload = [0; 8];
+    payload[0..2].copy_from_slice(&descriptor_type.0.to_be_bytes());
+    payload[2..4].copy_from_slice(&index.to_be_bytes());
+    payload[4..6].copy_from_slice(&operation_id.to_be_bytes());
+    command(addressing, AemCommandType::ABORT_OPERATION, &payload).encode(out)
+}
+
 /// Encodes GET_AVB_INFO for an AVB_INTERFACE.
 pub fn encode_get_avb_info(
     addressing: Addressing,

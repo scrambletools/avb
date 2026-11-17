@@ -144,6 +144,9 @@ pub const VENDOR_LOGO_ADDRESS: u64 = 0x2000_0000;
 /// Where a crash dump's octets start, the next 4 GiB above the log's
 /// ([`crate::log::LOG_ADDRESS`]).
 pub const CRASH_DUMP_ADDRESS: u64 = 0x2_0000_0000;
+/// Where a firmware image is uploaded to, the next 4 GiB above the crash
+/// dump's.
+pub const FIRMWARE_ADDRESS: u64 = 0x3_0000_0000;
 
 /// A memory object an entity has beside its logos that its model does
 /// not hold: its log, its crash dump.
