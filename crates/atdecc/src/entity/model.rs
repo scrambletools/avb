@@ -328,6 +328,11 @@ impl EndpointModel {
         })
     }
 
+    /// How many memory objects it has, before any log.
+    pub(crate) fn memory_count(&self) -> u16 {
+        self.memory_objects().count() as u16
+    }
+
     /// Whether it has memory for Address Access to read.
     pub(crate) fn has_memory(&self) -> bool {
         self.memory_objects().next().is_some()
@@ -369,6 +374,19 @@ impl EndpointModel {
         index: u16,
         entity: &EntityState,
     ) -> Option<Vec<u8>> {
+        self.descriptor_with_log(descriptor_type, index, entity, None)
+    }
+
+    /// As [`descriptor`](Self::descriptor), for an entity that keeps a
+    /// log of this length and maximum length: a MEMORY_OBJECT of
+    /// LOG_OBJECT after its logos.
+    pub(crate) fn descriptor_with_log(
+        &self,
+        descriptor_type: DescriptorType,
+        index: u16,
+        entity: &EntityState,
+        log: Option<(u64, u64)>,
+    ) -> Option<Vec<u8>> {
         let ports = self.ports();
         let mut writer = Writer::new(descriptor_type, index);
         let bytes = match descriptor_type {
@@ -393,7 +411,16 @@ impl EndpointModel {
                 .u16(0) // current_configuration
                 .done(),
             DescriptorType::CONFIGURATION if index == 0 => {
-                let counts = self.descriptor_counts();
+                let mut counts = self.descriptor_counts();
+                if log.is_some() {
+                    match counts
+                        .iter_mut()
+                        .find(|(kind, _)| *kind == DescriptorType::MEMORY_OBJECT)
+                    {
+                        Some((_, count)) => *count += 1,
+                        None => counts.push((DescriptorType::MEMORY_OBJECT, 1)),
+                    }
+                }
                 writer
                     .name("Configuration")
                     .u16(NO_STRING)
@@ -599,6 +626,22 @@ impl EndpointModel {
                 .u16(NO_STRING)
                 .pad_to(212)
                 .done(),
+            DescriptorType::MEMORY_OBJECT
+                if log.is_some() && index == self.memory_objects().count() as u16 =>
+            {
+                let (length, maximum_length) = log?;
+                writer
+                    .name("Log")
+                    .u16(NO_STRING)
+                    .u16(MemoryObjectType::LOG_OBJECT.0)
+                    .u16(DescriptorType::ENTITY.0) // target_descriptor_type
+                    .u16(0) // target_descriptor_index
+                    .u64(crate::log::LOG_ADDRESS) // start_address
+                    .u64(maximum_length)
+                    .u64(length)
+                    .u64(u64::from(MEMORY_SEGMENT)) // maximum_segment_length
+                    .done()
+            }
             DescriptorType::MEMORY_OBJECT => {
                 let object = self.memory_objects().nth(usize::from(index))?;
                 let length = object.data.len() as u64;

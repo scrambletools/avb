@@ -37,6 +37,7 @@ pub mod descriptor;
 pub mod error;
 pub mod id;
 pub mod lite;
+pub mod log;
 #[cfg(feature = "alloc")]
 pub mod maap;
 #[cfg(feature = "alloc")]

@@ -272,6 +272,14 @@ pub enum Refusal {
     Aem(AemStatus),
 }
 
+/// An entity's answer to [`Controller::read_memory`]: its Address Access
+/// status, and each TLV's address and octets, as it answered them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryRead {
+    pub status: AaStatus,
+    pub tlvs: Vec<(u64, Vec<u8>)>,
+}
+
 /// A frame for the caller to send: `length` octets at the start of the
 /// buffer given to [`Controller::poll_transmit`], on the AVTP ethertype.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,6 +457,10 @@ enum Request {
         index: u16,
         offset: u32,
     },
+    /// The caller's Address Access READs, in `memory_asks`.
+    ReadMemoryForCaller {
+        command: CommandId,
+    },
 }
 
 /// The protocols whose commands are numbered apart.
@@ -476,7 +488,9 @@ impl Request {
             | Request::GetTxState { .. }
             | Request::GetTxConnection { .. }
             | Request::DisconnectTx { .. } => Channel::Acmp,
-            Request::ReadMemory { .. } => Channel::AddressAccess,
+            Request::ReadMemory { .. } | Request::ReadMemoryForCaller { .. } => {
+                Channel::AddressAccess
+            }
             _ => Channel::Aem,
         }
     }
@@ -511,6 +525,7 @@ impl Request {
             | Request::ReadForCaller { command, .. }
             | Request::SetLiteConfig { command, .. }
             | Request::SetWirelessConfig { command, .. }
+            | Request::ReadMemoryForCaller { command }
             | Request::ChangeMappings { command, .. } => Some(command),
             Request::Identify { command, .. }
             | Request::GetTxState { command, .. }
@@ -611,6 +626,10 @@ pub struct Controller {
     /// The octets read so far of each memory object being read, by entity
     /// and MEMORY_OBJECT index.
     memory_reads: BTreeMap<(EntityId, u16), Vec<u8>>,
+    /// The READs of each caller's Address Access command waiting to go.
+    memory_asks: BTreeMap<CommandId, Vec<(u64, u16)>>,
+    /// The answers to callers' Address Access commands, until taken.
+    memory_answers: BTreeMap<CommandId, MemoryRead>,
     advertiser: Option<Advertiser>,
     random: Random,
     outgoing: VecDeque<(MacAddress, Vec<u8>)>,
@@ -638,6 +657,8 @@ impl Controller {
             mapping_changes: BTreeMap::new(),
             control_values: BTreeMap::new(),
             memory_reads: BTreeMap::new(),
+            memory_asks: BTreeMap::new(),
+            memory_answers: BTreeMap::new(),
             advertiser: config.advertise.map(|advertise| Advertiser {
                 config: advertise,
                 available_index: 0,
@@ -1266,12 +1287,31 @@ impl Controller {
         let Some(&inflight) = self.inflight.get(&key) else {
             return;
         };
-        let Request::ReadMemory { index, offset } = inflight.request else {
-            return;
-        };
         if inflight.entity_id != header.target_entity_id {
             return;
         }
+        if let Request::ReadMemoryForCaller { command } = inflight.request {
+            self.complete(key, inflight);
+            self.memory_asks.remove(&command);
+            let tlvs = response
+                .tlvs()
+                .map_while(Result::ok)
+                .map(|tlv| (tlv.address, tlv.data.to_vec()))
+                .collect();
+            self.memory_answers.insert(
+                command,
+                MemoryRead {
+                    status: response.status(),
+                    tlvs,
+                },
+            );
+            self.events
+                .push_back(Event::CommandFinished(command, Outcome::Done));
+            return;
+        }
+        let Request::ReadMemory { index, offset } = inflight.request else {
+            return;
+        };
         self.complete(key, inflight);
         let read = (response.status() == AaStatus::SUCCESS)
             .then(|| response.tlvs().next())
@@ -1555,7 +1595,8 @@ impl Controller {
             | Request::GetTxState { .. }
             | Request::GetTxConnection { .. }
             | Request::DisconnectTx { .. }
-            | Request::ReadMemory { .. } => {}
+            | Request::ReadMemory { .. }
+            | Request::ReadMemoryForCaller { .. } => {}
         }
         self.check_complete(entity_id);
     }
@@ -2886,6 +2927,46 @@ impl Controller {
                     .encode(&mut out)
                 })
             }
+            Request::ReadMemoryForCaller { command } => {
+                let Some(reads) = self.memory_asks.get(&command) else {
+                    return false;
+                };
+                // Each READ padded with as many zeros as it asks for, as
+                // for a logo.
+                let mut tlvs = [0; AddressAccessPdu::MAX_TLVS_LEN];
+                let mut at = 0;
+                let zeros = [0; AddressAccessPdu::MAX_TLVS_LEN];
+                let mut encoded = Ok(());
+                for &(address, length) in reads {
+                    let read = AaTlv {
+                        mode: AaMode::READ,
+                        length,
+                        address,
+                        data: &zeros[..usize::from(length)],
+                    };
+                    match read.encode(&mut tlvs[at..]) {
+                        Ok(written) => at += written,
+                        Err(error) => {
+                            encoded = Err(error);
+                            break;
+                        }
+                    }
+                }
+                encoded.and_then(|()| {
+                    AddressAccessPdu {
+                        header: AecpHeader {
+                            message_type: AecpMessageType::ADDRESS_ACCESS_COMMAND,
+                            status: 0,
+                            target_entity_id: addressing.target,
+                            controller_entity_id: addressing.controller,
+                            sequence_id,
+                        },
+                        tlv_count: reads.len() as u16,
+                        tlvs: &tlvs[..at],
+                    }
+                    .encode(&mut out)
+                })
+            }
             Request::GetRxState { input } => acmp(
                 AcmpMessageType::GET_RX_STATE_COMMAND,
                 (EntityId(0), 0),
@@ -3376,6 +3457,50 @@ impl Controller {
         command
     }
 
+    /// Reads an entity's memory through Address Access: one command with
+    /// a READ TLV for each address and length in `reads`, in order. The
+    /// command finishes [`Done`](Outcome::Done) once the entity answers,
+    /// whatever its status; [`take_memory_read`](Self::take_memory_read)
+    /// gives the answer. Each READ goes padded with zeros as long as it
+    /// asks for, as entities that answer in place need, so all of them,
+    /// with a TLV header of 10 octets each, fit in 512 octets
+    /// ([`AddressAccessPdu::MAX_TLVS_LEN`]) or the command is not
+    /// possible.
+    pub fn read_memory(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        reads: &[(u64, u16)],
+    ) -> CommandId {
+        let command = self.next_command();
+        let octets: usize = reads
+            .iter()
+            .map(|&(_, length)| AaTlv::HEADER_LEN + usize::from(length))
+            .sum();
+        if reads.is_empty()
+            || octets > AddressAccessPdu::MAX_TLVS_LEN
+            || reads.iter().any(|&(_, length)| length > 0x0fff)
+        {
+            self.events
+                .push_back(Event::CommandFinished(command, Outcome::NotPossible));
+            return command;
+        }
+        self.memory_asks.insert(command, reads.to_vec());
+        self.queue_command(
+            now,
+            entity_id,
+            command,
+            Request::ReadMemoryForCaller { command },
+        );
+        command
+    }
+
+    /// The answer to a [`read_memory`](Self::read_memory) command that
+    /// finished [`Done`](Outcome::Done), taken once.
+    pub fn take_memory_read(&mut self, command: CommandId) -> Option<MemoryRead> {
+        self.memory_answers.remove(&command)
+    }
+
     /// Takes the max transit time a response or notification carries for
     /// a stream output into the model.
     fn store_max_transit_time(&mut self, entity_id: EntityId, output: u16, payload: &[u8]) {
@@ -3423,6 +3548,7 @@ impl Controller {
     fn drop_command_data(&mut self, command: CommandId) {
         self.mapping_changes.remove(&command);
         self.control_values.remove(&command);
+        self.memory_asks.remove(&command);
     }
 
     /// Takes a control's current values into its entity's model.
@@ -3987,7 +4113,8 @@ fn command_type_of(request: Request) -> AemCommandType {
         | Request::GetTxState { .. }
         | Request::GetTxConnection { .. }
         | Request::DisconnectTx { .. }
-        | Request::ReadMemory { .. } => AemCommandType(0xffff),
+        | Request::ReadMemory { .. }
+        | Request::ReadMemoryForCaller { .. } => AemCommandType(0xffff),
     }
 }
 

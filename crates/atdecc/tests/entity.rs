@@ -1941,3 +1941,122 @@ fn an_output_is_connected_while_a_listener_is_ready() {
     assert!(connected(&mut talker, 2, true));
     assert!(!connected(&mut talker, 0, true));
 }
+
+#[test]
+fn an_entity_gives_its_log_through_address_access() {
+    use atdecc::log::{LOG_ADDRESS, LogHeader};
+    let mut entity = Entity::new(model(TALKER, "Talker", true), &[(STREAM, DESTINATION)]);
+    entity.keep_log(Instant::ZERO, 256, 7);
+    entity.start(Instant::ZERO);
+    let adp = loop {
+        if let Some(adp) = std::iter::from_fn(|| entity.poll_transmit())
+            .find_map(|(_, bytes)| Adpdu::decode(&bytes).ok())
+        {
+            break adp;
+        }
+        let at = entity.poll_timeout().expect("it advertises");
+        entity.handle_timeout(at);
+    };
+    assert!(
+        adp.entity_capabilities
+            .contains(EntityCapabilities::ADDRESS_ACCESS_SUPPORTED)
+    );
+    while entity.poll_transmit().is_some() {}
+    entity.log(b"I (1) app: one\n");
+    entity.log_dropped_line();
+    let read = |address: u64, length: u16| AaTlv {
+        mode: AaMode::READ,
+        length,
+        address,
+        data: &[],
+    };
+    let (status, header) = address_access(&mut entity, read(LOG_ADDRESS, 128));
+    assert_eq!(status, AaStatus::SUCCESS);
+    let header = LogHeader::decode(&header).expect("a header");
+    assert_eq!(
+        (header.total, header.drop, header.boot, header.ring),
+        (15, 1, 7, 256)
+    );
+    assert_eq!(
+        address_access(&mut entity, read(LOG_ADDRESS + 128, 15)),
+        (AaStatus::SUCCESS, b"I (1) app: one\n".to_vec())
+    );
+    assert_eq!(
+        address_access(&mut entity, read(LOG_ADDRESS + 128 + 200, 100)).0,
+        AaStatus::ADDRESS_TOO_HIGH
+    );
+}
+
+#[test]
+fn a_controller_follows_an_entitys_log() {
+    use atdecc::log::{LogPiece, LogTail};
+    let mut network = Network::new();
+    network.talker = Entity::new(model(TALKER, "Talker", true), &[(STREAM, DESTINATION)]);
+    network.talker.keep_log(Instant::ZERO, 512, 1);
+    network
+        .talker
+        .log(b"I (0) boot: first line\nI (1) boot: second line\n");
+    network.talker.start(Instant::ZERO);
+    network.controller.discover(None);
+    network.run(3000);
+    let model = network.controller.model(TALKER).expect("read");
+    let log = model
+        .memory_objects()
+        .find(|object| object.memory_object_type == MemoryObjectType::LOG_OBJECT)
+        .expect("its LOG_OBJECT");
+    assert_eq!(log.start_address, atdecc::log::LOG_ADDRESS);
+    assert_eq!(log.maximum_length, 128 + 512);
+    network.controller_events.clear();
+
+    let mut tail = LogTail::new(log.start_address, network.now);
+    let mut read = Vec::new();
+    let mut commands = 0;
+    let mut out = None;
+    let mut written = 0;
+    for step in 0..2000 {
+        // Lines every 50 ms for the first three seconds, more than the
+        // ring holds in all, then a quiet stretch.
+        if step % 10 == 0 && step < 600 {
+            let line = format!("I ({step}) app: line {written}\n");
+            network.talker.log(line.as_bytes());
+            written += 1;
+        }
+        if out.is_none()
+            && let Some(reads) = tail.poll_read(network.now)
+        {
+            out = Some(network.controller.read_memory(network.now, TALKER, &reads));
+            commands += 1;
+        }
+        network.run(5);
+        for event in network.controller_events.drain(..) {
+            let Event::CommandFinished(command, outcome) = event else {
+                continue;
+            };
+            if Some(command) != out {
+                continue;
+            }
+            out = None;
+            assert_eq!(outcome, Outcome::Done);
+            let answer = network.controller.take_memory_read(command).unwrap();
+            assert_eq!(answer.status, AaStatus::SUCCESS);
+            let tlvs: Vec<(u64, &[u8])> = answer.tlvs.iter().map(|(a, o)| (*a, &o[..])).collect();
+            let mut pieces = Vec::new();
+            tail.handle_read(network.now, &tlvs, &mut pieces);
+            for piece in pieces {
+                match piece {
+                    LogPiece::Text { octets, .. } => read.extend_from_slice(&octets),
+                    other => panic!("nothing lost here: {other:?}"),
+                }
+            }
+        }
+    }
+    let read = String::from_utf8(read).unwrap();
+    let mut expected = String::from("I (0) boot: first line\nI (1) boot: second line\n");
+    for line in 0..written {
+        expected.push_str(&format!("I ({}) app: line {line}\n", line * 10));
+    }
+    assert_eq!(read, expected);
+    assert!(tail.caught_up());
+    // About one read per 250 ms while lines came, then one a second.
+    assert!((14..=40).contains(&commands), "{commands} reads");
+}

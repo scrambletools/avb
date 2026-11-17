@@ -30,6 +30,7 @@ use crate::avtp::{read_u16, read_u32, read_u64};
 use crate::descriptor::DescriptorType;
 use crate::id::{ClockIdentity, EntityId, StreamId};
 use crate::lite::{LiteCommandType, LiteConfigFlags, LiteFlags, LiteStatus, STATUS_PROTOCOL_ID};
+use crate::log::{LOG_ADDRESS, LogRing};
 use crate::mvu::{MVU_PROTOCOL_ID, MilanFeatures, MvuCommandType, MvuStatus};
 use crate::pdu::{self, Pdu};
 use crate::stream_format::StreamFormat;
@@ -268,6 +269,9 @@ pub struct Entity {
     /// lets go of without DISCONNECT_TX.
     milan_talkers: BTreeSet<EntityId>,
     random: Random,
+    /// Its log, kept since the instant given, as a LOG_OBJECT after its
+    /// logos.
+    log: Option<(LogRing, Instant)>,
     outgoing: VecDeque<(MacAddress, Vec<u8>)>,
     events: VecDeque<EntityEvent>,
 }
@@ -326,9 +330,39 @@ impl Entity {
             interface_counters: [0; 32],
             known: BTreeMap::new(),
             milan_talkers: BTreeSet::new(),
+            log: None,
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
         }
+    }
+
+    /// Keeps a log of the latest `ring` octets written with
+    /// [`log`](Self::log), from `now` in the boot `boot`, for controllers
+    /// to read through Address Access as a LOG_OBJECT memory object (see
+    /// [`crate::log`]). Called before [`start`](Self::start), as it adds
+    /// a descriptor.
+    pub fn keep_log(&mut self, now: Instant, ring: u32, boot: u32) {
+        self.log = Some((LogRing::new(ring, boot), now));
+    }
+
+    /// Writes to its log, if it keeps one.
+    pub fn log(&mut self, octets: &[u8]) {
+        if let Some((log, _)) = &mut self.log {
+            log.write(octets);
+        }
+    }
+
+    /// Counts a line its log dropped whole, if it keeps one.
+    pub fn log_dropped_line(&mut self) {
+        if let Some((log, _)) = &mut self.log {
+            log.drop_line();
+        }
+    }
+
+    /// The log's length and maximum length, as its descriptor has them.
+    fn log_lengths(&self) -> Option<(u64, u64)> {
+        let (log, _) = self.log.as_ref()?;
+        Some((log.length(), log.maximum_length()))
     }
 
     pub fn model(&self) -> &EndpointModel {
@@ -779,8 +813,8 @@ impl Entity {
             | EntityCapabilities::GPTP_SUPPORTED
             | EntityCapabilities::AEM_IDENTIFY_CONTROL_INDEX_VALID
             | EntityCapabilities::AEM_INTERFACE_INDEX_VALID;
-        // Its logos are read through Address Access.
-        if self.model.has_memory() {
+        // Its logos and log are read through Address Access.
+        if self.model.has_memory() || self.log.is_some() {
             capabilities |= EntityCapabilities::ADDRESS_ACCESS_SUPPORTED;
         }
         let model = &self.model;
@@ -894,7 +928,7 @@ impl Entity {
                     && header.message_type == AecpMessageType::ADDRESS_ACCESS_COMMAND =>
             {
                 if let Ok(command) = AddressAccessPdu::decode(bytes) {
-                    self.handle_address_access(source, &command);
+                    self.handle_address_access(now, source, &command);
                 }
             }
             _ => {}
@@ -904,8 +938,13 @@ impl Entity {
     /// Address Access: reads of its memory objects' octets, its logos',
     /// as many as one response carries. It writes and executes nothing,
     /// and without a logo has no memory to read.
-    fn handle_address_access(&mut self, source: MacAddress, command: &AddressAccessPdu<'_>) {
-        let (status, tlv_count, tlvs) = match self.read_memory(command) {
+    fn handle_address_access(
+        &mut self,
+        now: Instant,
+        source: MacAddress,
+        command: &AddressAccessPdu<'_>,
+    ) {
+        let (status, tlv_count, tlvs) = match self.read_memory(now, command) {
             Ok(answer) => (AaStatus::SUCCESS, command.tlv_count, answer),
             Err(refusal) => {
                 let (count, tlvs) = refused(command);
@@ -929,17 +968,39 @@ impl Entity {
 
     /// The response TLVs of an Address Access command whose every TLV
     /// reads its memory, each with the octets read.
-    fn read_memory(&self, command: &AddressAccessPdu<'_>) -> Result<Vec<u8>, AaStatus> {
-        if !self.model.has_memory() {
+    fn read_memory(
+        &self,
+        now: Instant,
+        command: &AddressAccessPdu<'_>,
+    ) -> Result<Vec<u8>, AaStatus> {
+        if !self.model.has_memory() && self.log.is_none() {
             return Err(AaStatus::NOT_IMPLEMENTED);
         }
+        // Every TLV reads the log as it is now, header and ring alike.
+        let log_header = self.log.as_ref().map(|(log, since)| {
+            let ms = now.saturating_duration_since(*since).as_millis() as u32;
+            log.header(ms, 0).encode()
+        });
+        let mut log_octets = Vec::new();
         let mut answer = Vec::new();
         for tlv in command.tlvs() {
             let tlv = tlv.map_err(|_| AaStatus::TLV_INVALID)?;
             if tlv.mode != AaMode::READ {
                 return Err(AaStatus::UNSUPPORTED);
             }
-            let data = self.model.memory(tlv.address, tlv.length)?;
+            let data = match (&self.log, &log_header) {
+                (Some((log, _)), Some(header)) if tlv.address >= LOG_ADDRESS => {
+                    log_octets.clear();
+                    log.read(
+                        tlv.address - LOG_ADDRESS,
+                        usize::from(tlv.length),
+                        header,
+                        &mut log_octets,
+                    )?;
+                    &log_octets[..]
+                }
+                _ => self.model.memory(tlv.address, tlv.length)?,
+            };
             let at = answer.len();
             let end = at + AaTlv::HEADER_LEN + data.len();
             if end > AddressAccessPdu::MAX_TLVS_LEN {
@@ -1433,10 +1494,12 @@ impl Entity {
                 }
                 let descriptor_type = DescriptorType(read_u16(payload, 4));
                 let index = read_u16(payload, 6);
-                match self
-                    .model
-                    .descriptor(descriptor_type, index, &self.entity_state())
-                {
+                match self.model.descriptor_with_log(
+                    descriptor_type,
+                    index,
+                    &self.entity_state(),
+                    self.log_lengths(),
+                ) {
                     Some(descriptor) => {
                         let mut answer = Vec::from(&payload[..4]);
                         answer.extend_from_slice(&descriptor);
@@ -1649,7 +1712,11 @@ impl Entity {
                     return (AemStatus::BAD_ARGUMENTS, echo(), false);
                 }
                 let (configuration, index) = (read_u16(payload, 0), read_u16(payload, 2));
-                match self.model.memory_length(index) {
+                let length = match self.log_lengths() {
+                    Some((length, _)) if index == self.model.memory_count() => Some(length),
+                    _ => self.model.memory_length(index),
+                };
+                match length {
                     Some(length) if configuration == 0 => {
                         let mut answer = Vec::from(&payload[..4]);
                         answer.extend_from_slice(&length.to_be_bytes());
