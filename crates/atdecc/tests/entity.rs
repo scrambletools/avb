@@ -2061,3 +2061,119 @@ fn a_controller_follows_an_entitys_log() {
     // lines stopped.
     assert!((30..=50).contains(&commands), "{commands} reads");
 }
+
+/// Runs the network until the controller's `command` finishes.
+fn finish(network: &mut Network, command: atdecc::controller::CommandId) -> Outcome {
+    for _ in 0..400 {
+        network.run(5);
+        let found = network
+            .controller_events
+            .iter()
+            .find_map(|event| match event {
+                Event::CommandFinished(finished, outcome) if *finished == command => Some(*outcome),
+                _ => None,
+            });
+        if let Some(outcome) = found {
+            network.controller_events.clear();
+            return outcome;
+        }
+    }
+    panic!("{command:?} never finished");
+}
+
+#[test]
+fn a_controller_reads_and_erases_a_crash_dump() {
+    use atdecc::descriptor::MemoryObjectOperation;
+    use atdecc::entity::CRASH_DUMP_ADDRESS;
+    let dump: Vec<u8> = (0..1300).map(|at| (at % 253) as u8).collect();
+    let mut network = Network::new();
+    network.talker = Entity::new(model(TALKER, "Talker", true), &[(STREAM, DESTINATION)]);
+    network.talker.keep_log(Instant::ZERO, 256, 1);
+    network.talker.keep_crash_dump(4096, dump.clone());
+    network.talker.start(Instant::ZERO);
+    network.controller.discover(None);
+    network.run(3000);
+    network.controller_events.clear();
+    let model = network.controller.model(TALKER).expect("read");
+    let objects: Vec<_> = model
+        .memory_objects()
+        .map(|object| {
+            (
+                object.index,
+                object.memory_object_type,
+                object.start_address,
+            )
+        })
+        .collect();
+    assert_eq!(
+        objects,
+        [
+            (0, MemoryObjectType::LOG_OBJECT, atdecc::log::LOG_ADDRESS),
+            (1, MemoryObjectType::CRASH_DUMP, CRASH_DUMP_ADDRESS)
+        ]
+    );
+    let crash = model.memory_objects().nth(1).unwrap();
+    assert_eq!((crash.length, crash.maximum_length), (1300, 4096));
+
+    // Read whole, as much as one response carries at a time.
+    let mut read = Vec::new();
+    while read.len() < dump.len() {
+        let length = (dump.len() - read.len()).min(usize::from(MEMORY_SEGMENT)) as u16;
+        let address = CRASH_DUMP_ADDRESS + read.len() as u64;
+        let command = network
+            .controller
+            .read_memory(network.now, TALKER, &[(address, length)]);
+        assert_eq!(finish(&mut network, command), Outcome::Done);
+        let answer = network.controller.take_memory_read(command).unwrap();
+        assert_eq!(answer.status, AaStatus::SUCCESS);
+        read.extend_from_slice(&answer.tlvs[0].1);
+    }
+    assert_eq!(read, dump);
+    // Past its end, nothing.
+    let command =
+        network
+            .controller
+            .read_memory(network.now, TALKER, &[(CRASH_DUMP_ADDRESS + 1290, 20)]);
+    finish(&mut network, command);
+    let answer = network.controller.take_memory_read(command).unwrap();
+    assert_eq!(answer.status, AaStatus::ADDRESS_TOO_HIGH);
+
+    // The log has no operations; the crash dump erases.
+    let command = network.controller.start_operation(
+        network.now,
+        TALKER,
+        DescriptorType::MEMORY_OBJECT,
+        0,
+        MemoryObjectOperation::ERASE.0,
+        &[],
+    );
+    assert_eq!(
+        finish(&mut network, command),
+        Outcome::Refused(Refusal::Aem(AemStatus::NO_SUCH_DESCRIPTOR))
+    );
+    let command = network.controller.start_operation(
+        network.now,
+        TALKER,
+        DescriptorType::MEMORY_OBJECT,
+        1,
+        MemoryObjectOperation::ERASE.0,
+        &[],
+    );
+    assert_eq!(finish(&mut network, command), Outcome::Done);
+    assert_eq!(network.controller.take_operation_id(command), Some(1));
+    assert_eq!(network.talker.crash_dump(), Some(&[][..]));
+    let command =
+        network
+            .controller
+            .read_descriptor(network.now, TALKER, DescriptorType::MEMORY_OBJECT, 1);
+    assert_eq!(finish(&mut network, command), Outcome::Done);
+    let crash = network
+        .controller
+        .model(TALKER)
+        .unwrap()
+        .memory_objects()
+        .nth(1)
+        .unwrap()
+        .length;
+    assert_eq!(crash, 0);
+}

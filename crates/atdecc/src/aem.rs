@@ -170,6 +170,32 @@ pub fn encode_set_control(
     command(addressing, AemCommandType::SET_CONTROL, body).encode(out)
 }
 
+/// The most octets of values START_OPERATION carries here: an UPLOAD's
+/// length takes 8.
+pub const MAX_OPERATION_VALUES: usize = 64;
+
+/// Encodes START_OPERATION (7.4.53) on a CONTROL or MEMORY_OBJECT: its
+/// operation_id zero, as a command's is, and the operation's `values`.
+pub fn encode_start_operation(
+    addressing: Addressing,
+    descriptor_type: DescriptorType,
+    index: u16,
+    operation_type: u16,
+    values: &[u8],
+    out: &mut [u8],
+) -> Result<usize, EncodeError> {
+    let mut payload = [0; 8 + MAX_OPERATION_VALUES];
+    let length = 8 + values.len();
+    let Some(body) = payload.get_mut(..length) else {
+        return Err(EncodeError::OutOfRange("values"));
+    };
+    body[0..2].copy_from_slice(&descriptor_type.0.to_be_bytes());
+    body[2..4].copy_from_slice(&index.to_be_bytes());
+    body[6..8].copy_from_slice(&operation_type.to_be_bytes());
+    body[8..].copy_from_slice(values);
+    command(addressing, AemCommandType::START_OPERATION, body).encode(out)
+}
+
 /// Encodes GET_AVB_INFO for an AVB_INTERFACE.
 pub fn encode_get_avb_info(
     addressing: Addressing,

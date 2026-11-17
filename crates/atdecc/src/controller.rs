@@ -461,6 +461,10 @@ enum Request {
     ReadMemoryForCaller {
         command: CommandId,
     },
+    /// The caller's START_OPERATION, in `operation_asks`.
+    StartOperation {
+        command: CommandId,
+    },
 }
 
 /// The protocols whose commands are numbered apart.
@@ -526,6 +530,7 @@ impl Request {
             | Request::SetLiteConfig { command, .. }
             | Request::SetWirelessConfig { command, .. }
             | Request::ReadMemoryForCaller { command }
+            | Request::StartOperation { command }
             | Request::ChangeMappings { command, .. } => Some(command),
             Request::Identify { command, .. }
             | Request::GetTxState { command, .. }
@@ -630,6 +635,11 @@ pub struct Controller {
     memory_asks: BTreeMap<CommandId, Vec<(u64, u16)>>,
     /// The answers to callers' Address Access commands, until taken.
     memory_answers: BTreeMap<CommandId, MemoryRead>,
+    /// What each caller's START_OPERATION is to start: the descriptor,
+    /// operation_type and values.
+    operation_asks: BTreeMap<CommandId, (DescriptorType, u16, u16, Vec<u8>)>,
+    /// The operation_id each started operation was given, until taken.
+    operation_ids: BTreeMap<CommandId, u16>,
     advertiser: Option<Advertiser>,
     random: Random,
     outgoing: VecDeque<(MacAddress, Vec<u8>)>,
@@ -659,6 +669,8 @@ impl Controller {
             memory_reads: BTreeMap::new(),
             memory_asks: BTreeMap::new(),
             memory_answers: BTreeMap::new(),
+            operation_asks: BTreeMap::new(),
+            operation_ids: BTreeMap::new(),
             advertiser: config.advertise.map(|advertise| Advertiser {
                 config: advertise,
                 available_index: 0,
@@ -1465,6 +1477,15 @@ impl Controller {
                             index,
                         },
                     );
+                }
+                self.events
+                    .push_back(Event::CommandFinished(command, aem_outcome(aem)));
+            }
+            Request::StartOperation { command } => {
+                self.operation_asks.remove(&command);
+                if aem.status().is_success() && aem.payload.len() >= 6 {
+                    let operation_id = crate::avtp::read_u16(aem.payload, 4);
+                    self.operation_ids.insert(command, operation_id);
                 }
                 self.events
                     .push_back(Event::CommandFinished(command, aem_outcome(aem)));
@@ -2862,6 +2883,21 @@ impl Controller {
                     .map_or(&[][..], Vec::as_slice),
                 &mut out,
             ),
+            Request::StartOperation { command } => {
+                let Some((descriptor_type, index, operation_type, values)) =
+                    self.operation_asks.get(&command)
+                else {
+                    return false;
+                };
+                aem::encode_start_operation(
+                    addressing,
+                    *descriptor_type,
+                    *index,
+                    *operation_type,
+                    values,
+                    &mut out,
+                )
+            }
             Request::GetAudioMap {
                 descriptor_type,
                 index,
@@ -3501,6 +3537,45 @@ impl Controller {
         self.memory_answers.remove(&command)
     }
 
+    /// Starts an operation on a CONTROL or MEMORY_OBJECT
+    /// (START_OPERATION, 7.4.53), such as erasing a memory object
+    /// ([`MemoryObjectOperation`](crate::descriptor::MemoryObjectOperation)),
+    /// with the operation's `values`, [`aem::MAX_OPERATION_VALUES`] at
+    /// most. The command finishes [`Done`](Outcome::Done) once the entity
+    /// starts it; [`take_operation_id`](Self::take_operation_id) gives the
+    /// operation_id it was given, which its OPERATION_STATUS reports carry.
+    pub fn start_operation(
+        &mut self,
+        now: Instant,
+        entity_id: EntityId,
+        descriptor_type: DescriptorType,
+        index: u16,
+        operation_type: u16,
+        values: &[u8],
+    ) -> CommandId {
+        let command = self.next_command();
+        if values.len() > aem::MAX_OPERATION_VALUES {
+            self.events
+                .push_back(Event::CommandFinished(command, Outcome::NotPossible));
+            return command;
+        }
+        self.operation_asks.insert(
+            command,
+            (descriptor_type, index, operation_type, values.to_vec()),
+        );
+        self.queue_command(now, entity_id, command, Request::StartOperation { command });
+        if !self.entities.contains_key(&entity_id) {
+            self.operation_asks.remove(&command);
+        }
+        command
+    }
+
+    /// The operation_id of a [`start_operation`](Self::start_operation)
+    /// command that finished [`Done`](Outcome::Done), taken once.
+    pub fn take_operation_id(&mut self, command: CommandId) -> Option<u16> {
+        self.operation_ids.remove(&command)
+    }
+
     /// Takes the max transit time a response or notification carries for
     /// a stream output into the model.
     fn store_max_transit_time(&mut self, entity_id: EntityId, output: u16, payload: &[u8]) {
@@ -3549,6 +3624,7 @@ impl Controller {
         self.mapping_changes.remove(&command);
         self.control_values.remove(&command);
         self.memory_asks.remove(&command);
+        self.operation_asks.remove(&command);
     }
 
     /// Takes a control's current values into its entity's model.
@@ -4092,6 +4168,7 @@ fn command_type_of(request: Request) -> AemCommandType {
         Request::SetClockSource { .. } => AemCommandType::SET_CLOCK_SOURCE,
         Request::SetConfiguration { .. } => AemCommandType::SET_CONFIGURATION,
         Request::SetControl { .. } => AemCommandType::SET_CONTROL,
+        Request::StartOperation { .. } => AemCommandType::START_OPERATION,
         Request::GetMaxTransitTime { .. } => AemCommandType::GET_MAX_TRANSIT_TIME,
         Request::SetMaxTransitTime { .. } => AemCommandType::SET_MAX_TRANSIT_TIME,
         Request::ReadForCaller { .. } | Request::ReadOther { .. } => {

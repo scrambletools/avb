@@ -141,6 +141,20 @@ pub struct EndpointModel {
 pub const LOGO_ADDRESS: u64 = 0x1000_0000;
 /// Where the vendor logo's octets start.
 pub const VENDOR_LOGO_ADDRESS: u64 = 0x2000_0000;
+/// Where a crash dump's octets start, the next 4 GiB above the log's
+/// ([`crate::log::LOG_ADDRESS`]).
+pub const CRASH_DUMP_ADDRESS: u64 = 0x2_0000_0000;
+
+/// A memory object an entity has beside its logos that its model does
+/// not hold: its log, its crash dump.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExtraMemory {
+    pub memory_object_type: MemoryObjectType,
+    pub name: &'static str,
+    pub address: u64,
+    pub length: u64,
+    pub maximum_length: u64,
+}
 
 /// A memory object the entity has: what it holds, its name, where its
 /// octets start and the octets.
@@ -374,18 +388,17 @@ impl EndpointModel {
         index: u16,
         entity: &EntityState,
     ) -> Option<Vec<u8>> {
-        self.descriptor_with_log(descriptor_type, index, entity, None)
+        self.descriptor_with_extra(descriptor_type, index, entity, &[])
     }
 
-    /// As [`descriptor`](Self::descriptor), for an entity that keeps a
-    /// log of this length and maximum length: a MEMORY_OBJECT of
-    /// LOG_OBJECT after its logos.
-    pub(crate) fn descriptor_with_log(
+    /// As [`descriptor`](Self::descriptor), for an entity that has the
+    /// `extra` memory objects too, after its logos.
+    pub(crate) fn descriptor_with_extra(
         &self,
         descriptor_type: DescriptorType,
         index: u16,
         entity: &EntityState,
-        log: Option<(u64, u64)>,
+        extra: &[ExtraMemory],
     ) -> Option<Vec<u8>> {
         let ports = self.ports();
         let mut writer = Writer::new(descriptor_type, index);
@@ -412,13 +425,14 @@ impl EndpointModel {
                 .done(),
             DescriptorType::CONFIGURATION if index == 0 => {
                 let mut counts = self.descriptor_counts();
-                if log.is_some() {
+                if !extra.is_empty() {
+                    let more = extra.len() as u16;
                     match counts
                         .iter_mut()
                         .find(|(kind, _)| *kind == DescriptorType::MEMORY_OBJECT)
                     {
-                        Some((_, count)) => *count += 1,
-                        None => counts.push((DescriptorType::MEMORY_OBJECT, 1)),
+                        Some((_, count)) => *count += more,
+                        None => counts.push((DescriptorType::MEMORY_OBJECT, more)),
                     }
                 }
                 writer
@@ -626,19 +640,17 @@ impl EndpointModel {
                 .u16(NO_STRING)
                 .pad_to(212)
                 .done(),
-            DescriptorType::MEMORY_OBJECT
-                if log.is_some() && index == self.memory_objects().count() as u16 =>
-            {
-                let (length, maximum_length) = log?;
+            DescriptorType::MEMORY_OBJECT if index >= self.memory_count() => {
+                let object = extra.get(usize::from(index - self.memory_count()))?;
                 writer
-                    .name("Log")
+                    .name(object.name)
                     .u16(NO_STRING)
-                    .u16(MemoryObjectType::LOG_OBJECT.0)
+                    .u16(object.memory_object_type.0)
                     .u16(DescriptorType::ENTITY.0) // target_descriptor_type
                     .u16(0) // target_descriptor_index
-                    .u64(crate::log::LOG_ADDRESS) // start_address
-                    .u64(maximum_length)
-                    .u64(length)
+                    .u64(object.address) // start_address
+                    .u64(object.maximum_length)
+                    .u64(object.length)
                     .u64(u64::from(MEMORY_SEGMENT)) // maximum_segment_length
                     .done()
             }

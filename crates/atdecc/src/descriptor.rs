@@ -211,6 +211,18 @@ code! {
     }
 }
 
+code! {
+    /// The operation_type of START_OPERATION on a MEMORY_OBJECT (Table
+    /// 7-20).
+    pub struct MemoryObjectOperation(u16) {
+        const STORE = 0x0000;
+        const STORE_AND_REBOOT = 0x0001;
+        const READ = 0x0002;
+        const ERASE = 0x0003;
+        const UPLOAD = 0x0004;
+    }
+}
+
 fn need(bytes: &[u8], length: usize) -> Result<(), DecodeError> {
     if bytes.len() < length {
         return Err(DecodeError::Truncated {

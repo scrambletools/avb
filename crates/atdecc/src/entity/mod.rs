@@ -27,7 +27,7 @@ use crate::aecp::{
 use crate::aem::NAME_LENGTH;
 use crate::aem::{AudioMapping, AvbInfoFlags, StreamInfoFlags};
 use crate::avtp::{read_u16, read_u32, read_u64};
-use crate::descriptor::DescriptorType;
+use crate::descriptor::{DescriptorType, MemoryObjectOperation, MemoryObjectType};
 use crate::id::{ClockIdentity, EntityId, StreamId};
 use crate::lite::{LiteCommandType, LiteConfigFlags, LiteFlags, LiteStatus, STATUS_PROTOCOL_ID};
 use crate::log::{LOG_ADDRESS, LogRing};
@@ -37,9 +37,10 @@ use crate::stream_format::StreamFormat;
 use crate::time::Instant;
 
 pub use model::{
-    ClockQuality, EndpointModel, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel, VENDOR_LOGO_ADDRESS,
+    CRASH_DUMP_ADDRESS, ClockQuality, EndpointModel, LOGO_ADDRESS, MEMORY_SEGMENT, StreamModel,
+    VENDOR_LOGO_ADDRESS,
 };
-use model::{EntityState, name_field};
+use model::{EntityState, ExtraMemory, name_field};
 
 /// How long the advertisement stays valid, in units of 2 s.
 const VALID_TIME: u8 = 31;
@@ -272,6 +273,11 @@ pub struct Entity {
     /// Its log, kept since the instant given, as a LOG_OBJECT after its
     /// logos.
     log: Option<(LogRing, Instant)>,
+    /// Its crash dump, empty when it has none, and the most it holds, as
+    /// a CRASH_DUMP after its log.
+    crash_dump: Option<(Vec<u8>, u64)>,
+    /// The last operation_id START_OPERATION gave.
+    operation_id: u16,
     outgoing: VecDeque<(MacAddress, Vec<u8>)>,
     events: VecDeque<EntityEvent>,
 }
@@ -331,6 +337,8 @@ impl Entity {
             known: BTreeMap::new(),
             milan_talkers: BTreeSet::new(),
             log: None,
+            crash_dump: None,
+            operation_id: 0,
             outgoing: VecDeque::new(),
             events: VecDeque::new(),
         }
@@ -359,10 +367,71 @@ impl Entity {
         }
     }
 
-    /// The log's length and maximum length, as its descriptor has them.
-    fn log_lengths(&self) -> Option<(u64, u64)> {
-        let (log, _) = self.log.as_ref()?;
-        Some((log.length(), log.maximum_length()))
+    /// Keeps a crash dump of up to `maximum_length` octets, `dump` or none
+    /// when it is empty, for controllers to read through Address Access as
+    /// a CRASH_DUMP memory object at [`CRASH_DUMP_ADDRESS`], after its log,
+    /// and to erase with START_OPERATION. Called before
+    /// [`start`](Self::start), as it adds a descriptor.
+    pub fn keep_crash_dump(&mut self, maximum_length: u64, mut dump: Vec<u8>) {
+        dump.truncate(usize::try_from(maximum_length).unwrap_or(usize::MAX));
+        self.crash_dump = Some((dump, maximum_length));
+    }
+
+    /// Its crash dump, empty once erased, if it keeps one.
+    pub fn crash_dump(&self) -> Option<&[u8]> {
+        self.crash_dump.as_ref().map(|(dump, _)| &dump[..])
+    }
+
+    /// Its memory objects beyond its logos, in index order: its log, then
+    /// its crash dump.
+    fn extra_memory(&self) -> Vec<ExtraMemory> {
+        let log = self.log.as_ref().map(|(log, _)| ExtraMemory {
+            memory_object_type: MemoryObjectType::LOG_OBJECT,
+            name: "Log",
+            address: LOG_ADDRESS,
+            length: log.length(),
+            maximum_length: log.maximum_length(),
+        });
+        let crash = self.crash_dump.as_ref().map(|(dump, maximum)| ExtraMemory {
+            memory_object_type: MemoryObjectType::CRASH_DUMP,
+            name: "Crash dump",
+            address: CRASH_DUMP_ADDRESS,
+            length: dump.len() as u64,
+            maximum_length: *maximum,
+        });
+        log.into_iter().chain(crash).collect()
+    }
+
+    /// START_OPERATION: an ERASE of its crash dump, done at once, is the
+    /// one operation it has.
+    fn start_operation(&mut self, payload: &[u8]) -> (AemStatus, Vec<u8>, bool) {
+        let mut answer = Vec::from(payload);
+        if payload.len() < 8 {
+            return (AemStatus::BAD_ARGUMENTS, answer, false);
+        }
+        let descriptor_type = DescriptorType(read_u16(payload, 0));
+        let index = read_u16(payload, 2);
+        let operation_type = MemoryObjectOperation(read_u16(payload, 6));
+        let crash_dump = descriptor_type == DescriptorType::MEMORY_OBJECT
+            && Some(index) == self.crash_dump_index();
+        if !crash_dump {
+            return (AemStatus::NO_SUCH_DESCRIPTOR, answer, false);
+        }
+        if operation_type != MemoryObjectOperation::ERASE {
+            return (AemStatus::BAD_ARGUMENTS, answer, false);
+        }
+        if let Some((dump, _)) = &mut self.crash_dump {
+            dump.clear();
+        }
+        self.operation_id = self.operation_id.wrapping_add(1).max(1);
+        answer[4..6].copy_from_slice(&self.operation_id.to_be_bytes());
+        (AemStatus::SUCCESS, answer, false)
+    }
+
+    /// The MEMORY_OBJECT index of its crash dump, if it keeps one.
+    fn crash_dump_index(&self) -> Option<u16> {
+        self.crash_dump.as_ref()?;
+        Some(self.model.memory_count() + u16::from(self.log.is_some()))
     }
 
     pub fn model(&self) -> &EndpointModel {
@@ -814,7 +883,7 @@ impl Entity {
             | EntityCapabilities::AEM_IDENTIFY_CONTROL_INDEX_VALID
             | EntityCapabilities::AEM_INTERFACE_INDEX_VALID;
         // Its logos and log are read through Address Access.
-        if self.model.has_memory() || self.log.is_some() {
+        if self.model.has_memory() || self.log.is_some() || self.crash_dump.is_some() {
             capabilities |= EntityCapabilities::ADDRESS_ACCESS_SUPPORTED;
         }
         let model = &self.model;
@@ -973,7 +1042,7 @@ impl Entity {
         now: Instant,
         command: &AddressAccessPdu<'_>,
     ) -> Result<Vec<u8>, AaStatus> {
-        if !self.model.has_memory() && self.log.is_none() {
+        if !self.model.has_memory() && self.log.is_none() && self.crash_dump.is_none() {
             return Err(AaStatus::NOT_IMPLEMENTED);
         }
         // Every TLV reads the log as it is now, header and ring alike.
@@ -989,6 +1058,20 @@ impl Entity {
                 return Err(AaStatus::UNSUPPORTED);
             }
             let data = match (&self.log, &log_header) {
+                _ if tlv.address >= CRASH_DUMP_ADDRESS => {
+                    let dump = self
+                        .crash_dump
+                        .as_ref()
+                        .map(|(dump, _)| &dump[..])
+                        .ok_or(AaStatus::ADDRESS_INVALID)?;
+                    let start = usize::try_from(tlv.address - CRASH_DUMP_ADDRESS)
+                        .map_err(|_| AaStatus::ADDRESS_TOO_HIGH)?;
+                    start
+                        .checked_add(usize::from(tlv.length))
+                        .filter(|end| *end <= dump.len())
+                        .map(|end| &dump[start..end])
+                        .ok_or(AaStatus::ADDRESS_TOO_HIGH)?
+                }
                 (Some((log, _)), Some(header)) if tlv.address >= LOG_ADDRESS => {
                     log_octets.clear();
                     log.read(
@@ -1445,6 +1528,7 @@ impl Entity {
                 | AemCommandType::SET_MAX_TRANSIT_TIME
                 | AemCommandType::ADD_AUDIO_MAPPINGS
                 | AemCommandType::REMOVE_AUDIO_MAPPINGS
+                | AemCommandType::START_OPERATION
         );
         if changes && !self.may_change(controller) {
             let payload = Vec::from(command.payload);
@@ -1470,6 +1554,13 @@ impl Entity {
         if status.is_success() && notify {
             self.notify(command.command_type, &payload, Some(controller));
         }
+        // An operation done at once: its OPERATION_STATUS of 1000 to every
+        // registered controller (7.4.55).
+        if status.is_success() && command.command_type == AemCommandType::START_OPERATION {
+            let mut done = Vec::from(&payload[..6]);
+            done.extend_from_slice(&1000u16.to_be_bytes());
+            self.notify(AemCommandType::OPERATION_STATUS, &done, None);
+        }
     }
 
     /// The status and payload answering an AEM command, and whether the
@@ -1494,11 +1585,11 @@ impl Entity {
                 }
                 let descriptor_type = DescriptorType(read_u16(payload, 4));
                 let index = read_u16(payload, 6);
-                match self.model.descriptor_with_log(
+                match self.model.descriptor_with_extra(
                     descriptor_type,
                     index,
                     &self.entity_state(),
-                    self.log_lengths(),
+                    &self.extra_memory(),
                 ) {
                     Some(descriptor) => {
                         let mut answer = Vec::from(&payload[..4]);
@@ -1712,9 +1803,12 @@ impl Entity {
                     return (AemStatus::BAD_ARGUMENTS, echo(), false);
                 }
                 let (configuration, index) = (read_u16(payload, 0), read_u16(payload, 2));
-                let length = match self.log_lengths() {
-                    Some((length, _)) if index == self.model.memory_count() => Some(length),
-                    _ => self.model.memory_length(index),
+                let length = match index.checked_sub(self.model.memory_count()) {
+                    Some(extra) => self
+                        .extra_memory()
+                        .get(usize::from(extra))
+                        .map(|object| object.length),
+                    None => self.model.memory_length(index),
                 };
                 match length {
                     Some(length) if configuration == 0 => {
@@ -1725,6 +1819,7 @@ impl Entity {
                     _ => (AemStatus::NO_SUCH_DESCRIPTOR, echo(), false),
                 }
             }
+            AemCommandType::START_OPERATION => self.start_operation(payload),
             AemCommandType::GET_AUDIO_MAP => self.audio_map(payload),
             AemCommandType::ADD_AUDIO_MAPPINGS | AemCommandType::REMOVE_AUDIO_MAPPINGS => {
                 self.change_mappings(command.command_type, payload)
