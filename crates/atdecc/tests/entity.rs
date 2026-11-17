@@ -2057,6 +2057,7 @@ fn a_controller_follows_an_entitys_log() {
     }
     assert_eq!(read, expected);
     assert!(tail.caught_up());
-    // About one read per 250 ms while lines came, then one a second.
-    assert!((14..=40).contains(&commands), "{commands} reads");
+    // About one read per 250 ms throughout, the header alone once the
+    // lines stopped.
+    assert!((30..=50).contains(&commands), "{commands} reads");
 }

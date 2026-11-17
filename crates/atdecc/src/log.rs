@@ -267,7 +267,8 @@ pub enum LogPiece {
 /// at once, as many as one response carries; otherwise the next read
 /// follows after the flowing interval, 250 ms by default. After four
 /// reads in a row found nothing new, the header alone is read at the idle
-/// interval, one second by default, until it shows more.
+/// interval, also 250 ms by default, until it shows more: a line waits a
+/// quarter second at most, for a header read four times a second.
 #[cfg(feature = "alloc")]
 #[derive(Debug, Clone)]
 pub struct LogTail {
@@ -323,7 +324,7 @@ const TLV_HEADER: usize = AaTlv::HEADER_LEN;
 #[cfg(feature = "alloc")]
 impl LogTail {
     pub const FLOWING: Duration = Duration::from_millis(250);
-    pub const IDLE: Duration = Duration::from_secs(1);
+    pub const IDLE: Duration = Duration::from_millis(250);
 
     /// Follows the log whose object starts at `base`, reading first at
     /// `now`.
@@ -732,7 +733,7 @@ mod tests {
             assert!(step(&mut tail, &log, now).unwrap().is_empty());
         }
         let idle_at = tail.poll_timeout().unwrap();
-        assert_eq!(idle_at, ms(3 * 250 + 1000));
+        assert_eq!(idle_at, ms(3 * 250) + LogTail::IDLE);
         assert_eq!(
             tail.clone().poll_read(idle_at).unwrap(),
             Vec::from([(LOG_ADDRESS, 128)])
