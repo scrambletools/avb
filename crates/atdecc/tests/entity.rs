@@ -2045,6 +2045,7 @@ fn a_controller_follows_an_entitys_log() {
             for piece in pieces {
                 match piece {
                     LogPiece::Text { octets, .. } => read.extend_from_slice(&octets),
+                    LogPiece::Boot(header) => assert_eq!(header.boot, 1),
                     other => panic!("nothing lost here: {other:?}"),
                 }
             }

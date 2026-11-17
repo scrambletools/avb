@@ -360,6 +360,15 @@ impl Entity {
         self.log = Some((LogRing::new(ring, boot), now));
     }
 
+    /// Says in its log's header why this boot began, ESP-IDF's
+    /// `esp_reset_reason_t`, and how many boots began unexpectedly, if it
+    /// keeps a log.
+    pub fn set_log_reset(&mut self, reason: u8, resets: u16) {
+        if let Some((log, _)) = &mut self.log {
+            log.set_reset(reason, resets);
+        }
+    }
+
     /// Writes to its log, if it keeps one.
     pub fn log(&mut self, octets: &[u8]) {
         if let Some((log, _)) = &mut self.log {

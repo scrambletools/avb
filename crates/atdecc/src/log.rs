@@ -18,6 +18,9 @@
 //! - `ring`: the ring's size.
 //! - `ptp` and `ms`: gPTP time in nanoseconds (0 while unsynchronized) and
 //!   milliseconds since boot, sampled together as the read is answered.
+//! - `rst` and `resets`, which an entity may leave out: why this boot
+//!   began, as ESP-IDF's `esp_reset_reason_t` numbers it, and how many
+//!   boots began unexpectedly, after a panic, a watchdog or a brownout.
 //!
 //! Log octet `n` sits at `128 + n % ring` in the object. A reader takes
 //! the `key=value` pairs by name and passes over keys it does not know, so
@@ -57,6 +60,11 @@ pub struct LogHeader {
     pub ptp: u64,
     /// Milliseconds since boot when it was read.
     pub ms: u32,
+    /// Why this boot began, if the entity says: ESP-IDF's
+    /// `esp_reset_reason_t` (see [`reset_reason_name`]).
+    pub reset_reason: Option<u8>,
+    /// How many boots began unexpectedly, if the entity counts them.
+    pub resets: Option<u16>,
 }
 
 impl LogHeader {
@@ -76,7 +84,16 @@ impl LogHeader {
             (b" ring=", u64::from(self.ring), 8),
             (b" ptp=", self.ptp, 16),
             (b" ms=", u64::from(self.ms), 8),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            self.reset_reason
+                .map(|reason| (&b" rst="[..], u64::from(reason), 2)),
+        )
+        .chain(
+            self.resets
+                .map(|resets| (&b" resets="[..], u64::from(resets), 4)),
+        ) {
             put(&mut out, &mut at, key);
             for place in (0..digits).rev() {
                 let digit = ((value >> (4 * place)) & 0xf) as usize;
@@ -118,6 +135,8 @@ impl LogHeader {
                 b"ring" => header.ring = u32::try_from(hex(value)?).ok()?,
                 b"ptp" => header.ptp = hex(value)?,
                 b"ms" => header.ms = u32::try_from(hex(value)?).ok()?,
+                b"rst" => header.reset_reason = Some(u8::try_from(hex(value)?).ok()?),
+                b"resets" => header.resets = Some(u16::try_from(hex(value)?).ok()?),
                 _ => {}
             }
         }
@@ -128,6 +147,29 @@ impl LogHeader {
     pub const fn oldest(&self) -> u64 {
         self.total.saturating_sub(self.ring as u64)
     }
+}
+
+/// The name ESP-IDF gives a reset reason, `esp_reset_reason_t`.
+pub fn reset_reason_name(reason: u8) -> Option<&'static str> {
+    Some(match reason {
+        0 => "UNKNOWN",
+        1 => "POWERON",
+        2 => "EXT",
+        3 => "SW",
+        4 => "PANIC",
+        5 => "INT_WDT",
+        6 => "TASK_WDT",
+        7 => "WDT",
+        8 => "DEEPSLEEP",
+        9 => "BROWNOUT",
+        10 => "SDIO",
+        11 => "USB",
+        12 => "JTAG",
+        13 => "EFUSE",
+        14 => "PWR_GLITCH",
+        15 => "CPU_LOCKUP",
+        _ => return None,
+    })
 }
 
 fn put(out: &mut [u8], at: &mut usize, bytes: &[u8]) {
@@ -155,6 +197,8 @@ pub struct LogRing {
     total: u64,
     drop: u32,
     boot: u32,
+    reset_reason: Option<u8>,
+    resets: Option<u16>,
 }
 
 #[cfg(feature = "alloc")]
@@ -167,7 +211,16 @@ impl LogRing {
             total: 0,
             drop: 0,
             boot,
+            reset_reason: None,
+            resets: None,
         }
+    }
+
+    /// Says in its header why this boot began, ESP-IDF's
+    /// `esp_reset_reason_t`, and how many boots began unexpectedly.
+    pub fn set_reset(&mut self, reason: u8, resets: u16) {
+        self.reset_reason = Some(reason);
+        self.resets = Some(resets);
     }
 
     pub fn write(&mut self, bytes: &[u8]) {
@@ -210,6 +263,8 @@ impl LogRing {
             ring: self.octets.len() as u32,
             ptp,
             ms,
+            reset_reason: self.reset_reason,
+            resets: self.resets,
         }
     }
 
@@ -251,6 +306,10 @@ pub enum LogPiece {
     Lost(u64),
     /// The entity booted again: its log starts over.
     Restarted,
+    /// The header of the boot read first, and of each boot after a
+    /// restart: its ID, why it began, and the entity's milliseconds since
+    /// boot then.
+    Boot(LogHeader),
     /// Lines the entity dropped whole since the last read.
     Dropped(u32),
 }
@@ -468,6 +527,7 @@ impl LogTail {
                 if known.is_some() {
                     pieces.push(LogPiece::Restarted);
                 }
+                pieces.push(LogPiece::Boot(header));
                 self.gap = header.total > u64::from(header.ring);
                 self.known = Some(Known {
                     boot: header.boot,
@@ -619,6 +679,8 @@ mod tests {
             ring: 0x8000,
             ptp: 0x1122_3344_5566_7788,
             ms: 0x1e240,
+            reset_reason: None,
+            resets: None,
         };
         let bytes = header.encode();
         assert_eq!(bytes.len(), 128);
@@ -648,9 +710,37 @@ mod tests {
             ring: 0x8000,
             ptp: 0x0001_d369_4c09_482a,
             ms: 0xb194,
+            reset_reason: None,
+            resets: None,
         };
         assert_eq!(LogHeader::decode(&line), Some(header));
         assert_eq!(header.encode(), line);
+    }
+
+    #[test]
+    fn a_header_says_why_its_boot_began_in_the_padding() {
+        let header = LogHeader {
+            total: 0x1acd,
+            boot: 0x812c_21f8,
+            ring: 0x8000,
+            ms: 0xb194,
+            reset_reason: Some(4),
+            resets: Some(3),
+            ..LogHeader::default()
+        };
+        let bytes = header.encode();
+        let line = core::str::from_utf8(&bytes).unwrap();
+        assert!(line.trim_end().ends_with(" ms=0000b194 rst=04 resets=0003"));
+        assert_eq!(line.trim_end().len(), 124);
+        assert_eq!(bytes[127], b'\n');
+        assert_eq!(LogHeader::decode(&bytes), Some(header));
+        assert_eq!(reset_reason_name(4), Some("PANIC"));
+        assert_eq!(reset_reason_name(99), None);
+        // A ring that knows says so in every header.
+        let mut log = LogRing::new(64, 1);
+        log.set_reset(6, 1);
+        let read = log.header(0, 0);
+        assert_eq!((read.reset_reason, read.resets), (Some(6), Some(1)));
     }
 
     #[test]
@@ -707,7 +797,8 @@ mod tests {
         log.write(burst.as_bytes());
         let mut tail = LogTail::new(LOG_ADDRESS, ms(0));
         // The header first, then the burst in reads one after another.
-        assert_eq!(step(&mut tail, &log, ms(0)).unwrap(), Vec::new());
+        let first = step(&mut tail, &log, ms(0)).unwrap();
+        assert!(matches!(&first[..], [LogPiece::Boot(header)] if header.boot == 7));
         let mut read = String::new();
         let mut reads = 0;
         while tail.poll_timeout() == Some(ms(0)) {
@@ -810,7 +901,10 @@ mod tests {
         let mut log = LogRing::new(64, 2);
         log.write(b"I (3) boot: again\n");
         let pieces = step(&mut tail, &log, ms(250)).unwrap();
-        assert_eq!(pieces, Vec::from([LogPiece::Restarted]));
+        assert!(matches!(
+            &pieces[..],
+            [LogPiece::Restarted, LogPiece::Boot(header)] if header.boot == 2
+        ));
         let pieces = step(&mut tail, &log, ms(250)).unwrap();
         assert_eq!(text(&pieces), "I (3) boot: again\n");
     }
