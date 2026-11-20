@@ -58,6 +58,8 @@ pub mod controller;
 pub mod entity;
 #[cfg(feature = "std")]
 pub mod neighbor;
+#[cfg(feature = "alloc")]
+pub mod upload;
 
 pub use acmp::{AcmpFlags, AcmpIp, AcmpMessageType, AcmpStatus, Acmpdu};
 pub use adp::{

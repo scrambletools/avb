@@ -90,6 +90,9 @@ struct Network {
     /// The status the listener's unbind answers carry in place of its
     /// own, as a listener outside Milan answers.
     unbind_status: Option<AcmpStatus>,
+    /// How many of the talker's Address Access answers to lose, as a
+    /// busy network loses them.
+    lose_answers: usize,
 }
 
 impl Network {
@@ -108,6 +111,7 @@ impl Network {
             sent: Vec::new(),
             in_place: None,
             unbind_status: None,
+            lose_answers: 0,
         }
     }
 
@@ -145,6 +149,15 @@ impl Network {
                 let Some((source, destination, bytes)) = frames.pop_front() else {
                     break;
                 };
+                if source == HOST_MAC
+                    && self.lose_answers > 0
+                    && AddressAccessPdu::decode(&bytes).is_ok_and(|pdu| {
+                        pdu.header.message_type == AecpMessageType::ADDRESS_ACCESS_RESPONSE
+                    })
+                {
+                    self.lose_answers -= 1;
+                    continue;
+                }
                 if destination == HOST_MAC
                     && let Some(answer) = self.answer_in_place(&bytes)
                 {
@@ -2291,4 +2304,197 @@ fn a_controller_uploads_firmware_as_annex_d_has_it() {
             .map(|status| (status.operation_id, status.percent_complete))
             .collect();
     assert_eq!(statuses, [(store.unwrap(), 0), (upload.unwrap(), 0)]);
+}
+
+/// Runs the network for `millis`, handing `upload` the commands finished,
+/// the OPERATION_STATUS reports and the entities gone, as a caller does.
+fn drive(network: &mut Network, upload: &mut atdecc::upload::Upload, millis: u64) {
+    for _ in 0..millis / 5 {
+        network.run(5);
+        let now = network.now;
+        for event in std::mem::take(&mut network.controller_events) {
+            match event {
+                Event::CommandFinished(command, outcome) => {
+                    upload.handle_finished(&mut network.controller, now, command, outcome);
+                }
+                Event::EntityOffline(entity_id, _) | Event::EntityRestarted(entity_id) => {
+                    upload.handle_gone(&mut network.controller, now, entity_id);
+                }
+                _ => {}
+            }
+        }
+        while let Some(status) = network.controller.poll_operation_status() {
+            upload.handle_status(&mut network.controller, now, &status);
+        }
+        if upload.poll_timeout().is_some_and(|due| due <= now) {
+            upload.handle_timeout(&mut network.controller, now);
+        }
+    }
+}
+
+/// A talker that keeps firmware of up to 4096 octets, its streams running,
+/// read by the controller, and its FIRMWARE_IMAGE memory object.
+fn firmware_talker() -> (Network, atdecc::model::EntityModel) {
+    let mut network = Network::new();
+    network.talker = Entity::new(model(TALKER, "Talker", true), &[(STREAM, DESTINATION)]);
+    network.talker.keep_firmware(4096);
+    network.talker.set_streams_running(true);
+    network.talker.start(Instant::ZERO);
+    network.controller.discover(None);
+    network.run(3000);
+    network.controller_events.clear();
+    let read = network.controller.model(TALKER).unwrap().clone();
+    (network, read)
+}
+
+fn firmware_object(read: &atdecc::model::EntityModel) -> MemoryObjectDescriptor<'_> {
+    read.memory_objects()
+        .find(|object| object.memory_object_type == MemoryObjectType::FIRMWARE_IMAGE)
+        .expect("its FIRMWARE_IMAGE")
+}
+
+/// Drives `upload` until the talker has the image to check.
+fn until_stored(
+    network: &mut Network,
+    upload: &mut atdecc::upload::Upload,
+) -> atdecc::entity::StoredFirmware {
+    for _ in 0..2000 {
+        drive(network, upload, 5);
+        if let Some(stored) = network.talker.take_stored_firmware() {
+            return stored;
+        }
+        assert!(!upload.is_over(), "{:?}", upload.stage());
+    }
+    panic!("never stored: {:?}", upload.stage());
+}
+
+#[test]
+fn an_upload_locks_writes_in_order_and_stores() {
+    use atdecc::upload::{Stage, Upload};
+    let image: Vec<u8> = (0..2900).map(|at| (at * 13 % 251) as u8).collect();
+    let (mut network, read) = firmware_talker();
+    let object = firmware_object(&read);
+    let now = network.now;
+    let mut upload = Upload::start(
+        &mut network.controller,
+        now,
+        TALKER,
+        &object,
+        image.clone(),
+        false,
+    );
+    assert_eq!(upload.stage(), Stage::Locking);
+    // Two answers lost on the way: their WRITEs go again.
+    drive(&mut network, &mut upload, 30);
+    network.lose_answers = 2;
+    let stored = until_stored(&mut network, &mut upload);
+    assert_eq!(stored.image, image);
+    assert!(!stored.reboot);
+    assert!(matches!(upload.stage(), Stage::Storing { .. }));
+    network.talker.finish_firmware(true);
+    drive(&mut network, &mut upload, 100);
+    assert_eq!(upload.stage(), Stage::Done);
+    assert!(!network.talker.uploading());
+
+    assert!(let_go(&mut network, object.index));
+}
+
+/// Whether the talker's lock was let go: unlocked, its running streams
+/// refuse an upload.
+fn let_go(network: &mut Network, index: u16) -> bool {
+    let again = network.controller.start_operation(
+        network.now,
+        TALKER,
+        DescriptorType::MEMORY_OBJECT,
+        index,
+        atdecc::descriptor::MemoryObjectOperation::UPLOAD.0,
+        &64u64.to_be_bytes(),
+    );
+    finish(network, again) == Outcome::Refused(Refusal::Aem(AemStatus::STREAM_IS_RUNNING))
+}
+
+#[test]
+fn an_upload_to_restart_on_is_done_when_stored() {
+    use atdecc::upload::{Stage, Upload};
+    let image: Vec<u8> = (0..700).map(|at| at as u8).collect();
+    let (mut network, read) = firmware_talker();
+    let object = firmware_object(&read);
+    let now = network.now;
+    let mut upload = Upload::start(
+        &mut network.controller,
+        now,
+        TALKER,
+        &object,
+        image.clone(),
+        true,
+    );
+    let stored = until_stored(&mut network, &mut upload);
+    assert!(stored.reboot);
+    // Gone to restart before saying how storing went: done all the same.
+    drive(&mut network, &mut upload, 50);
+    assert!(matches!(upload.stage(), Stage::Storing { .. }));
+    let now = network.now;
+    assert!(upload.handle_gone(&mut network.controller, now, TALKER));
+    assert_eq!(upload.stage(), Stage::Done);
+}
+
+#[test]
+fn an_image_that_fails_its_check_fails_the_upload() {
+    use atdecc::upload::{Failure, Stage, Upload};
+    let image = vec![0xe9; 1200];
+    let (mut network, read) = firmware_talker();
+    let object = firmware_object(&read);
+    let now = network.now;
+    let mut upload = Upload::start(&mut network.controller, now, TALKER, &object, image, true);
+    until_stored(&mut network, &mut upload);
+    network.talker.finish_firmware(false);
+    drive(&mut network, &mut upload, 100);
+    assert_eq!(upload.stage(), Stage::Failed(Failure::Rejected));
+    // Not restarting after all, it lets the lock go.
+    assert!(let_go(&mut network, object.index));
+}
+
+#[test]
+fn an_upload_stops_when_asked() {
+    use atdecc::upload::{Stage, Upload};
+    let image: Vec<u8> = (0..4000).map(|at| (at % 256) as u8).collect();
+    let (mut network, read) = firmware_talker();
+    let object = firmware_object(&read);
+    let now = network.now;
+    let mut upload = Upload::start(&mut network.controller, now, TALKER, &object, image, false);
+    for _ in 0..400 {
+        drive(&mut network, &mut upload, 5);
+        if matches!(upload.stage(), Stage::Writing { sent, .. } if sent > 0) {
+            break;
+        }
+    }
+    assert!(network.talker.uploading());
+    let now = network.now;
+    assert!(upload.abort(&mut network.controller, now));
+    assert_eq!(upload.stage(), Stage::Aborting);
+    drive(&mut network, &mut upload, 100);
+    assert_eq!(upload.stage(), Stage::Aborted);
+    assert!(!network.talker.uploading());
+    assert_eq!(network.talker.take_stored_firmware(), None);
+    assert!(let_go(&mut network, object.index));
+}
+
+#[test]
+fn an_image_too_long_for_the_object_is_not_sent() {
+    use atdecc::upload::{Failure, Stage, Upload};
+    let (mut network, read) = firmware_talker();
+    let object = firmware_object(&read);
+    let now = network.now;
+    let mut upload = Upload::start(
+        &mut network.controller,
+        now,
+        TALKER,
+        &object,
+        vec![0; 4097],
+        false,
+    );
+    assert_eq!(upload.stage(), Stage::Failed(Failure::DoesNotFit));
+    drive(&mut network, &mut upload, 100);
+    assert!(!network.talker.uploading());
+    assert!(let_go(&mut network, object.index));
 }
