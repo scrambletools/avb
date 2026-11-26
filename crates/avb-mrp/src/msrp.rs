@@ -3,9 +3,11 @@
 //! as an MRPDU or a CVU SRP message carries them.
 
 use alloc::vec::Vec;
+use core::time::Duration;
 
 use avb_net::MacAddress;
 
+use crate::Participant;
 use crate::mrpdu::{Format, add};
 
 /// MSRP attribute types (35.2.2.4).
@@ -17,6 +19,18 @@ pub mod attribute {
 }
 
 pub use crate::mrpdu::Event;
+
+/// Class measurement intervals a second, by SR class: how often a
+/// class's talkers may send their MaxIntervalFrames.
+pub mod intervals {
+    /// Class A's, one each 125 us.
+    pub const CLASS_A: u32 = 8000;
+    /// Class B's, one each 250 us.
+    pub const CLASS_B: u32 = 4000;
+    /// Class C's by default, one each 500 us. A profile may set its own,
+    /// to match its control cycle.
+    pub const CLASS_C: u32 = 2000;
+}
 
 /// The format of MSRP's MRPDUs, for a [`crate::Participant`].
 pub const FORMAT: Format = Format {
@@ -103,7 +117,7 @@ impl ListenerState {
 /// An SR class's domain: its class ID, priority and VLAN (35.2.2.9).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Domain {
-    /// 6 for class A, 5 for class B.
+    /// 6 for class A, 5 for class B, 4 for class C.
     pub class_id: u8,
     pub priority: u8,
     pub vlan_id: u16,
@@ -123,6 +137,24 @@ impl Domain {
         priority: 2,
         vlan_id: 2,
     };
+
+    /// Class C on its default priority and VLAN, for control streams.
+    /// Opt-in: no port declares it unless asked, and a talker in it can
+    /// fall back to Class A where it cannot be reserved ([`fall_back`]).
+    pub const CLASS_C: Domain = Domain {
+        class_id: 4,
+        priority: 6,
+        vlan_id: 2,
+    };
+
+    /// Whether a port whose neighbor declares the domains `registered` is
+    /// a boundary of this class's SRP domain (35.2.1.4 h): none of them
+    /// has its class ID with its priority.
+    pub fn boundary(&self, registered: impl IntoIterator<Item = Domain>) -> bool {
+        !registered
+            .into_iter()
+            .any(|domain| domain.class_id == self.class_id && domain.priority == self.priority)
+    }
 
     pub fn value(&self) -> Vec<u8> {
         let vlan = self.vlan_id.to_be_bytes();
@@ -210,13 +242,138 @@ const FRAME_OVERHEAD: u64 = 8 + 18 + 4 + 12;
 impl TalkerDeclaration {
     /// The bandwidth the stream takes in bits per second, at
     /// `intervals_per_second` class measurement intervals: 8000 for class
-    /// A, 4000 for class B.
+    /// A, 4000 for class B, 2000 for class C by default ([`intervals`]).
     pub fn bandwidth(&self, intervals_per_second: u32) -> u64 {
         (u64::from(self.max_frame_size) + FRAME_OVERHEAD)
             * 8
             * u64::from(self.max_interval_frames)
             * u64::from(intervals_per_second)
     }
+
+    /// The declaration as its talker declares it again in Class A, from
+    /// Class C measured `class_c_intervals` times a second: Class A's
+    /// priority, and its frames per interval counted again for Class A's
+    /// 125 us ([`interval_frames`]). Its stream, destination, VLAN, frame
+    /// size, rank and latency stay.
+    pub fn in_class_a(&self, class_c_intervals: u32) -> TalkerDeclaration {
+        TalkerDeclaration {
+            priority: Domain::CLASS_A.priority,
+            max_interval_frames: interval_frames(
+                self.max_interval_frames,
+                class_c_intervals,
+                intervals::CLASS_A,
+            ),
+            failure: None,
+            ..*self
+        }
+    }
+}
+
+/// The frames in each interval of a class measured `to` times a second
+/// that carry a stream sending `frames` in each of `from`'s: as many a
+/// second, rounded up to a whole frame, and at least one.
+///
+/// From Class C's 2000 to Class A's 8000 that is frames / 4 rounded up,
+/// the least that carries the stream in whole frames: one frame each
+/// 500 us reserves four times its rate in Class A, one each 125 us. The
+/// talker then spreads its frames, no more than that many in any one of
+/// the new intervals; one that keeps sending a Class C interval's frames
+/// together needs `frames` unchanged.
+pub fn interval_frames(frames: u16, from: u32, to: u32) -> u16 {
+    let per_second = u64::from(frames) * u64::from(from);
+    let frames = per_second.div_ceil(u64::from(to.max(1)));
+    u16::try_from(frames).unwrap_or(u16::MAX).max(1)
+}
+
+/// Why a talker in Class C falls back to Class A.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fallback {
+    /// Its port is the edge of Class C's SRP domain: the neighbor
+    /// declares domains, but not Class C with its priority.
+    Boundary,
+    /// Its stream's listeners answer only AskingFailed: none of them can
+    /// reserve it in Class C, as where a bridge on the way fails it.
+    AskingFailed,
+}
+
+/// Whether a talker that declares `declaration` in Class C should declare
+/// its stream again in Class A, and why: `domains` are the domains its
+/// port registers, `listener` the listener state registered for its
+/// stream. Opt-in: nothing asks unless a talker does, and a declaration
+/// at any priority but Class C's never falls back.
+///
+/// A port that registers no domain at all, as before its neighbor first
+/// declares, is no boundary yet. The neighbor's domains come one at a
+/// time, so ask about the boundary once they have settled, as a bridge
+/// holds a new port's talkers for its neighbor's; the listeners' answer
+/// may come at any time.
+pub fn fallback(
+    declaration: &TalkerDeclaration,
+    domains: impl IntoIterator<Item = Domain>,
+    listener: Option<ListenerState>,
+) -> Option<Fallback> {
+    if declaration.priority != Domain::CLASS_C.priority {
+        return None;
+    }
+    let mut domains = domains.into_iter().peekable();
+    if domains.peek().is_some() && Domain::CLASS_C.boundary(domains) {
+        Some(Fallback::Boundary)
+    } else if listener == Some(ListenerState::AskingFailed) {
+        Some(Fallback::AskingFailed)
+    } else {
+        None
+    }
+}
+
+/// [`fallback`], from what `participant`, the talker's MSRP participant
+/// on its port, registers: the port's domains and the listener state for
+/// `declaration`'s stream.
+pub fn registered_fallback(
+    participant: &Participant,
+    declaration: &TalkerDeclaration,
+) -> Option<Fallback> {
+    let stream = declaration.stream_id.to_be_bytes();
+    let mut domains = Vec::new();
+    let mut listener = None;
+    for (attribute_type, value, four_packed) in participant.registered() {
+        match attribute_type {
+            attribute::DOMAIN => domains.extend(Domain::decode(value)),
+            attribute::LISTENER if value.get(..8) == Some(&stream[..]) => {
+                listener = four_packed.map(ListenerState::from_number);
+            }
+            _ => {}
+        }
+    }
+    fallback(declaration, domains, listener)
+}
+
+/// Falls a Class C talker back to Class A on `participant` when
+/// [`registered_fallback`] says it should: declares `declaration`'s stream
+/// again at Class A's priority, its frames per interval counted again
+/// from Class C's `class_c_intervals` a second
+/// ([`TalkerDeclaration::in_class_a`]). Returns why, and the declaration
+/// the talker now sends its stream by.
+///
+/// MSRP names a talker by its stream ID, so the Class A declaration
+/// withdraws the Class C one as it goes out, a New in its place, with no
+/// Leave between that would take the stream from a listener. The talker
+/// then sends its frames at Class A's priority, and stays in Class A: to
+/// try Class C again, declare the stream in it again.
+pub fn fall_back(
+    participant: &mut Participant,
+    now: Duration,
+    declaration: &TalkerDeclaration,
+    class_c_intervals: u32,
+) -> Option<(Fallback, TalkerDeclaration)> {
+    let why = registered_fallback(participant, declaration)?;
+    let class_a = declaration.in_class_a(class_c_intervals);
+    participant.declare(
+        now,
+        attribute::TALKER_ADVERTISE,
+        talker_value(&class_a),
+        None,
+    );
+    Some((why, class_a))
 }
 
 /// The talker declarations in an MSRP message, from its AttributeType on.
@@ -381,5 +538,238 @@ mod tests {
         assert_eq!(talker_declarations(&listener).count(), 0);
         assert_eq!(talker_declarations(&advertise()[..20]).count(), 0);
         assert_eq!(talker_declarations(&[]).count(), 0);
+    }
+
+    #[test]
+    fn class_c_is_class_4_at_priority_6_on_vlan_2() {
+        let c = Domain::CLASS_C;
+        assert_eq!((c.class_id, c.priority, c.vlan_id), (4, 6, 2));
+        assert_eq!(c.value(), [4, 6, 0, 2]);
+        assert_eq!(Domain::decode(&c.value()), Some(c));
+        assert_eq!(intervals::CLASS_C, 2000);
+        // Classes A and B stay as they were.
+        assert_eq!(Domain::CLASS_A.value(), [6, 3, 0, 2]);
+        assert_eq!(Domain::CLASS_B.value(), [5, 2, 0, 2]);
+        assert_eq!((intervals::CLASS_A, intervals::CLASS_B), (8000, 4000));
+    }
+
+    /// One frame of 64 octets each 500 us, in Class C.
+    fn control() -> TalkerDeclaration {
+        TalkerDeclaration {
+            stream_id: 0xa010_a3ff_70a8_1140,
+            destination: MacAddress([0x91, 0xe0, 0xf0, 0x00, 0x70, 0x01]),
+            vlan_id: 2,
+            max_frame_size: 64,
+            max_interval_frames: 1,
+            priority: Domain::CLASS_C.priority,
+            rank: true,
+            accumulated_latency: 50_000,
+            failure: None,
+            event: Event::New,
+        }
+    }
+
+    const A_AND_B: [Domain; 2] = [Domain::CLASS_A, Domain::CLASS_B];
+    const A_B_AND_C: [Domain; 3] = [Domain::CLASS_A, Domain::CLASS_B, Domain::CLASS_C];
+
+    #[test]
+    fn a_port_without_class_c_is_its_boundary() {
+        let c = Domain::CLASS_C;
+        assert!(c.boundary(A_AND_B));
+        assert!(!c.boundary(A_B_AND_C));
+        // Class C's ID at another priority is a boundary too.
+        assert!(c.boundary([Domain { priority: 5, ..c }]));
+        assert_eq!(
+            fallback(&control(), A_AND_B, None),
+            Some(Fallback::Boundary)
+        );
+        assert_eq!(
+            fallback(&control(), A_AND_B, Some(ListenerState::Ready)),
+            Some(Fallback::Boundary)
+        );
+        assert_eq!(fallback(&control(), A_B_AND_C, None), None);
+        // No domain registered yet is no boundary yet.
+        assert_eq!(fallback(&control(), [], None), None);
+    }
+
+    #[test]
+    fn listeners_asking_failed_only_fall_class_c_back() {
+        let asking = Some(ListenerState::AskingFailed);
+        assert_eq!(
+            fallback(&control(), A_B_AND_C, asking),
+            Some(Fallback::AskingFailed)
+        );
+        assert_eq!(
+            fallback(&control(), [], asking),
+            Some(Fallback::AskingFailed)
+        );
+        for state in [
+            ListenerState::Ignore,
+            ListenerState::Ready,
+            ListenerState::ReadyFailed,
+        ] {
+            assert_eq!(fallback(&control(), A_B_AND_C, Some(state)), None);
+        }
+    }
+
+    #[test]
+    fn class_a_and_b_talkers_never_fall_back() {
+        for priority in [Domain::CLASS_A.priority, Domain::CLASS_B.priority] {
+            let talker = TalkerDeclaration {
+                priority,
+                ..control()
+            };
+            let asking = Some(ListenerState::AskingFailed);
+            assert_eq!(fallback(&talker, A_AND_B, asking), None);
+            assert_eq!(fallback(&talker, [], asking), None);
+        }
+    }
+
+    #[test]
+    fn frames_per_interval_carry_the_same_frames_a_second() {
+        let (c, a) = (intervals::CLASS_C, intervals::CLASS_A);
+        // At least one each 125 us, then a quarter, rounded up.
+        for (frames, expected) in [(0, 1), (1, 1), (4, 1), (5, 2), (8, 2), (9, 3)] {
+            assert_eq!(interval_frames(frames, c, a), expected, "{frames}");
+        }
+        // A profile's own Class C interval, 250 us.
+        assert_eq!(interval_frames(3, 4000, a), 2);
+        // The other way round, and no overflow or division by zero.
+        assert_eq!(interval_frames(3, a, c), 12);
+        assert_eq!(interval_frames(u16::MAX, a, c), u16::MAX);
+        assert_eq!(interval_frames(2, c, 0), 4000);
+
+        let talker = TalkerDeclaration {
+            max_interval_frames: 6,
+            ..control()
+        };
+        let class_a = talker.in_class_a(c);
+        assert_eq!(
+            class_a,
+            TalkerDeclaration {
+                priority: 3,
+                max_interval_frames: 2,
+                ..talker
+            }
+        );
+        assert!(class_a.bandwidth(a) >= talker.bandwidth(c));
+    }
+
+    fn ms(millis: u64) -> Duration {
+        Duration::from_millis(millis)
+    }
+
+    /// Runs a talker's participant and its neighbor's from `from` to `to`
+    /// ms, handing each one's MRPDUs to the other; returns what the
+    /// neighbor registered as it changed.
+    fn run(
+        talker: &mut Participant,
+        neighbor: &mut Participant,
+        from: u64,
+        to: u64,
+    ) -> Vec<crate::Registration> {
+        let mut heard = Vec::new();
+        for now in (from..=to).step_by(10).map(ms) {
+            talker.handle_timeout(now);
+            neighbor.handle_timeout(now);
+            while let Some(pdu) = talker.poll_transmit() {
+                neighbor.handle_pdu(now, &pdu);
+            }
+            while let Some(pdu) = neighbor.poll_transmit() {
+                talker.handle_pdu(now, &pdu);
+            }
+            while talker.poll_event().is_some() {}
+            heard.extend(core::iter::from_fn(|| neighbor.poll_event()));
+        }
+        heard
+    }
+
+    /// A Class C talker on a port whose neighbor declares `domains`, and,
+    /// when `listener` says, a listener state for its stream.
+    fn talker_beside(
+        domains: &[Domain],
+        listener: Option<ListenerState>,
+    ) -> (Participant, Participant) {
+        let mut talker = Participant::new(FORMAT, ms(0), 11).with_twins(twin);
+        let mut neighbor = Participant::new(FORMAT, ms(0), 12).with_twins(twin);
+        for domain in domains {
+            neighbor.declare(ms(0), attribute::DOMAIN, domain.value(), None);
+        }
+        let stream = control().stream_id.to_be_bytes().to_vec();
+        if let Some(state) = listener {
+            neighbor.declare(ms(0), attribute::LISTENER, stream, Some(state.number()));
+        }
+        let value = talker_value(&control());
+        talker.declare(ms(0), attribute::TALKER_ADVERTISE, value, None);
+        run(&mut talker, &mut neighbor, 0, 1000);
+        (talker, neighbor)
+    }
+
+    /// The stream's talker declarations the neighbor registered, and
+    /// whether it took the stream off at any point.
+    fn talkers(heard: &[crate::Registration]) -> (Vec<TalkerDeclaration>, bool) {
+        let mut declarations = Vec::new();
+        let mut left = false;
+        for registration in heard {
+            match registration {
+                crate::Registration::Joined {
+                    attribute_type: attribute::TALKER_ADVERTISE,
+                    value,
+                    ..
+                } => declarations.extend(decode_talker(
+                    attribute::TALKER_ADVERTISE,
+                    value,
+                    Event::JoinIn,
+                )),
+                crate::Registration::Left {
+                    attribute_type: attribute::TALKER_ADVERTISE,
+                    ..
+                } => left = true,
+                _ => {}
+            }
+        }
+        (declarations, left)
+    }
+
+    #[test]
+    fn a_talker_beside_a_neighbor_without_class_c_falls_back_to_a() {
+        let (mut talker, mut neighbor) = talker_beside(&A_AND_B, None);
+        assert_eq!(
+            registered_fallback(&talker, &control()),
+            Some(Fallback::Boundary)
+        );
+        let (why, class_a) =
+            fall_back(&mut talker, ms(1000), &control(), intervals::CLASS_C).expect("falls back");
+        assert_eq!(why, Fallback::Boundary);
+        assert_eq!((class_a.priority, class_a.max_interval_frames), (3, 1));
+        let (declarations, left) = talkers(&run(&mut talker, &mut neighbor, 1000, 3000));
+        assert_eq!(declarations.last().map(|d| d.priority), Some(3));
+        assert!(!left, "the stream went off between classes");
+        // In Class A it falls back no further.
+        assert_eq!(registered_fallback(&talker, &class_a), None);
+    }
+
+    #[test]
+    fn a_talker_whose_listeners_ask_failed_falls_back_to_a() {
+        let asking = Some(ListenerState::AskingFailed);
+        let (mut talker, mut neighbor) = talker_beside(&A_B_AND_C, asking);
+        let (why, class_a) =
+            fall_back(&mut talker, ms(1000), &control(), intervals::CLASS_C).expect("falls back");
+        assert_eq!(why, Fallback::AskingFailed);
+        let (declarations, left) = talkers(&run(&mut talker, &mut neighbor, 1000, 3000));
+        let last = declarations.last().expect("declared again");
+        assert_eq!(talker_value(last), talker_value(&class_a));
+        assert!(!left);
+    }
+
+    #[test]
+    fn a_talker_with_class_c_and_a_ready_listener_stays() {
+        let ready = Some(ListenerState::Ready);
+        let (mut talker, _) = talker_beside(&A_B_AND_C, ready);
+        assert_eq!(registered_fallback(&talker, &control()), None);
+        assert_eq!(
+            fall_back(&mut talker, ms(1000), &control(), intervals::CLASS_C),
+            None
+        );
     }
 }
