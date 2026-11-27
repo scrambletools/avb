@@ -87,6 +87,17 @@ impl SrClass {
         intervals_per_second: 4000,
         delta_bandwidth: 0,
     };
+
+    /// Class C (SRclassID 4, priority 6), which may reserve 75% of a link,
+    /// with an interval each 500 us. A network may set its own priority
+    /// and interval, the same on every bridge and talker of the SRP domain,
+    /// as `intervals_per_second` to a control cycle's rate to reserve one
+    /// frame each cycle.
+    pub const C: SrClass = SrClass {
+        domain: Domain::CLASS_C,
+        intervals_per_second: msrp::intervals::CLASS_C,
+        delta_bandwidth: 75,
+    };
 }
 
 /// How a bridge runs.
@@ -118,6 +129,18 @@ impl Config {
             max_frame_size: 1500,
             mvrp: true,
             static_vlans: Vec::from([Domain::CLASS_A.vlan_id]),
+        }
+    }
+
+    /// As [`Config::new`], with class C above classes A and B, as the
+    /// robotics profiles have it: the three reserve 75% of a link
+    /// together, A and B what C leaves.
+    pub fn robotics(bridge_id: u64) -> Self {
+        let mut class_a = SrClass::A;
+        class_a.delta_bandwidth = 0;
+        Config {
+            classes: Vec::from([SrClass::C, class_a, SrClass::B]),
+            ..Config::new(bridge_id)
         }
     }
 }

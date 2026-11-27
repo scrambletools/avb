@@ -12,6 +12,7 @@ const OTHER_BRIDGE_ID: u64 = 0x8000_fc06_8cff_fe20;
 const STREAM: u64 = 0x9c6b_0030_9a2b_0001;
 const CLASS_A: u8 = 6;
 const CLASS_B: u8 = 5;
+const CLASS_C: u8 = 4;
 
 fn ms(millis: u64) -> Duration {
     Duration::from_millis(millis)
@@ -26,7 +27,12 @@ fn bridge_with(ports: &[(u32, PortStatus)]) -> Bridge {
 }
 
 fn bridge_named(bridge_id: u64, ports: &[(u32, PortStatus)]) -> Bridge {
-    let mut bridge = Bridge::new(Config::new(bridge_id), bridge_id);
+    bridge_configured(Config::new(bridge_id), ports)
+}
+
+fn bridge_configured(config: Config, ports: &[(u32, PortStatus)]) -> Bridge {
+    let seed = config.bridge_id;
+    let mut bridge = Bridge::new(config, seed);
     for (port, status) in ports {
         bridge.set_port(ms(0), PortId(*port), *status);
     }
@@ -73,6 +79,18 @@ impl Station {
             msrp,
             mvrp: Participant::new(mvrp::FORMAT, ms(0), seed.rotate_left(9)),
         }
+    }
+
+    /// An end station declaring class C as well.
+    fn with_class_c(port: u32, seed: u64) -> Self {
+        let mut station = Station::new(port, seed);
+        station.msrp.declare(
+            ms(0),
+            msrp::attribute::DOMAIN,
+            SrClass::C.domain.value(),
+            None,
+        );
+        station
     }
 
     fn talk(&mut self, now: u64, declaration: &TalkerDeclaration) {
@@ -788,4 +806,233 @@ fn malformed_mrpdus_change_nothing() {
         bridge.handle_pdu(ms(0), PortId(9), Application::Msrp, pdu);
     }
     assert_eq!(bridge.reservations().count(), 0);
+}
+
+/// `declaration` in `class`, at its priority.
+fn in_class(declaration: TalkerDeclaration, class: &SrClass) -> TalkerDeclaration {
+    TalkerDeclaration {
+        priority: class.domain.priority,
+        ..declaration
+    }
+}
+
+/// The bandwidth of `frames` frames of `max_frame_size` octets each
+/// interval of `class`.
+fn class_bandwidth(max_frame_size: u64, frames: u64, class: &SrClass) -> u64 {
+    (max_frame_size + 43) * 8 * frames * u64::from(class.intervals_per_second)
+}
+
+#[test]
+fn only_the_robotics_config_adds_class_c() {
+    assert_eq!(Config::new(BRIDGE_ID).classes, [SrClass::A, SrClass::B]);
+    let robotics = Config::robotics(BRIDGE_ID);
+    let classes: Vec<(u8, u8, u16, u32)> = robotics
+        .classes
+        .iter()
+        .map(|class| {
+            (
+                class.domain.class_id,
+                class.domain.priority,
+                class.domain.vlan_id,
+                class.intervals_per_second,
+            )
+        })
+        .collect();
+    assert_eq!(
+        classes,
+        [
+            (CLASS_C, 6, 2, 2000),
+            (CLASS_A, 3, 2, 8000),
+            (CLASS_B, 2, 2, 4000)
+        ]
+    );
+    let together: u32 = robotics
+        .classes
+        .iter()
+        .map(|class| u32::from(class.delta_bandwidth))
+        .sum();
+    assert_eq!(together, 75);
+}
+
+#[test]
+fn classes_c_a_and_b_reserve_75_percent_of_a_link_together() {
+    let slow = PortStatus::up(100, true);
+    let mut bridge = bridge_configured(Config::robotics(BRIDGE_ID), &[(1, gigabit()), (2, slow)]);
+    let mut talker = Station::with_class_c(1, 29);
+    let mut listener = Station::with_class_c(2, 30);
+    let classes = bridge.config().classes.clone();
+    let (class_c, class_a, class_b) = (&classes[0], &classes[1], &classes[2]);
+    let control = in_class(advertise(STREAM, 1000), class_c);
+    let media_a = advertise(STREAM + 1, 224);
+    let media_b = in_class(advertise(STREAM + 2, 224), class_b);
+    // About 34 Mb/s more class C: within class C's own 75%, not within
+    // the 75% all three share.
+    let more_control = TalkerDeclaration {
+        max_interval_frames: 2,
+        ..in_class(advertise(STREAM + 3, 1000), class_c)
+    };
+    for declaration in [&control, &media_a, &media_b] {
+        talker.talk(0, declaration);
+    }
+    run(&mut bridge, &mut [&mut talker, &mut listener], 0, 1000);
+    for declaration in [&control, &media_a, &media_b] {
+        listener.listen(1000, declaration.stream_id, ListenerState::Ready);
+    }
+    let changes = run(&mut bridge, &mut [&mut talker, &mut listener], 1000, 2000);
+    let control_bandwidth = class_bandwidth(1000, 1, class_c);
+    assert!(changes.contains(&Change::IdleSlope {
+        port: PortId(2),
+        class_id: CLASS_C,
+        bits_per_second: control_bandwidth,
+    }));
+    talker.talk(2000, &more_control);
+    run(&mut bridge, &mut [&mut talker, &mut listener], 2000, 3000);
+    listener.listen(3000, more_control.stream_id, ListenerState::Ready);
+    run(&mut bridge, &mut [&mut talker, &mut listener], 3000, 4000);
+
+    let reserved: Vec<(u64, u8)> = bridge
+        .reservations()
+        .map(|reservation| (reservation.stream_id, reservation.class_id))
+        .collect();
+    assert_eq!(
+        reserved,
+        [
+            (control.stream_id, CLASS_C),
+            (media_a.stream_id, CLASS_A),
+            (media_b.stream_id, CLASS_B)
+        ]
+    );
+    for (class_id, bits_per_second) in [
+        (CLASS_C, control_bandwidth),
+        (CLASS_A, class_bandwidth(224, 1, class_a)),
+        (CLASS_B, class_bandwidth(224, 1, class_b)),
+    ] {
+        assert_eq!(bridge.idle_slope(PortId(2), class_id), bits_per_second);
+    }
+    let code = listener
+        .talker(more_control.stream_id)
+        .and_then(|heard| heard.failure)
+        .map(|failure| failure.code);
+    assert_eq!(code, Some(failure::INSUFFICIENT_BANDWIDTH));
+    assert_eq!(
+        talker.listener(more_control.stream_id),
+        Some(ListenerState::AskingFailed)
+    );
+}
+
+/// A neighbor declaring classes A and B only is a boundary for class C:
+/// its class C stream fails, those of A and B pass, and the talker
+/// declaring the stream again in class A gets it through.
+#[test]
+fn a_neighbor_without_class_c_fails_only_class_c_streams() {
+    let mut bridge = bridge_configured(
+        Config::robotics(BRIDGE_ID),
+        &[(1, gigabit()), (2, gigabit())],
+    );
+    let mut talker = Station::with_class_c(1, 31);
+    let mut listener = Station::new(2, 32);
+    let control = in_class(advertise(STREAM, 224), &SrClass::C);
+    let media_a = advertise(STREAM + 1, 224);
+    let media_b = in_class(advertise(STREAM + 2, 224), &SrClass::B);
+    for declaration in [&control, &media_a, &media_b] {
+        talker.talk(0, declaration);
+    }
+    // Past the wait for its Domain a port that has just come up makes.
+    run(&mut bridge, &mut [&mut talker, &mut listener], 0, 7000);
+    assert!(bridge.boundary(PortId(2), CLASS_C));
+    assert!(!bridge.boundary(PortId(2), CLASS_A));
+    assert!(!bridge.boundary(PortId(2), CLASS_B));
+    assert!(!bridge.boundary(PortId(1), CLASS_C));
+    // It declares class C to the neighbor all the same.
+    let class_c_value = SrClass::C.domain.value();
+    assert!(
+        listener
+            .msrp
+            .registered()
+            .any(|(attribute_type, value, _)| {
+                attribute_type == msrp::attribute::DOMAIN && value == class_c_value.as_slice()
+            })
+    );
+    assert_eq!(
+        listener
+            .talker(control.stream_id)
+            .and_then(|heard| heard.failure),
+        Some(TalkerFailure {
+            bridge_id: BRIDGE_ID,
+            code: failure::NOT_AVB_CAPABLE,
+        })
+    );
+    for declaration in [&media_a, &media_b] {
+        let heard = listener.talker(declaration.stream_id).expect("the talker");
+        assert_eq!(heard.failure, None);
+    }
+    for declaration in [&control, &media_a, &media_b] {
+        listener.listen(7000, declaration.stream_id, ListenerState::Ready);
+    }
+    run(&mut bridge, &mut [&mut talker, &mut listener], 7000, 8000);
+    assert_eq!(
+        talker.listener(control.stream_id),
+        Some(ListenerState::AskingFailed)
+    );
+    assert_eq!(
+        talker.listener(media_a.stream_id),
+        Some(ListenerState::Ready)
+    );
+    assert_eq!(
+        talker.listener(media_b.stream_id),
+        Some(ListenerState::Ready)
+    );
+    let reserved: Vec<u64> = bridge
+        .reservations()
+        .map(|reservation| reservation.stream_id)
+        .collect();
+    assert_eq!(reserved, [media_a.stream_id, media_b.stream_id]);
+
+    let fallen_back = in_class(control, &SrClass::A);
+    talker.talk(8000, &fallen_back);
+    run(&mut bridge, &mut [&mut talker, &mut listener], 8000, 9000);
+    let heard = listener.talker(control.stream_id).expect("the talker");
+    assert_eq!((heard.failure, heard.priority), (None, 3));
+    assert_eq!(
+        talker.listener(control.stream_id),
+        Some(ListenerState::Ready)
+    );
+    let reserved: Vec<(u64, u8)> = bridge
+        .reservations()
+        .map(|reservation| (reservation.stream_id, reservation.class_id))
+        .collect();
+    assert_eq!(
+        reserved,
+        [
+            (control.stream_id, CLASS_A),
+            (media_a.stream_id, CLASS_A),
+            (media_b.stream_id, CLASS_B)
+        ]
+    );
+    assert_eq!(bridge.idle_slope(PortId(2), CLASS_C), 0);
+}
+
+/// Class C's Domain in a vector of its own, and classes B and A in one
+/// vector of two values, as a neighbor may pack them.
+#[test]
+fn a_neighbors_class_c_domain_decodes() {
+    let mut bridge = bridge_configured(Config::robotics(BRIDGE_ID), &[(1, gigabit())]);
+    let join_in = 36;
+    let mut pdu = vec![0, msrp::attribute::DOMAIN, 4, 0, 0];
+    pdu.extend_from_slice(&[0x00, 0x01, CLASS_C, 6, 0, 2, join_in]);
+    pdu.extend_from_slice(&[0x00, 0x02, CLASS_B, 2, 0, 2, join_in + 6]);
+    pdu.extend_from_slice(&[0, 0]);
+    let list = (pdu.len() - 5) as u16;
+    pdu[3..5].copy_from_slice(&list.to_be_bytes());
+    pdu.extend_from_slice(&[0, 0]);
+    assert!(bridge.boundary(PortId(1), CLASS_C));
+    bridge.handle_pdu(ms(0), PortId(1), Application::Msrp, &pdu);
+    let domains: Vec<Domain> = bridge.domains(PortId(1)).collect();
+    assert_eq!(
+        domains,
+        [SrClass::C.domain, Domain::CLASS_B, Domain::CLASS_A]
+    );
+    for class_id in [CLASS_C, CLASS_A, CLASS_B] {
+        assert!(!bridge.boundary(PortId(1), class_id));
+    }
 }
