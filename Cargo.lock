@@ -66,7 +66,7 @@ dependencies = [
 
 [[package]]
 name = "avb-stream"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "atdecc",
  "avb-net",
@@ -210,9 +210,9 @@ dependencies = [
 
 [[package]]
 name = "gptp"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "54a135d78e91887574b20b2bab724f024709a75505ec54f0f59bf4eab5504bad"
+checksum = "bec299fb0ed734e519d1b004d67a7a7946e33090e2cc65b383987154909e94e1"
 
 [[package]]
 name = "hashbrown"
