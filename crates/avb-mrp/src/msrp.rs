@@ -27,8 +27,10 @@ pub mod intervals {
     pub const CLASS_A: u32 = 8000;
     /// Class B's, one each 250 us.
     pub const CLASS_B: u32 = 4000;
-    /// Class C's by default, one each 500 us. A profile may set its own,
-    /// to match its control cycle.
+    /// Class C's by default, one each 500 us. A network may set its own,
+    /// as to its control cycle, but MSRP does not carry it: every bridge
+    /// and talker in the SRP domain sets the same, and a talker counts its
+    /// MaxIntervalFrames against it.
     pub const CLASS_C: u32 = 2000;
 }
 
@@ -141,15 +143,31 @@ impl Domain {
     /// Class C on its default priority and VLAN, for control streams.
     /// Opt-in: no port declares it unless asked, and a talker in it can
     /// fall back to Class A where it cannot be reserved ([`fall_back`]).
+    /// A network may give it another priority and VLAN, the same across
+    /// its SRP domain, and a talker takes them from its port's Domain
+    /// declaration ([`Domain::registered`]), these until one comes.
     pub const CLASS_C: Domain = Domain {
         class_id: 4,
         priority: 6,
         vlan_id: 2,
     };
 
+    /// This class's domain as a port's neighbor declares it among
+    /// `registered`, by class ID whatever its priority and VLAN, or this
+    /// one until the neighbor declares it. A talker in the class takes its
+    /// priority and VLAN from it (35.2.2.9.3, 35.2.2.9.4).
+    pub fn registered(&self, registered: impl IntoIterator<Item = Domain>) -> Domain {
+        registered
+            .into_iter()
+            .find(|domain| domain.class_id == self.class_id)
+            .unwrap_or(*self)
+    }
+
     /// Whether a port whose neighbor declares the domains `registered` is
     /// a boundary of this class's SRP domain (35.2.1.4 h): none of them
-    /// has its class ID with its priority.
+    /// has its class ID with its priority. This is a bridge's rule, for
+    /// a priority it is configured with; a talker, which takes its class's
+    /// priority from the neighbor, asks [`fallback`].
     pub fn boundary(&self, registered: impl IntoIterator<Item = Domain>) -> bool {
         !registered
             .into_iter()
@@ -250,21 +268,32 @@ impl TalkerDeclaration {
             * u64::from(intervals_per_second)
     }
 
-    /// The declaration as its talker declares it again in Class A, from
-    /// Class C measured `class_c_intervals` times a second: Class A's
-    /// priority, and its frames per interval counted again for Class A's
-    /// 125 us ([`interval_frames`]). Its stream, destination, VLAN, frame
-    /// size, rank and latency stay.
-    pub fn in_class_a(&self, class_c_intervals: u32) -> TalkerDeclaration {
+    /// The declaration in `domain`'s class: its priority and VLAN, as a
+    /// talker takes them from its port's Domain declaration (35.2.2.9.3,
+    /// 35.2.2.9.4). All else stays.
+    pub fn in_domain(&self, domain: Domain) -> TalkerDeclaration {
         TalkerDeclaration {
-            priority: Domain::CLASS_A.priority,
+            priority: domain.priority,
+            vlan_id: domain.vlan_id,
+            ..*self
+        }
+    }
+
+    /// The declaration as its talker declares it again in Class A, from
+    /// Class C measured `class_c_intervals` times a second: `class_a`'s
+    /// priority and VLAN, Class A's domain as its port registers it
+    /// ([`Domain::registered`]), and its frames per interval counted again
+    /// for Class A's 125 us ([`interval_frames`]). Its stream, destination,
+    /// frame size, rank and latency stay.
+    pub fn in_class_a(&self, class_a: Domain, class_c_intervals: u32) -> TalkerDeclaration {
+        TalkerDeclaration {
             max_interval_frames: interval_frames(
                 self.max_interval_frames,
                 class_c_intervals,
                 intervals::CLASS_A,
             ),
             failure: None,
-            ..*self
+            ..self.in_domain(class_a)
         }
     }
 }
@@ -285,39 +314,60 @@ pub fn interval_frames(frames: u16, from: u32, to: u32) -> u16 {
     u16::try_from(frames).unwrap_or(u16::MAX).max(1)
 }
 
-/// Why a talker in Class C falls back to Class A.
+/// Why a talker in Class C declares its stream again: in Class A, or in
+/// Class C as its port now has it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fallback {
     /// Its port is the edge of Class C's SRP domain: the neighbor
-    /// declares domains, but not Class C with its priority.
+    /// declares domains, but not Class C at any priority. It falls back
+    /// to Class A.
     Boundary,
+    /// Class C is on its port, but at another priority or VLAN than the
+    /// declaration's, as where the talker declared before the neighbor's
+    /// Domain came. It stays in Class C, in this domain.
+    Domain(Domain),
     /// Its stream's listeners answer only AskingFailed: none of them can
-    /// reserve it in Class C, as where a bridge on the way fails it.
+    /// reserve it in Class C, as where a bridge on the way fails it. It
+    /// falls back to Class A.
     AskingFailed,
 }
 
 /// Whether a talker that declares `declaration` in Class C should declare
-/// its stream again in Class A, and why: `domains` are the domains its
-/// port registers, `listener` the listener state registered for its
-/// stream. Opt-in: nothing asks unless a talker does, and a declaration
-/// at any priority but Class C's never falls back.
+/// its stream again, and why: `domains` are the domains its port
+/// registers, `listener` the listener state registered for its stream.
+/// Opt-in: nothing asks unless a talker does, and a declaration at Class
+/// A's or Class B's priority, as the port registers them or by default,
+/// never falls back. Any other is taken for Class C's, so a talker asks
+/// only of its Class C streams.
 ///
 /// A port that registers no domain at all, as before its neighbor first
 /// declares, is no boundary yet. The neighbor's domains come one at a
 /// time, so ask about the boundary once they have settled, as a bridge
-/// holds a new port's talkers for its neighbor's; the listeners' answer
-/// may come at any time.
+/// holds a new port's talkers for its neighbor's. The listeners' answer
+/// may come at any time, but one to a declaration the talker has since
+/// replaced may stay registered a while: ask about it once they have
+/// answered the new one.
 pub fn fallback(
     declaration: &TalkerDeclaration,
     domains: impl IntoIterator<Item = Domain>,
     listener: Option<ListenerState>,
 ) -> Option<Fallback> {
-    if declaration.priority != Domain::CLASS_C.priority {
+    let domains: Vec<Domain> = domains.into_iter().collect();
+    let registered = |class: Domain| class.registered(domains.iter().copied());
+    let a_or_b = [Domain::CLASS_A, Domain::CLASS_B].map(|class| registered(class).priority);
+    if a_or_b.contains(&declaration.priority) {
         return None;
     }
-    let mut domains = domains.into_iter().peekable();
-    if domains.peek().is_some() && Domain::CLASS_C.boundary(domains) {
+    let class_c = registered(Domain::CLASS_C);
+    let declared = domains
+        .iter()
+        .any(|domain| domain.class_id == class_c.class_id);
+    if !domains.is_empty() && !declared {
         Some(Fallback::Boundary)
+    } else if declared
+        && (class_c.priority, class_c.vlan_id) != (declaration.priority, declaration.vlan_id)
+    {
+        Some(Fallback::Domain(class_c))
     } else if listener == Some(ListenerState::AskingFailed) {
         Some(Fallback::AskingFailed)
     } else {
@@ -325,13 +375,12 @@ pub fn fallback(
     }
 }
 
-/// [`fallback`], from what `participant`, the talker's MSRP participant
-/// on its port, registers: the port's domains and the listener state for
-/// `declaration`'s stream.
-pub fn registered_fallback(
+/// The domains `participant` registers, and the listener state it
+/// registers for `declaration`'s stream.
+fn registrations(
     participant: &Participant,
     declaration: &TalkerDeclaration,
-) -> Option<Fallback> {
+) -> (Vec<Domain>, Option<ListenerState>) {
     let stream = declaration.stream_id.to_be_bytes();
     let mut domains = Vec::new();
     let mut listener = None;
@@ -344,36 +393,54 @@ pub fn registered_fallback(
             _ => {}
         }
     }
+    (domains, listener)
+}
+
+/// [`fallback`], from what `participant`, the talker's MSRP participant
+/// on its port, registers: the port's domains and the listener state for
+/// `declaration`'s stream.
+pub fn registered_fallback(
+    participant: &Participant,
+    declaration: &TalkerDeclaration,
+) -> Option<Fallback> {
+    let (domains, listener) = registrations(participant, declaration);
     fallback(declaration, domains, listener)
 }
 
-/// Falls a Class C talker back to Class A on `participant` when
-/// [`registered_fallback`] says it should: declares `declaration`'s stream
-/// again at Class A's priority, its frames per interval counted again
-/// from Class C's `class_c_intervals` a second
-/// ([`TalkerDeclaration::in_class_a`]). Returns why, and the declaration
-/// the talker now sends its stream by.
+/// Declares a Class C talker's stream again on `participant` when
+/// [`registered_fallback`] says it should. Returns why, and the
+/// declaration the talker now sends its stream by:
+/// - for [`Fallback::Domain`], in Class C's domain as the port registers
+///   it ([`TalkerDeclaration::in_domain`]);
+/// - otherwise in Class A, as the port registers Class A's domain, its
+///   frames per interval counted again from Class C's `class_c_intervals`
+///   a second ([`TalkerDeclaration::in_class_a`]).
 ///
-/// MSRP names a talker by its stream ID, so the Class A declaration
-/// withdraws the Class C one as it goes out, a New in its place, with no
+/// MSRP names a talker by its stream ID, so the new declaration
+/// withdraws the old one as it goes out, a New in its place, with no
 /// Leave between that would take the stream from a listener. The talker
-/// then sends its frames at Class A's priority, and stays in Class A: to
-/// try Class C again, declare the stream in it again.
+/// then sends its frames at the new priority and VLAN. One fallen back
+/// stays in Class A: to try Class C again, declare the stream in it
+/// again.
 pub fn fall_back(
     participant: &mut Participant,
     now: Duration,
     declaration: &TalkerDeclaration,
     class_c_intervals: u32,
 ) -> Option<(Fallback, TalkerDeclaration)> {
-    let why = registered_fallback(participant, declaration)?;
-    let class_a = declaration.in_class_a(class_c_intervals);
-    participant.declare(
-        now,
-        attribute::TALKER_ADVERTISE,
-        talker_value(&class_a),
-        None,
-    );
-    Some((why, class_a))
+    let (domains, listener) = registrations(participant, declaration);
+    let why = fallback(declaration, domains.iter().copied(), listener)?;
+    let again = match why {
+        Fallback::Domain(class_c) => TalkerDeclaration {
+            failure: None,
+            ..declaration.in_domain(class_c)
+        },
+        Fallback::Boundary | Fallback::AskingFailed => {
+            declaration.in_class_a(Domain::CLASS_A.registered(domains), class_c_intervals)
+        }
+    };
+    participant.declare(now, attribute::TALKER_ADVERTISE, talker_value(&again), None);
+    Some((why, again))
 }
 
 /// The talker declarations in an MSRP message, from its AttributeType on.
@@ -577,7 +644,7 @@ mod tests {
         let c = Domain::CLASS_C;
         assert!(c.boundary(A_AND_B));
         assert!(!c.boundary(A_B_AND_C));
-        // Class C's ID at another priority is a boundary too.
+        // For a bridge, Class C's ID at another priority is a boundary too.
         assert!(c.boundary([Domain { priority: 5, ..c }]));
         assert_eq!(
             fallback(&control(), A_AND_B, None),
@@ -590,6 +657,65 @@ mod tests {
         assert_eq!(fallback(&control(), A_B_AND_C, None), None);
         // No domain registered yet is no boundary yet.
         assert_eq!(fallback(&control(), [], None), None);
+        // A talker that took another priority falls back where Class C
+        // goes, as where it moves to a neighbor without it.
+        let at_5 = TalkerDeclaration {
+            priority: 5,
+            ..control()
+        };
+        assert_eq!(fallback(&at_5, A_AND_B, None), Some(Fallback::Boundary));
+    }
+
+    /// Class C where a network gives it priority 5.
+    const C_AT_5: Domain = Domain {
+        priority: 5,
+        ..Domain::CLASS_C
+    };
+
+    #[test]
+    fn class_c_takes_its_priority_and_vlan_from_the_domain() {
+        // As the neighbor declares it, or the default until it does.
+        assert_eq!(
+            Domain::CLASS_C.registered([Domain::CLASS_A, C_AT_5]),
+            C_AT_5
+        );
+        assert_eq!(Domain::CLASS_C.registered(A_AND_B), Domain::CLASS_C);
+        assert_eq!(Domain::CLASS_A.registered(A_B_AND_C), Domain::CLASS_A);
+        let on_vlan_3 = Domain {
+            vlan_id: 3,
+            ..C_AT_5
+        };
+        assert_eq!(
+            control().in_domain(on_vlan_3),
+            TalkerDeclaration {
+                priority: 5,
+                vlan_id: 3,
+                ..control()
+            }
+        );
+
+        // Class C at another priority is no boundary: the talker declares
+        // again in it, before it looks at its listeners, as a bridge fails
+        // a stream at a priority it has no class for.
+        let with_c_at_5 = [Domain::CLASS_A, Domain::CLASS_B, C_AT_5];
+        let asking = Some(ListenerState::AskingFailed);
+        for listener in [None, asking] {
+            assert_eq!(
+                fallback(&control(), with_c_at_5, listener),
+                Some(Fallback::Domain(C_AT_5))
+            );
+        }
+        let at_5 = control().in_domain(C_AT_5);
+        assert_eq!(fallback(&at_5, with_c_at_5, None), None);
+        assert_eq!(
+            fallback(&at_5, with_c_at_5, asking),
+            Some(Fallback::AskingFailed)
+        );
+        // Another VLAN alone declares it again too.
+        assert_eq!(
+            fallback(&at_5, [Domain::CLASS_A, on_vlan_3], None),
+            Some(Fallback::Domain(on_vlan_3))
+        );
     }
 
     #[test]
@@ -622,6 +748,8 @@ mod tests {
             let asking = Some(ListenerState::AskingFailed);
             assert_eq!(fallback(&talker, A_AND_B, asking), None);
             assert_eq!(fallback(&talker, [], asking), None);
+            let with_c_at_5 = [Domain::CLASS_A, Domain::CLASS_B, C_AT_5];
+            assert_eq!(fallback(&talker, with_c_at_5, asking), None);
         }
     }
 
@@ -643,7 +771,7 @@ mod tests {
             max_interval_frames: 6,
             ..control()
         };
-        let class_a = talker.in_class_a(c);
+        let class_a = talker.in_class_a(Domain::CLASS_A, c);
         assert_eq!(
             class_a,
             TalkerDeclaration {
@@ -653,6 +781,14 @@ mod tests {
             }
         );
         assert!(class_a.bandwidth(a) >= talker.bandwidth(c));
+        // Class A's priority and VLAN as its port has them.
+        let class_a_on_vlan_3 = Domain {
+            priority: 4,
+            vlan_id: 3,
+            ..Domain::CLASS_A
+        };
+        let class_a = talker.in_class_a(class_a_on_vlan_3, c);
+        assert_eq!((class_a.priority, class_a.vlan_id), (4, 3));
     }
 
     fn ms(millis: u64) -> Duration {
@@ -760,6 +896,36 @@ mod tests {
         let last = declarations.last().expect("declared again");
         assert_eq!(talker_value(last), talker_value(&class_a));
         assert!(!left);
+    }
+
+    #[test]
+    fn a_talker_beside_a_neighbor_with_class_c_at_5_moves_to_it() {
+        let with_c_at_5 = [Domain::CLASS_A, Domain::CLASS_B, C_AT_5];
+        let (mut talker, mut neighbor) = talker_beside(&with_c_at_5, None);
+        let (why, moved) =
+            fall_back(&mut talker, ms(1000), &control(), intervals::CLASS_C).expect("moves");
+        assert_eq!(why, Fallback::Domain(C_AT_5));
+        assert_eq!(moved, control().in_domain(C_AT_5));
+        let (declarations, left) = talkers(&run(&mut talker, &mut neighbor, 1000, 3000));
+        let last = declarations.last().expect("declared again");
+        assert_eq!(talker_value(last), talker_value(&moved));
+        assert!(!left, "the stream went off between priorities");
+        // At 5 it stays in Class C.
+        assert_eq!(registered_fallback(&talker, &moved), None);
+    }
+
+    #[test]
+    fn a_talker_falls_back_to_class_a_as_its_port_has_it() {
+        let class_a_on_vlan_3 = Domain {
+            vlan_id: 3,
+            ..Domain::CLASS_A
+        };
+        let (mut talker, _) = talker_beside(&[class_a_on_vlan_3, Domain::CLASS_B], None);
+        let (why, class_a) =
+            fall_back(&mut talker, ms(1000), &control(), intervals::CLASS_C).expect("falls back");
+        assert_eq!(why, Fallback::Boundary);
+        assert_eq!((class_a.priority, class_a.vlan_id), (3, 3));
+        assert_eq!(registered_fallback(&talker, &class_a), None);
     }
 
     #[test]
